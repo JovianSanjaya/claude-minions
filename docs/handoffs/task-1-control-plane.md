@@ -4,7 +4,9 @@
 
 - Base commit: `acaccd8e7f66dba622503efab0607e70d6e80398`
 - Working branch: `jovian/task1`
-- Commit ID: not created; the user requested no push and the work remains uncommitted for review.
+- Original full Task 1 commit: `3466067e5d2cf53545c0251dd4d05070a6113fc0`
+- Integrated parallel Task 1 commit: `6bb120a` from `task1-julian`
+- The integration merge keeps the complete control-plane scope and incorporates compatible behavior and tests from both implementations.
 
 ## Files changed
 
@@ -17,6 +19,7 @@
 - `apps/server/src/orchestration/control/read-model.ts` — safe correlated orchestration read model.
 - `apps/server/src/orchestration/control/routes.ts` — standalone Fastify route registration for the Task 1 API.
 - `apps/server/src/orchestration/control/{store,state-machine,budget-ledger,service,routes}.test.ts` — deterministic task-local tests.
+- `apps/server/src/orchestration/control/redaction.test.ts` — focused free-text, secret-key, assignment, and safe-value redaction tests integrated from Julian's branch.
 - `docs/handoffs/task-1-control-plane.md` — this handoff.
 
 No composition root, baseline Agent service, runner, React, Task 2, Task 3, README, or environment file was edited.
@@ -38,7 +41,7 @@ The service implements the frozen `OrchestrationSink` interface and calls an inj
 
 - `diff -u <Appendix A block> apps/server/src/orchestration/contracts.ts` — passed; no differences.
 - `npm run typecheck -w @launchpad/server` — passed.
-- `npm run test -w @launchpad/server -- --reporter=dot` — passed: 10 files, 30 tests.
+- `npm run test -w @launchpad/server -- --reporter=dot` — passed after integration: 11 files, 35 tests.
 - `git diff --check` — passed.
 - `npm run check` — passed: server/web typechecks, 10 server test files with 30 tests, web production build, and server build.
 
@@ -47,6 +50,8 @@ The service implements the frozen `OrchestrationSink` interface and calls an inj
 Tests use deterministic in-process `OrchestrationExecutionDriver` fakes and temporary JSON databases/workspace paths. They do not require Ark, network, Docker, a globally installed Codex CLI, or production mocks.
 
 Coverage includes empty/reloaded/corrupt/future stores, serialized and failed persistence, pre-disk/API redaction, all declared state transitions, immutable revisions/contracts/amendments, explicit confirmation, one-active concurrency, stopped-Agent denial, role and total known/unknown pricing, hard budget denial, cancellation/idempotency, driver cancellation, restart reconciliation, route validation/statuses, and inherited bearer-hook protection.
+
+The merge additionally preserves the original raw prompt across intent revisions, accepts Julian's `note` revision DTO alongside `revision`, defaults omitted `requestedMode` to `auto`, and rejects explicit confirmation when the estimate's low end already exceeds a configured hard limit.
 
 ## Configuration
 

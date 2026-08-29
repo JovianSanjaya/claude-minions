@@ -68,6 +68,41 @@ export function actualUsageCost(
   );
 }
 
+/**
+ * Rejects confirmation when even the low end of the planner estimate cannot
+ * fit inside the already-confirmed hard limits. Unknown dollar pricing is
+ * intentionally not treated as zero.
+ */
+export function estimateExceedsBudget(
+  estimate: {
+    inputTokenLow: number;
+    outputTokenLow: number;
+    estimatedUsdLow: number | null;
+  },
+  budget: Orchestration["budget"],
+): string | null {
+  if (
+    budget.maxInputTokens !== null &&
+    estimate.inputTokenLow > budget.maxInputTokens
+  ) {
+    return "Estimated input tokens already exceed the configured hard budget";
+  }
+  if (
+    budget.maxOutputTokens !== null &&
+    estimate.outputTokenLow > budget.maxOutputTokens
+  ) {
+    return "Estimated output tokens already exceed the configured hard budget";
+  }
+  if (
+    budget.maxEstimatedUsd !== null &&
+    estimate.estimatedUsdLow !== null &&
+    estimate.estimatedUsdLow > budget.maxEstimatedUsd
+  ) {
+    return "Estimated cost already exceeds the configured hard budget";
+  }
+  return null;
+}
+
 function modelCallCount(orchestration: Orchestration): number {
   return Object.values(orchestration.usage.byRole).reduce(
     (total, usage) => total + (usage?.modelCalls ?? 0),
