@@ -24,15 +24,19 @@ export function buildCodexArgs(
   sandboxMode: AppConfig["codexSandboxMode"],
   workspacePath = request.workspacePath,
 ): string[] {
+  const effectiveSandboxMode = request.sandboxMode ?? sandboxMode;
   const args = [
     "exec",
     "--json",
     "--sandbox",
-    sandboxMode,
+    effectiveSandboxMode,
     "--skip-git-repo-check",
     "-C",
     workspacePath,
   ];
+  if (request.modelId) {
+    args.push("--model", request.modelId);
+  }
   if (request.threadId) {
     args.push("resume", request.threadId, request.prompt);
   } else {
@@ -113,8 +117,8 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
+  async cancel(executionId: string): Promise<boolean> {
+    const active = this.active.get(executionId);
     if (!active) {
       return false;
     }
@@ -125,14 +129,14 @@ export class CodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
-      throw new Error("Agent already has an active Codex process");
+    if (this.active.has(request.executionId)) {
+      throw new Error("Execution already has an active Codex process");
     }
 
     const args = buildCodexArgs(request, this.config.codexSandboxMode);
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
-      env: this.childEnvironment(),
+      env: this.childEnvironment(request.runtimeHomePath),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const settled = new Promise<void>((resolve) => {
@@ -147,7 +151,7 @@ export class CodexRunner implements AgentRunner {
       settled,
       forceKillTimer: null as NodeJS.Timeout | null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(request.executionId, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -219,11 +223,12 @@ export class CodexRunner implements AgentRunner {
         output,
         threadId: parsed.threadId,
         usage: parsed.usage,
+        ...(request.modelId ? { modelId: request.modelId, modelFallback: false } : {}),
       };
     } finally {
       clearTimeout(timeout);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
-      this.active.delete(request.agentId);
+      this.active.delete(request.executionId);
     }
   }
 
@@ -239,7 +244,7 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  private childEnvironment(): NodeJS.ProcessEnv {
+  private childEnvironment(runtimeHomePath = this.config.codexHome): NodeJS.ProcessEnv {
     const inheritedNames = [
       "PATH",
       "HOME",
@@ -255,7 +260,7 @@ export class CodexRunner implements AgentRunner {
       "TERM",
     ] as const;
     const environment: NodeJS.ProcessEnv = {
-      CODEX_HOME: this.config.codexHome,
+      CODEX_HOME: runtimeHomePath,
       ARK_API_KEY: this.config.arkApiKey,
       NO_COLOR: "1",
     };

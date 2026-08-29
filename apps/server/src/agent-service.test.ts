@@ -5,7 +5,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { JsonStore } from "./store.js";
-import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
+import type {
+  AgentExecutionCoordinator,
+  AgentRunner,
+  RunnerRequest,
+  RunnerResult,
+} from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -35,7 +40,10 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeService(
+  runner: AgentRunner = new FakeRunner(),
+  coordinator?: AgentExecutionCoordinator,
+): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -51,6 +59,7 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     new JsonStore(path.join(root, "data", "db.json")),
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
+    coordinator,
   );
   await service.initialize();
   return service;
@@ -128,6 +137,31 @@ describe("Agent lifecycle", () => {
     });
 
     finish({ output: "done", threadId: "thread", usage: null });
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("coordinates direct admission and Agent lifecycle cancellation", async () => {
+    const cancelled: string[] = [];
+    let blocked = true;
+    const coordinator: AgentExecutionCoordinator = {
+      assertAgentAvailableForDirect: async (agentId) => {
+        if (blocked) throw new Error(`orchestration active for ${agentId}`);
+      },
+      hasActiveOrchestration: async () => blocked,
+      cancelForAgent: async (agentId) => {
+        cancelled.push(agentId);
+        blocked = false;
+        return true;
+      },
+    };
+    const service = await makeService(new FakeRunner(), coordinator);
+    const agent = await service.createAgent({ name: "Coordinated" });
+    await expect(service.sendMessage(agent.id, "blocked")).rejects.toThrow("orchestration active");
+    expect(service.getMessages(agent.id)).toHaveLength(0);
+    await service.stopAgent(agent.id);
+    expect(cancelled).toEqual([agent.id]);
+    await service.startAgent(agent.id);
+    const { run } = await service.sendMessage(agent.id, "allowed");
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
 });

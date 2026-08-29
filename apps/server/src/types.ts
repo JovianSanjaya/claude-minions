@@ -1,3 +1,5 @@
+import type { ModelRole } from "./orchestration/contracts.js";
+
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
@@ -66,17 +68,32 @@ export interface RunnerResult {
   output: string;
   threadId: string | null;
   usage: RunUsage | null;
+  modelId?: string | undefined;
+  modelFallback?: boolean | undefined;
 }
 
 export interface RunnerRequest {
+  executionId: string;
   agentId: string;
   workspacePath: string;
   prompt: string;
   threadId: string | null;
+  orchestrationId?: string | undefined;
+  taskId?: string | undefined;
+  role?: ModelRole | undefined;
+  modelId?: string | undefined;
+  runtimeHomePath?: string | undefined;
+  sandboxMode?: "read-only" | "workspace-write" | undefined;
 }
 
 export interface AgentRunner {
   run(request: RunnerRequest): Promise<RunnerResult>;
-  cancel(agentId: string): Promise<boolean>;
+  cancel(executionId: string): Promise<boolean>;
   isAvailable(): Promise<boolean>;
+}
+
+export interface AgentExecutionCoordinator {
+  assertAgentAvailableForDirect(agentId: string): Promise<void>;
+  hasActiveOrchestration(agentId: string): Promise<boolean>;
+  cancelForAgent(agentId: string): Promise<boolean>;
 }

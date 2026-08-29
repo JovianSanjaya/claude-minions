@@ -29,18 +29,19 @@ interface ParsedEvents {
   errors: string[];
 }
 
-export function containerName(agentId: string, instanceId = "default"): string {
+export function containerName(executionId: string, instanceId = "default"): string {
   const safeInstance = instanceId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 32);
-  const safeAgent = agentId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
-  return "launchpad-" + safeInstance + "-" + safeAgent;
+  const safeExecution = executionId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
+  return "launchpad-" + safeInstance + "-" + safeExecution;
 }
 
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
 ): string[] {
-  const name = containerName(request.agentId, config.runtimeInstanceId);
+  const name = containerName(request.executionId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
+  const runtimeHomePath = request.runtimeHomePath ?? config.codexHome;
   return [
     "run",
     "--rm",
@@ -51,6 +52,12 @@ export function buildContainerRunArgs(
     "io.codejam.launchpad=agent-runtime",
     "--label",
     "io.codejam.agent-id=" + request.agentId,
+    "--label",
+    "io.codejam.execution-id=" + request.executionId,
+    ...(request.orchestrationId
+      ? ["--label", "io.codejam.orchestration-id=" + request.orchestrationId]
+      : []),
+    ...(request.taskId ? ["--label", "io.codejam.task-id=" + request.taskId] : []),
     "--label",
     "io.codejam.instance-id=" + config.runtimeInstanceId,
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
@@ -77,9 +84,12 @@ export function buildContainerRunArgs(
     "--env",
     "NO_COLOR=1",
     "--mount",
-    "type=bind,src=" + request.workspacePath + ",dst=/workspace",
+    "type=bind,src=" +
+      request.workspacePath +
+      ",dst=/workspace" +
+      (request.sandboxMode === "read-only" ? ",readonly" : ""),
     "--mount",
-    "type=bind,src=" + config.codexHome + ",dst=/codex-home",
+    "type=bind,src=" + runtimeHomePath + ",dst=/codex-home",
     "--workdir",
     "/workspace",
     config.containerRuntimeImage,
@@ -110,8 +120,8 @@ export class ContainerCodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
+  async cancel(executionId: string): Promise<boolean> {
+    const active = this.active.get(executionId);
     if (!active) return false;
 
     active.cancelled = true;
@@ -138,8 +148,8 @@ export class ContainerCodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
-      throw new Error("Agent already has an active Runtime container");
+    if (this.active.has(request.executionId)) {
+      throw new Error("Execution already has an active Runtime container");
     }
 
     const child = spawn(
@@ -157,14 +167,14 @@ export class ContainerCodexRunner implements AgentRunner {
     });
     const active: ActiveContainer = {
       child,
-      containerName: containerName(request.agentId, this.config.runtimeInstanceId),
+      containerName: containerName(request.executionId, this.config.runtimeInstanceId),
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
       settled,
       termination: null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(request.executionId, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -228,10 +238,15 @@ export class ContainerCodexRunner implements AgentRunner {
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) throw new Error("Codex completed without an agent message");
-      return { output, threadId: parsed.threadId, usage: parsed.usage };
+      return {
+        output,
+        threadId: parsed.threadId,
+        usage: parsed.usage,
+        ...(request.modelId ? { modelId: request.modelId, modelFallback: false } : {}),
+      };
     } finally {
       clearTimeout(timeout);
-      this.active.delete(request.agentId);
+      this.active.delete(request.executionId);
     }
   }
 
