@@ -82,10 +82,19 @@ describe("orchestration routes", () => {
 
     const accepted = await app.inject({
       method: "POST", url: `/api/agents/${AGENT_ID}/orchestrations`,
-      payload: { prompt: "Do work", requestedMode: "auto" },
+      payload: { prompt: "Do work" },
     });
     expect(accepted.statusCode).toBe(202);
     const id = accepted.json().orchestration.id as string;
+    expect(accepted.json().orchestration.requestedMode).toBe("auto");
+    await service.waitForIdle(id);
+
+    const revised = await app.inject({
+      method: "PATCH",
+      url: `/api/orchestrations/${id}/intent`,
+      payload: { note: "Preserve compatibility" },
+    });
+    expect(revised.statusCode).toBe(202);
     await service.waitForIdle(id);
 
     const listed = await app.inject({ method: "GET", url: `/api/agents/${AGENT_ID}/orchestrations` });

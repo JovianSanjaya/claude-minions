@@ -4,6 +4,7 @@ import {
   actualUsageCost,
   commitUsageToDatabase,
   decideReservation,
+  estimateExceedsBudget,
   type ModelPricing,
 } from "./budget-ledger.js";
 import { emptyOrchestrationDatabase } from "./store.js";
@@ -39,6 +40,22 @@ const reservation: ModelCallReservation = {
 };
 
 describe("budget ledger", () => {
+  it("blocks confirmation when the low estimate cannot fit the hard budget", () => {
+    const item = orchestration();
+    expect(
+      estimateExceedsBudget(
+        { inputTokenLow: 1_001, outputTokenLow: 1, estimatedUsdLow: null },
+        item.budget,
+      ),
+    ).toBe("Estimated input tokens already exceed the configured hard budget");
+    expect(
+      estimateExceedsBudget(
+        { inputTokenLow: 100, outputTokenLow: 100, estimatedUsdLow: null },
+        item.budget,
+      ),
+    ).toBeNull();
+  });
+
   it("gates token, call, cost, and wall-clock reservations", () => {
     const item = orchestration();
     expect(decideReservation(item, [], reservation, pricing, 5_000).decision.allowed).toBe(true);

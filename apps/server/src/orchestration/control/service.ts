@@ -24,6 +24,7 @@ import type {
 import {
   commitUsageToDatabase,
   decideReservation,
+  estimateExceedsBudget,
   type ModelPricing,
 } from "./budget-ledger.js";
 import {
@@ -352,7 +353,6 @@ export class OrchestrationControlService implements OrchestrationSink {
       const orchestration = findOrchestration(database, orchestrationId);
       assertTransition(orchestration.status, "drafting-intent");
       orchestration.status = "drafting-intent";
-      orchestration.prompt = redactString(`${orchestration.prompt}\n\nUser revision:\n${feedback}`, 50_000);
       orchestration.updatedAt = this.now().toISOString();
       database.events.push(
         this.makeEvent(orchestrationId, "intent-revision-requested", "The user requested a new immutable intent revision", {
@@ -361,7 +361,13 @@ export class OrchestrationControlService implements OrchestrationSink {
       );
     });
     this.launch(orchestrationId, (signal) =>
-      this.elaborate(orchestrationId, agent.workspacePath, nextRevision, signal),
+      this.elaborate(
+        orchestrationId,
+        agent.workspacePath,
+        nextRevision,
+        signal,
+        `${model.orchestration.prompt}\n\nUser revision:\n${feedback}`,
+      ),
     );
     return this.getOrchestration(orchestrationId).orchestration;
   }
@@ -378,6 +384,13 @@ export class OrchestrationControlService implements OrchestrationSink {
       throw new OrchestrationSemanticError(
         "Resolve all material questions through an intent revision before confirmation",
       );
+    }
+    if (model.orchestration.estimate) {
+      const budgetConflict = estimateExceedsBudget(
+        model.orchestration.estimate,
+        model.orchestration.budget,
+      );
+      if (budgetConflict) throw new OrchestrationSemanticError(budgetConflict);
     }
     const contractCriteria = criteria?.length ? criteria : this.deriveCriteria(draft);
     this.validateCriteria(contractCriteria);
@@ -731,13 +744,14 @@ export class OrchestrationControlService implements OrchestrationSink {
     workspacePath: string,
     revision: number,
     signal: AbortSignal,
+    promptOverride?: string,
   ): Promise<void> {
     const orchestration = this.getOrchestration(orchestrationId).orchestration;
     const result = await this.driver.elaborateIntent(
       {
         orchestrationId,
         agentId: orchestration.agentId,
-        prompt: orchestration.prompt,
+        prompt: redactString(promptOverride ?? orchestration.prompt, 50_000),
         requestedMode: orchestration.requestedMode,
         budget: orchestration.budget,
         workspacePath,

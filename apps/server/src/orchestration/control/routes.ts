@@ -42,15 +42,19 @@ const budgetSchema = z
 const createBody = z
   .object({
     prompt: z.string().trim().min(1).max(50_000),
-    requestedMode: z.enum(["auto", "direct", "orchestrated"]),
+    requestedMode: z.enum(["auto", "direct", "orchestrated"]).optional(),
     budget: budgetSchema.optional(),
   })
   .strict();
 const revisionBody = z
   .object({
-    revision: z.string().trim().min(1).max(20_000),
+    revision: z.string().trim().min(1).max(20_000).optional(),
+    note: z.string().trim().min(1).max(20_000).optional(),
   })
-  .strict();
+  .strict()
+  .refine((body) => Boolean(body.revision ?? body.note), {
+    message: "revision or note is required",
+  });
 const criterionSchema = z
   .object({
     id: z.string().min(1).max(200),
@@ -77,7 +81,7 @@ export function registerOrchestrationRoutes(
       : undefined;
     const orchestration = await service.createOrchestration(agentId, {
       prompt: body.prompt,
-      requestedMode: body.requestedMode,
+      requestedMode: body.requestedMode ?? "auto",
       ...(budget ? { budget } : {}),
     });
     return reply.code(202).send({ orchestration });
@@ -95,8 +99,11 @@ export function registerOrchestrationRoutes(
 
   app.patch("/api/orchestrations/:orchestrationId/intent", async (request, reply) => {
     const { orchestrationId } = parse(orchestrationParams, request.params);
-    const { revision } = parse(revisionBody, request.body);
-    const orchestration = await service.reviseIntent(orchestrationId, revision);
+    const body = parse(revisionBody, request.body);
+    const orchestration = await service.reviseIntent(
+      orchestrationId,
+      body.revision ?? body.note!,
+    );
     return reply.code(202).send({ orchestration });
   });
 

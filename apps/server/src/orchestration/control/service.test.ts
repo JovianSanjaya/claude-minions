@@ -120,7 +120,9 @@ describe("OrchestrationControlService", () => {
 
     await service.reviseIntent(created.id, "Keep the public API stable");
     await service.waitForIdle(created.id);
-    expect(service.getOrchestration(created.id).intentHistory.map((item) => item.revision)).toEqual([1, 2]);
+    const revised = service.getOrchestration(created.id);
+    expect(revised.intentHistory.map((item) => item.revision)).toEqual([1, 2]);
+    expect(revised.orchestration.prompt).toBe("Build the feature");
 
     const contract = await service.confirm(created.id);
     await service.waitForIdle(created.id);
