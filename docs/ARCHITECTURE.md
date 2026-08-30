@@ -21,6 +21,64 @@ flowchart LR
     Control -. enforces .-> Integrate
 ```
 
+```mermaid
+flowchart TB
+    UI["React UI<br/>Direct / Auto / Orchestrated"]
+
+    subgraph B1["Trust boundary 1 — browser to API"]
+        AUTH["Bearer-token check<br/>(not user identity)"]
+    end
+
+    subgraph CP["Control plane — Fastify + AgentService"]
+        API["API routes<br/>validation"]
+        CTRL["Orchestration control service<br/>contract + state machine"]
+        STORE[("Atomic JSON store<br/>contracts / events / redacted evidence")]
+        BUDGET{{"ENFORCEMENT<br/>Budget ledger<br/>calls / tokens / attempts / wall-clock"}}
+        RECON(("RECOVERY<br/>Restart reconciliation<br/>interrupted -> cancelled, reservations released"))
+        ROUTER["Adaptive router<br/>direct / one worker / multi-worker"]
+        BROKER["Context broker<br/>minimum-context packets"]
+    end
+
+    subgraph B2["Trust boundary 2 — control plane to model calls"]
+        ROLES["Planner / Worker / Verifier / Integrator roles"]
+        RUNNER["AgentRunner"]
+    end
+
+    ARK["Volcengine ModelArk<br/>(Ark key stays server-side)"]
+
+    subgraph B3["Trust boundary 3 — main workspace vs. isolated worker copies"]
+        WORKERS["Isolated worker workspaces<br/>scoped file access, symlink/traversal checks"]
+    end
+
+    INTEGRATE["Deterministic-first integrator<br/>focused conflict resolution"]
+
+    subgraph B4["Trust boundary 4 — worker to protected verifier"]
+        VERIFY{{"ENFORCEMENT<br/>Verification service<br/>argv-only, allowlisted commands<br/>mode-0700, excluded from worker copies"}}
+    end
+
+    subgraph B5["Trust boundary 5 — staging to publish"]
+        MAIN["Main Agent workspace<br/>updated only after required verification passes"]
+    end
+
+    UI -->|HTTPS| AUTH --> API --> CTRL
+    CTRL <--> STORE
+    CTRL --> BUDGET
+    CTRL --> RECON
+    CTRL --> ROUTER --> BROKER --> ROLES
+    ROLES --> RUNNER --> ARK
+    ROLES --> WORKERS --> INTEGRATE --> VERIFY
+    VERIFY -->|pass| MAIN
+    VERIFY -.->|fail: no publish, evidence retained in STORE| STORE
+    BUDGET -.->|deny: exact stop reason, no model call| ROLES
+    RECON -.->|on restart| STORE
+
+    classDef enforce fill:#fdecea,stroke:#c0392b,stroke-width:1px
+    classDef recover fill:#eaf2fd,stroke:#2e5fa3,stroke-width:1px
+    classDef boundary fill:#fff,stroke:#999,stroke-dasharray: 4 3
+    class BUDGET,VERIFY enforce
+    class RECON recover
+```
+
 ## Components
 
 ### Web UI
