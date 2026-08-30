@@ -20,24 +20,32 @@ describe("Container Codex runner", () => {
     });
     const args = buildContainerRunArgs(
       {
+        executionId: "execution/unsafe",
         agentId: "agent/unsafe",
         workspacePath: "/tmp/agent-workspace",
         prompt: "write a small program",
         threadId: null,
+        orchestrationId: "orch-1",
+        taskId: "task-1",
+        runtimeHomePath: "/tmp/role-home",
+        sandboxMode: "read-only",
       },
       config,
     );
 
-    expect(containerName("agent/unsafe", "test-instance")).toBe(
-      "launchpad-test-instance-agent-unsafe",
+    expect(containerName("execution/unsafe", "test-instance")).toBe(
+      "launchpad-test-instance-execution-unsafe",
     );
     expect(args).toContain("runtime:test");
-    expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
-    expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
+    expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace,readonly");
+    expect(args).toContain("type=bind,src=/tmp/role-home,dst=/codex-home");
     expect(args).toContain("501:20");
-    expect(args).toContain("workspace-write");
+    expect(args).toContain("read-only");
     expect(args).toContain("/workspace");
     expect(args).toContain("io.codejam.instance-id=test-instance");
+    expect(args).toContain("io.codejam.execution-id=execution/unsafe");
+    expect(args).toContain("io.codejam.orchestration-id=orch-1");
+    expect(args).toContain("io.codejam.task-id=task-1");
     expect(args).toContain("keep-id");
     expect(args).not.toContain("secret-that-must-not-appear-in-argv");
   });
@@ -50,6 +58,7 @@ describe("Container Codex runner", () => {
     });
     const args = buildContainerRunArgs(
       {
+        executionId: "execution-2",
         agentId: "agent",
         workspacePath: "/tmp/workspace",
         prompt: "continue",

@@ -5,6 +5,7 @@ describe("Codex runner protocol", () => {
   it("builds a new-session invocation", () => {
     const args = buildCodexArgs(
       {
+        executionId: "execution-1",
         agentId: "agent",
         workspacePath: "/tmp/workspace",
         prompt: "build a calculator",
@@ -27,6 +28,7 @@ describe("Codex runner protocol", () => {
   it("resumes a stored Codex thread", () => {
     const args = buildCodexArgs(
       {
+        executionId: "execution-2",
         agentId: "agent",
         workspacePath: "/tmp/workspace",
         prompt: "add tests",
@@ -35,6 +37,41 @@ describe("Codex runner protocol", () => {
       "workspace-write",
     );
     expect(args.slice(-3)).toEqual(["resume", "thread-123", "add tests"]);
+  });
+
+  it("passes a trusted role model override as an argv element", () => {
+    const args = buildCodexArgs(
+      {
+        executionId: "execution-model",
+        agentId: "agent",
+        workspacePath: "/tmp/workspace",
+        prompt: "plan",
+        threadId: null,
+        role: "planner",
+        modelId: "trusted-model-id",
+        sandboxMode: "read-only",
+      },
+      "read-only",
+    );
+    expect(args).toContain("trusted-model-id");
+    expect(args.slice(-3)).toEqual(["--model", "trusted-model-id", "plan"]);
+  });
+
+  it("truthfully omits unsupported model overrides", () => {
+    const args = buildCodexArgs(
+      {
+        executionId: "execution-fallback",
+        agentId: "agent",
+        workspacePath: "/tmp/workspace",
+        prompt: "work",
+        threadId: null,
+        modelId: "requested-role-model",
+      },
+      "workspace-write",
+      "/tmp/workspace",
+      false,
+    );
+    expect(args).not.toContain("requested-role-model");
   });
 
   it("extracts the session, final message and usage", () => {

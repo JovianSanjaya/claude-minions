@@ -1,4 +1,5 @@
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { OrchestrationApi } from "./orchestration/api-port";
 
 export class ApiError extends Error {
   constructor(
@@ -78,4 +79,18 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+};
+
+export const orchestrationApi: OrchestrationApi = {
+  list: (agentId) => request(`/api/agents/${agentId}/orchestrations`),
+  create: (agentId, input) => request(`/api/agents/${agentId}/orchestrations`, { method: "POST", body: JSON.stringify(input) }),
+  get: (id) => request(`/api/orchestrations/${id}`),
+  reviseIntent: (id, revision) => request(`/api/orchestrations/${id}/intent`, { method: "PATCH", body: JSON.stringify({ revision }) }),
+  confirm: (id, criteria) => request(`/api/orchestrations/${id}/confirm`, { method: "POST", body: JSON.stringify(criteria ? { criteria } : {}) }),
+  start: (id) => request(`/api/orchestrations/${id}/start`, { method: "POST" }),
+  cancel: (id) => request(`/api/orchestrations/${id}/cancel`, { method: "POST" }),
+  confirmAmendment: (id, amendmentId) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/confirm`, { method: "POST" }),
+  rejectAmendment: (id, amendmentId) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/reject`, { method: "POST" }),
+  createBenchmark: (agentId, input) => request(`/api/agents/${agentId}/benchmarks`, { method: "POST", body: JSON.stringify(input) }),
+  getBenchmark: (id) => request(`/api/benchmarks/${id}`),
 };

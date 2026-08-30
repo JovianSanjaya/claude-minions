@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
+import { writeCodexConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
@@ -23,6 +24,7 @@ export function buildCodexArgs(
   request: RunnerRequest,
   sandboxMode: AppConfig["codexSandboxMode"],
   workspacePath = request.workspacePath,
+  modelOverrideSupported = true,
 ): string[] {
   const args = [
     "exec",
@@ -33,6 +35,7 @@ export function buildCodexArgs(
     "-C",
     workspacePath,
   ];
+  if (request.modelId && modelOverrideSupported) args.push("--model", request.modelId);
   if (request.threadId) {
     args.push("resume", request.threadId, request.prompt);
   } else {
@@ -113,8 +116,8 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
+  async cancel(executionId: string): Promise<boolean> {
+    const active = this.active.get(executionId);
     if (!active) {
       return false;
     }
@@ -125,14 +128,23 @@ export class CodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
-      throw new Error("Agent already has an active Codex process");
+    if (this.active.has(request.executionId)) {
+      throw new Error("Execution already has an active Codex process");
     }
 
-    const args = buildCodexArgs(request, this.config.codexSandboxMode);
+    if (request.runtimeHomePath) {
+      await writeCodexConfig(this.config, request.runtimeHomePath);
+    }
+
+    const args = buildCodexArgs(
+      request,
+      request.sandboxMode ?? this.config.codexSandboxMode,
+      request.workspacePath,
+      this.config.codexModelOverrideSupported,
+    );
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
-      env: this.childEnvironment(),
+      env: this.childEnvironment(request.runtimeHomePath),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const settled = new Promise<void>((resolve) => {
@@ -147,7 +159,7 @@ export class CodexRunner implements AgentRunner {
       settled,
       forceKillTimer: null as NodeJS.Timeout | null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(request.executionId, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -219,11 +231,19 @@ export class CodexRunner implements AgentRunner {
         output,
         threadId: parsed.threadId,
         usage: parsed.usage,
+        modelId:
+          request.modelId && this.config.codexModelOverrideSupported
+            ? request.modelId
+            : this.config.arkModel,
+        modelFallback:
+          Boolean(request.modelId) &&
+          !this.config.codexModelOverrideSupported &&
+          request.modelId !== this.config.arkModel,
       };
     } finally {
       clearTimeout(timeout);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
-      this.active.delete(request.agentId);
+      this.active.delete(request.executionId);
     }
   }
 
@@ -239,7 +259,7 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  private childEnvironment(): NodeJS.ProcessEnv {
+  private childEnvironment(runtimeHomePath?: string): NodeJS.ProcessEnv {
     const inheritedNames = [
       "PATH",
       "HOME",
@@ -255,7 +275,7 @@ export class CodexRunner implements AgentRunner {
       "TERM",
     ] as const;
     const environment: NodeJS.ProcessEnv = {
-      CODEX_HOME: this.config.codexHome,
+      CODEX_HOME: runtimeHomePath ?? this.config.codexHome,
       ARK_API_KEY: this.config.arkApiKey,
       NO_COLOR: "1",
     };
