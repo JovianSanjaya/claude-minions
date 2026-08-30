@@ -1,7 +1,11 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
-import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
+import {
+  buildCodexArgs,
+  parseCodexEventLine,
+  resolveSandboxMode,
+} from "./codex-runner.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
@@ -29,18 +33,23 @@ interface ParsedEvents {
   errors: string[];
 }
 
-export function containerName(agentId: string, instanceId = "default"): string {
+/**
+ * Sanitizes an identifier (an execution ID for orchestrated and direct calls)
+ * into a container name. Kept generic so callers can name by any stable ID.
+ */
+export function containerName(executionId: string, instanceId = "default"): string {
   const safeInstance = instanceId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 32);
-  const safeAgent = agentId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
-  return "launchpad-" + safeInstance + "-" + safeAgent;
+  const safeExecution = executionId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
+  return "launchpad-" + safeInstance + "-" + safeExecution;
 }
 
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
 ): string[] {
-  const name = containerName(request.agentId, config.runtimeInstanceId);
+  const name = containerName(request.executionId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
+  const runtimeHome = request.runtimeHomePath ?? config.codexHome;
   return [
     "run",
     "--rm",
@@ -51,6 +60,13 @@ export function buildContainerRunArgs(
     "io.codejam.launchpad=agent-runtime",
     "--label",
     "io.codejam.agent-id=" + request.agentId,
+    "--label",
+    "io.codejam.execution-id=" + request.executionId,
+    ...(request.orchestrationId
+      ? ["--label", "io.codejam.orchestration-id=" + request.orchestrationId]
+      : []),
+    ...(request.taskId ? ["--label", "io.codejam.task-id=" + request.taskId] : []),
+    ...(request.role ? ["--label", "io.codejam.role=" + request.role] : []),
     "--label",
     "io.codejam.instance-id=" + config.runtimeInstanceId,
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
@@ -79,19 +95,56 @@ export function buildContainerRunArgs(
     "--mount",
     "type=bind,src=" + request.workspacePath + ",dst=/workspace",
     "--mount",
-    "type=bind,src=" + config.codexHome + ",dst=/codex-home",
+    "type=bind,src=" + runtimeHome + ",dst=/codex-home",
     "--workdir",
     "/workspace",
     config.containerRuntimeImage,
     "codex",
-    ...buildCodexArgs(request, config.codexSandboxMode, "/workspace"),
+    ...buildCodexArgs(
+      request,
+      resolveSandboxMode(request, config.codexSandboxMode),
+      "/workspace",
+    ),
   ];
 }
 
 export class ContainerCodexRunner implements AgentRunner {
   private readonly active = new Map<string, ActiveContainer>();
 
+  private modelOverrideSupport: boolean | null = null;
+
   constructor(private readonly config: AppConfig) {}
+
+  /**
+   * Probes the Runtime image once for `--model` support. Any failure (no
+   * engine, no image, unknown flag) reports `false` so all logical roles
+   * truthfully fall back to the single configured Ark model.
+   */
+  async supportsModelOverride(): Promise<boolean> {
+    if (this.modelOverrideSupport !== null) return this.modelOverrideSupport;
+    this.modelOverrideSupport = await (async () => {
+      try {
+        const { stdout } = await execFileAsync(
+          this.config.containerEngine,
+          [
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            this.config.containerRuntimeImage,
+            "codex",
+            "exec",
+            "--help",
+          ],
+          { timeout: 15_000, env: this.childEnvironment() },
+        );
+        return /(^|\s)--model(\s|=|,)/.test(stdout);
+      } catch {
+        return false;
+      }
+    })();
+    return this.modelOverrideSupport;
+  }
 
   async isAvailable(): Promise<boolean> {
     try {
@@ -110,8 +163,8 @@ export class ContainerCodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
+  async cancel(executionId: string): Promise<boolean> {
+    const active = this.active.get(executionId);
     if (!active) return false;
 
     active.cancelled = true;
@@ -138,8 +191,8 @@ export class ContainerCodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
-      throw new Error("Agent already has an active Runtime container");
+    if (this.active.has(request.executionId)) {
+      throw new Error("Execution already has an active Runtime container");
     }
 
     const child = spawn(
@@ -157,14 +210,14 @@ export class ContainerCodexRunner implements AgentRunner {
     });
     const active: ActiveContainer = {
       child,
-      containerName: containerName(request.agentId, this.config.runtimeInstanceId),
+      containerName: containerName(request.executionId, this.config.runtimeInstanceId),
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
       settled,
       termination: null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(request.executionId, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -231,7 +284,7 @@ export class ContainerCodexRunner implements AgentRunner {
       return { output, threadId: parsed.threadId, usage: parsed.usage };
     } finally {
       clearTimeout(timeout);
-      this.active.delete(request.agentId);
+      this.active.delete(request.executionId);
     }
   }
 

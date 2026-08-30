@@ -7,6 +7,10 @@ import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
+import { registerOrchestrationRoutes } from "./orchestration/control/routes.js";
+import type { OrchestrationControlService } from "./orchestration/control/service.js";
+import { registerBenchmarkRoutes } from "./orchestration/benchmark/routes.js";
+import type { BenchmarkService } from "./orchestration/benchmark/service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
@@ -23,9 +27,15 @@ const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
 
+export interface OrchestrationComposition {
+  control: OrchestrationControlService;
+  benchmark: BenchmarkService;
+}
+
 export async function createApp(
   config: AppConfig,
   service: AgentService,
+  orchestration?: OrchestrationComposition,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -127,6 +137,13 @@ export async function createApp(
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
   });
+
+  // Orchestration middleware: registered after the bearer-token hook above,
+  // so every new /api/* route it adds inherits the same authentication.
+  if (orchestration) {
+    registerOrchestrationRoutes(app, orchestration.control);
+    registerBenchmarkRoutes(app, orchestration.benchmark);
+  }
 
   if (config.nodeEnv === "production") {
     const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));

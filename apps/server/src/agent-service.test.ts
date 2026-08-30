@@ -5,7 +5,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { JsonStore } from "./store.js";
-import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
+import { HttpError } from "./errors.js";
+import type {
+  AgentExecutionCoordinator,
+  AgentRunner,
+  RunnerRequest,
+  RunnerResult,
+} from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -35,7 +41,10 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeService(
+  runner: AgentRunner = new FakeRunner(),
+  coordinator?: AgentExecutionCoordinator,
+): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -46,12 +55,20 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
   });
-  const service = new AgentService(
-    config,
-    new JsonStore(path.join(root, "data", "db.json")),
-    new WorkspaceManager(path.join(root, "workspaces")),
-    runner,
-  );
+  const service = coordinator
+    ? new AgentService(
+        config,
+        new JsonStore(path.join(root, "data", "db.json")),
+        new WorkspaceManager(path.join(root, "workspaces")),
+        runner,
+        coordinator,
+      )
+    : new AgentService(
+        config,
+        new JsonStore(path.join(root, "data", "db.json")),
+        new WorkspaceManager(path.join(root, "workspaces")),
+        runner,
+      );
   await service.initialize();
   return service;
 }
@@ -129,5 +146,98 @@ describe("Agent lifecycle", () => {
 
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+});
+
+describe("orchestration coordinator port", () => {
+  it("keeps working when the coordinator is omitted and passes the Run ID as the execution ID", async () => {
+    const seen: RunnerRequest[] = [];
+    const runner: AgentRunner = {
+      run: async (request) => {
+        seen.push({ ...request });
+        return { output: "ok", threadId: "thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Direct" });
+    const { run } = await service.sendMessage(agent.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.executionId).toBe(run.id);
+    expect(seen[0]?.agentId).toBe(agent.id);
+    // The direct path stays exactly as it was: no orchestration metadata.
+    expect(seen[0]?.orchestrationId).toBeUndefined();
+    expect(seen[0]?.role).toBeUndefined();
+    expect(seen[0]?.modelId).toBeUndefined();
+    expect(seen[0]?.sandboxMode).toBeUndefined();
+  });
+
+  it("refuses a direct Run when the coordinator says orchestration owns the workspace", async () => {
+    const calls: string[] = [];
+    const coordinator: AgentExecutionCoordinator = {
+      assertAgentAvailableForDirect: async (agentId) => {
+        calls.push("assert:" + agentId);
+        throw new HttpError(409, "An orchestration is using this Agent workspace");
+      },
+      hasActiveOrchestration: async () => true,
+      cancelForAgent: async (agentId) => {
+        calls.push("cancel:" + agentId);
+      },
+    };
+    const service = await makeService(new FakeRunner(), coordinator);
+    const agent = await service.createAgent({ name: "Coordinated" });
+
+    await expect(service.sendMessage(agent.id, "hello")).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    expect(calls).toEqual(["assert:" + agent.id]);
+    expect(service.getMessages(agent.id)).toHaveLength(0);
+    expect(service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("cancels orchestration work when an Agent is stopped or deleted", async () => {
+    const calls: string[] = [];
+    const coordinator: AgentExecutionCoordinator = {
+      assertAgentAvailableForDirect: async () => {},
+      hasActiveOrchestration: async () => false,
+      cancelForAgent: async (agentId) => {
+        calls.push("cancel:" + agentId);
+      },
+    };
+    const service = await makeService(new FakeRunner(), coordinator);
+    const agent = await service.createAgent({ name: "Coordinated" });
+
+    await service.stopAgent(agent.id);
+    await service.startAgent(agent.id);
+    await service.deleteAgent(agent.id);
+
+    expect(calls).toEqual(["cancel:" + agent.id, "cancel:" + agent.id]);
+  });
+
+  it("cancels the exact active execution rather than the Agent ID", async () => {
+    const cancelled: string[] = [];
+    let finish!: (result: RunnerResult) => void;
+    const pending = new Promise<RunnerResult>((resolve) => {
+      finish = resolve;
+    });
+    const runner: AgentRunner = {
+      run: () => pending,
+      cancel: async (executionId) => {
+        cancelled.push(executionId);
+        finish({ output: "cancelled", threadId: null, usage: null });
+        return true;
+      },
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Cancellable" });
+    const { run } = await service.sendMessage(agent.id, "long task");
+
+    await service.stopAgent(agent.id);
+    expect(cancelled).toEqual([run.id]);
+    expect(cancelled).not.toContain(agent.id);
   });
 });

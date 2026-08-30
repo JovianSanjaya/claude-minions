@@ -5,18 +5,21 @@ import { HttpError, RunCancelledError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
+  AgentExecutionCoordinator,
   AgentRun,
   AgentRunner,
   CreateAgentInput,
   Message,
   UpdateAgentInput,
 } from "./types.js";
+import { noopAgentExecutionCoordinator } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
+  private readonly activeExecutionIds = new Map<string, string>();
   private readonly cancellationRequests = new Set<string>();
 
   constructor(
@@ -24,6 +27,11 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    /**
+     * Optional orchestration coordinator. Defaults to a no-op so existing
+     * construction sites and tests keep working unchanged.
+     */
+    private readonly coordinator: AgentExecutionCoordinator = noopAgentExecutionCoordinator,
   ) {}
 
   async initialize(): Promise<void> {
@@ -106,6 +114,7 @@ export class AgentService {
 
   async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
+    await this.coordinator.cancelForAgent(id);
     await this.cancelExecution(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
@@ -122,6 +131,7 @@ export class AgentService {
 
   async stopAgent(id: string): Promise<Agent> {
     this.getAgent(id);
+    await this.coordinator.cancelForAgent(id);
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
   }
@@ -160,6 +170,7 @@ export class AgentService {
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
+    await this.coordinator.assertAgentAvailableForDirect(agentId);
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
@@ -201,12 +212,16 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
+    this.activeExecutionIds.set(agentId, run.id);
     const execution = this.executeRun(agentAtStart, run);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
         if (this.activeExecutions.get(agentId) === execution) {
           this.activeExecutions.delete(agentId);
+        }
+        if (this.activeExecutionIds.get(agentId) === run.id) {
+          this.activeExecutionIds.delete(agentId);
         }
       })
       .catch(() => undefined);
@@ -249,6 +264,7 @@ export class AgentService {
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        executionId: run.id,
       });
       const completedAt = now();
       await this.store.mutate((database) => {
@@ -314,7 +330,11 @@ export class AgentService {
   private async cancelExecution(agentId: string): Promise<void> {
     this.cancellationRequests.add(agentId);
     try {
-      await this.runner.cancel(agentId);
+      // Cancel the exact child execution owned by this Agent's active Run.
+      const executionId = this.activeExecutionIds.get(agentId);
+      if (executionId) {
+        await this.runner.cancel(executionId);
+      }
       const execution = this.activeExecutions.get(agentId);
       if (execution) {
         await execution;

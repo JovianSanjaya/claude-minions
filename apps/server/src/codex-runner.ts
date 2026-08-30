@@ -19,6 +19,22 @@ export interface ParsedEvents {
   errors: string[];
 }
 
+/**
+ * Resolves the sandbox mode for one request. An orchestrated call may only
+ * narrow the platform default to `read-only` or `workspace-write`; it can never
+ * escalate to `danger-full-access`.
+ */
+export function resolveSandboxMode(
+  request: RunnerRequest,
+  configured: AppConfig["codexSandboxMode"],
+): AppConfig["codexSandboxMode"] {
+  if (request.sandboxMode === "read-only") return "read-only";
+  if (request.sandboxMode === "workspace-write") {
+    return configured === "read-only" ? "read-only" : "workspace-write";
+  }
+  return configured;
+}
+
 export function buildCodexArgs(
   request: RunnerRequest,
   sandboxMode: AppConfig["codexSandboxMode"],
@@ -33,6 +49,11 @@ export function buildCodexArgs(
     "-C",
     workspacePath,
   ];
+  // Trusted, server-resolved model override only. The engine sets this
+  // exclusively when the installed Codex CLI advertises `--model`.
+  if (request.modelId) {
+    args.push("--model", request.modelId);
+  }
   if (request.threadId) {
     args.push("resume", request.threadId, request.prompt);
   } else {
@@ -99,6 +120,8 @@ export class CodexRunner implements AgentRunner {
     }
   >();
 
+  private modelOverrideSupport: boolean | null = null;
+
   constructor(private readonly config: AppConfig) {}
 
   async isAvailable(): Promise<boolean> {
@@ -113,8 +136,29 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
+  /**
+   * Reports whether the installed Codex CLI accepts a `--model` argument.
+   * When it does not, every logical role truthfully falls back to the single
+   * configured Ark model instead of fabricating multi-model behavior.
+   */
+  async supportsModelOverride(): Promise<boolean> {
+    if (this.modelOverrideSupport !== null) return this.modelOverrideSupport;
+    this.modelOverrideSupport = await (async () => {
+      try {
+        const { stdout } = await execFileAsync(this.config.codexBin, ["exec", "--help"], {
+          timeout: 5_000,
+          env: this.childEnvironment(),
+        });
+        return /(^|\s)--model(\s|=|,)/.test(stdout);
+      } catch {
+        return false;
+      }
+    })();
+    return this.modelOverrideSupport;
+  }
+
+  async cancel(executionId: string): Promise<boolean> {
+    const active = this.active.get(executionId);
     if (!active) {
       return false;
     }
@@ -125,14 +169,17 @@ export class CodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
-      throw new Error("Agent already has an active Codex process");
+    if (this.active.has(request.executionId)) {
+      throw new Error("Execution already has an active Codex process");
     }
 
-    const args = buildCodexArgs(request, this.config.codexSandboxMode);
+    const args = buildCodexArgs(
+      request,
+      resolveSandboxMode(request, this.config.codexSandboxMode),
+    );
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
-      env: this.childEnvironment(),
+      env: this.childEnvironment(request.runtimeHomePath),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const settled = new Promise<void>((resolve) => {
@@ -147,7 +194,7 @@ export class CodexRunner implements AgentRunner {
       settled,
       forceKillTimer: null as NodeJS.Timeout | null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(request.executionId, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -223,7 +270,7 @@ export class CodexRunner implements AgentRunner {
     } finally {
       clearTimeout(timeout);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
-      this.active.delete(request.agentId);
+      this.active.delete(request.executionId);
     }
   }
 
@@ -239,7 +286,7 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  private childEnvironment(): NodeJS.ProcessEnv {
+  private childEnvironment(runtimeHomePath?: string | undefined): NodeJS.ProcessEnv {
     const inheritedNames = [
       "PATH",
       "HOME",
@@ -255,7 +302,7 @@ export class CodexRunner implements AgentRunner {
       "TERM",
     ] as const;
     const environment: NodeJS.ProcessEnv = {
-      CODEX_HOME: this.config.codexHome,
+      CODEX_HOME: runtimeHomePath ?? this.config.codexHome,
       ARK_API_KEY: this.config.arkApiKey,
       NO_COLOR: "1",
     };

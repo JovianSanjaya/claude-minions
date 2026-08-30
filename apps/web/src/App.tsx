@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken } from "./api";
+import { api, ApiError, orchestrationApi, setAuthToken } from "./api";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import "./orchestration/orchestration.css";
+import { OrchestrationPanel } from "./orchestration/OrchestrationPanel";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -582,6 +584,31 @@ export default function App() {
                 </div>
               </form>
             </section>
+
+            <OrchestrationPanel
+              agentId={selected.id}
+              agentStatus={selected.status}
+              agentName={selected.name}
+              api={orchestrationApi}
+              system={system}
+              onDirectSend={async (content) => {
+                const result = await api.sendMessage(selected.id, content);
+                if (selectedIdRef.current === selected.id) {
+                  setMessages((current) => [...current, result.message]);
+                  setActiveRun(result.run);
+                }
+                setAgents((current) =>
+                  current.map((agent) =>
+                    agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+                  ),
+                );
+                await pollRun(result.run.id, selected.id);
+              }}
+              onTerminalState={() => {
+                void refreshAgents();
+                void refreshMessages(selected.id);
+              }}
+            />
           </>
         ) : (
           <div className="no-agent">

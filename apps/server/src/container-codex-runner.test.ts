@@ -24,6 +24,7 @@ describe("Container Codex runner", () => {
         workspacePath: "/tmp/agent-workspace",
         prompt: "write a small program",
         threadId: null,
+        executionId: "exec/unsafe",
       },
       config,
     );
@@ -31,6 +32,8 @@ describe("Container Codex runner", () => {
     expect(containerName("agent/unsafe", "test-instance")).toBe(
       "launchpad-test-instance-agent-unsafe",
     );
+    expect(args).toContain("launchpad-test-instance-exec-unsafe");
+    expect(args).toContain("io.codejam.execution-id=exec/unsafe");
     expect(args).toContain("runtime:test");
     expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
     expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
@@ -54,10 +57,40 @@ describe("Container Codex runner", () => {
         workspacePath: "/tmp/workspace",
         prompt: "continue",
         threadId: "thread-123",
+        executionId: "run-9",
       },
       config,
     );
     expect(args.slice(-3)).toEqual(["resume", "thread-123", "continue"]);
     expect(args).not.toContain("keep-id");
+  });
+
+  it("mounts a per-role Runtime home and correlates orchestration labels", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      CODEX_HOME: "/tmp/codex-home",
+      RUNTIME_PROVIDER: "container",
+    });
+    const args = buildContainerRunArgs(
+      {
+        agentId: "agent",
+        workspacePath: "/tmp/worker-snapshot",
+        prompt: "implement",
+        threadId: null,
+        executionId: "exec-worker-1",
+        orchestrationId: "orc-1",
+        taskId: "task-1",
+        role: "worker",
+        runtimeHomePath: "/tmp/runtime-homes/worker",
+        sandboxMode: "read-only",
+      },
+      config,
+    );
+    expect(args).toContain("type=bind,src=/tmp/runtime-homes/worker,dst=/codex-home");
+    expect(args).not.toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
+    expect(args).toContain("io.codejam.orchestration-id=orc-1");
+    expect(args).toContain("io.codejam.task-id=task-1");
+    expect(args).toContain("io.codejam.role=worker");
+    expect(args).toContain("read-only");
   });
 });
