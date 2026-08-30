@@ -54,6 +54,7 @@ export class RoleExecutor {
     private readonly models: RoleModelConfiguration,
     private readonly runtimeHomeRoot: string,
     private readonly newId: () => string = randomUUID,
+    private readonly modelCallTimeoutMs: number = 600_000,
   ) {}
 
   async text(input: RoleCallInput): Promise<RoleCallResult> {
@@ -116,6 +117,37 @@ export class RoleExecutor {
     const active = this.activeByOrchestration.get(input.orchestrationId) ?? new Set<string>();
     active.add(executionId);
     this.activeByOrchestration.set(input.orchestrationId, active);
+    const startedAt = Date.now();
+    await this.sink.recordEvent({
+      orchestrationId: input.orchestrationId,
+      taskId: input.taskId,
+      executionId,
+      type: "role-call-started",
+      actorRole: input.role,
+      modelId: requestedModelId,
+      summary: `${input.role} model call started`,
+      metadata: {
+        timeoutMs: this.modelCallTimeoutMs,
+        estimatedInputTokens: input.estimatedInputTokens ?? Math.max(1, Math.ceil(prompt.length / 4)),
+        estimatedOutputTokens: input.estimatedOutputTokens ?? 2_000,
+      },
+    });
+    const heartbeat = setInterval(() => {
+      void this.sink.recordEvent({
+        orchestrationId: input.orchestrationId,
+        taskId: input.taskId,
+        executionId,
+        type: "role-call-heartbeat",
+        actorRole: input.role,
+        modelId: requestedModelId,
+        summary: `${input.role} model call is still running`,
+        metadata: {
+          elapsedMs: Date.now() - startedAt,
+          timeoutMs: this.modelCallTimeoutMs,
+        },
+      }).catch(() => undefined);
+    }, 15_000);
+    heartbeat.unref();
     const runtimeHomePath = path.join(
       this.runtimeHomeRoot,
       input.orchestrationId.replace(/[^A-Za-z0-9_.-]/g, "-"),
@@ -147,8 +179,19 @@ export class RoleExecutor {
         cachedInputTokens: 0,
         outputTokens: 0,
       });
+      await this.sink.recordEvent({
+        orchestrationId: input.orchestrationId,
+        taskId: input.taskId,
+        executionId,
+        type: "role-call-failed",
+        actorRole: input.role,
+        modelId: requestedModelId,
+        summary: `${input.role} model call stopped with an error`,
+        metadata: {},
+      });
       throw error;
     } finally {
+      clearInterval(heartbeat);
       input.signal.removeEventListener("abort", onAbort);
       active.delete(executionId);
       if (!active.size) this.activeByOrchestration.delete(input.orchestrationId);

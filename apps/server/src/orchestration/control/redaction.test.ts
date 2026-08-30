@@ -37,4 +37,10 @@ describe("redaction", () => {
     };
     expect(redactClone(input)).toEqual(input);
   });
+
+  it("does not silently discard collection records after 250 entries", () => {
+    const events = Array.from({ length: 300 }, (_, index) => ({ index, summary: `event ${index}` }));
+    expect(redactClone(events)).toHaveLength(300);
+    expect(redactClone(events).at(-1)).toEqual({ index: 299, summary: "event 299" });
+  });
 });

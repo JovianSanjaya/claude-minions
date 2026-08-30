@@ -2,7 +2,11 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
 import { writeCodexConfig } from "./config.js";
-import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
+import {
+  buildCodexArgs,
+  consumeCodexOutputChunk,
+  parseCodexEventLine,
+} from "./codex-runner.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
@@ -94,7 +98,11 @@ export function buildContainerRunArgs(
     "codex",
     ...buildCodexArgs(
       request,
-      request.sandboxMode ?? config.codexSandboxMode,
+      // Docker/Podman is the security boundary here. Running Codex's Linux
+      // Landlock sandbox inside this already-restricted container fails on
+      // Docker Desktop before any tool can execute. Read-only calls remain
+      // protected by the read-only /workspace bind mount above.
+      "danger-full-access",
       "/workspace",
       config.codexModelOverrideSupported,
     ),
@@ -189,25 +197,12 @@ export class ContainerCodexRunner implements AgentRunner {
       usage: null,
       errors: [],
     };
-    let stdout = "";
-    let stderr = "";
-    let totalBytes = 0;
+    const streams = { stdoutBuffer: "", stderrTail: "", stdoutBytes: 0 };
 
     const consume = (chunk: Buffer, target: "stdout" | "stderr") => {
-      totalBytes += chunk.byteLength;
-      if (totalBytes > this.config.codexMaxOutputBytes) {
+      if (consumeCodexOutputChunk(streams, chunk, target, this.config.codexMaxOutputBytes, parsed)) {
         active.outputExceeded = true;
         void this.removeContainer(active);
-        return;
-      }
-      if (target === "stdout") {
-        stdout += chunk.toString("utf8");
-        const lines = stdout.split(/\r?\n/);
-        stdout = lines.pop() ?? "";
-        for (const line of lines) parseCodexEventLine(line, parsed);
-      } else {
-        stderr += chunk.toString("utf8");
-        if (stderr.length > 16_384) stderr = stderr.slice(-16_384);
       }
     };
 
@@ -225,7 +220,7 @@ export class ContainerCodexRunner implements AgentRunner {
         child.once("error", reject);
         child.once("close", (code) => resolve(code ?? 1));
       });
-      if (stdout.trim()) parseCodexEventLine(stdout.trim(), parsed);
+      if (streams.stdoutBuffer.trim()) parseCodexEventLine(streams.stdoutBuffer.trim(), parsed);
       if (active.cancelled) throw new RunCancelledError();
       if (active.timedOut) {
         throw new Error("Runtime timed out after " + this.config.codexTimeoutMs + " ms");
@@ -234,7 +229,7 @@ export class ContainerCodexRunner implements AgentRunner {
         throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
       }
       if (exitCode !== 0) {
-        const detail = parsed.errors.at(-1) ?? stderr.trim() ?? "No error detail";
+        const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
         throw new Error(
           this.config.containerEngine +
             " Runtime exited with code " +

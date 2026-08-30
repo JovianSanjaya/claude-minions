@@ -23,7 +23,7 @@ import { classifyFailure, createFailurePacket } from "./failure-packet.js";
 import { DeterministicIntegrator } from "./integrator.js";
 import { reviewPreflight } from "./preflight.js";
 import { RoleExecutor } from "./role-executor.js";
-import { selectRoute } from "./router.js";
+import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
 import { parseStructured, StructuredOutputError } from "./structured-output.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
 import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
@@ -75,9 +75,25 @@ describe("engine primitives", () => {
   });
 
   it("routes tiny, coupled, and modular work adaptively within budget", () => {
-    expect(selectRoute({ requestedMode: "auto", taskCount: 1, changedAreaCount: 1, coupling: "low", estimatedCalls: 2, estimatedContextTokens: 100, budget }).selectedMode).toBe("direct");
-    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 2, changedAreaCount: 2, coupling: "high", estimatedCalls: 4, estimatedContextTokens: 100, budget }).selectedMode).toBe("one-worker");
-    expect(selectRoute({ requestedMode: "auto", taskCount: 3, changedAreaCount: 3, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("multi-worker");
+    expect(selectRoute({ requestedMode: "auto", taskCount: 1, changedAreaCount: 1, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 2, estimatedContextTokens: 100, budget }).selectedMode).toBe("direct");
+    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 2, changedAreaCount: 2, hasOverlappingWriteScopes: false, coupling: "high", estimatedCalls: 4, estimatedContextTokens: 100, budget }).selectedMode).toBe("one-worker");
+    expect(selectRoute({ requestedMode: "auto", taskCount: 3, changedAreaCount: 3, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("multi-worker");
+    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 8, changedAreaCount: 1, hasOverlappingWriteScopes: true, coupling: "low", estimatedCalls: 20, estimatedContextTokens: 100, budget })).toEqual({
+      selectedMode: "one-worker",
+      reason: "Planned tasks share writable paths, so one coordinated worker avoids conflicting edits",
+    });
+    expect(tasksHaveOverlappingWriteScopes([
+      { allowedPaths: ["index.html"] },
+      { allowedPaths: ["index.html"] },
+    ])).toBe(true);
+    expect(tasksHaveOverlappingWriteScopes([
+      { allowedPaths: ["src"] },
+      { allowedPaths: ["src/app.ts"] },
+    ])).toBe(true);
+    expect(tasksHaveOverlappingWriteScopes([
+      { allowedPaths: ["src/app.ts"] },
+      { allowedPaths: ["tests/app.test.ts"] },
+    ])).toBe(false);
   });
 
   it("builds a deterministic map, minimizes context, and denies traversal/symlinks", async () => {
@@ -157,6 +173,7 @@ describe("engine primitives", () => {
     expect(result).toMatchObject({ requestedModelId: "p", actualModelId: "fallback-model", modelFallback: true });
     expect(new Set(seen).size).toBe(2);
     expect(sink.usage).toHaveLength(2);
+    expect(sink.events.filter((event) => event.type === "role-call-started")).toHaveLength(2);
   });
 
   it("sends the exact schema and reports safe field errors after a failed repair", async () => {
@@ -224,6 +241,17 @@ describe("engine primitives", () => {
     expect(candidate.conflicts).toEqual([]);
     await writeFile(path.join(main, "src", "a.ts"), "user change\n");
     await expect(integrator.publish(candidate, main)).rejects.toThrow("workspace changed");
+  });
+
+  it("refuses to publish an empty integration candidate", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "engine-empty-integrate-"));
+    temporary.push(root);
+    const main = path.join(root, "main");
+    await mkdir(main, { recursive: true });
+    await writeFile(path.join(main, "README.md"), "base\n");
+    const integrator = new DeterministicIntegrator(path.join(root, "temp"));
+    const candidate = await integrator.integrate("empty", main, []);
+    await expect(integrator.publish(candidate, main)).rejects.toThrow("no workspace changes");
   });
 
   it("gives the integrator only focused conflicting file variants", async () => {

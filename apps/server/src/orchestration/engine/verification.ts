@@ -1,11 +1,16 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 import type {
   OrchestrationSink,
   VerificationRecord,
 } from "../contracts.js";
+import {
+  protectedAcceptancePlanSchema,
+  type ProtectedAcceptancePlan,
+} from "./acceptance-plan.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +35,31 @@ export class VerificationService {
   async initialize(): Promise<void> {
     await mkdir(this.protectedRoot, { recursive: true, mode: 0o700 });
     await chmod(this.protectedRoot, 0o700);
+  }
+
+  async saveAcceptancePlan(plan: ProtectedAcceptancePlan): Promise<void> {
+    await this.initialize();
+    const parsed = protectedAcceptancePlanSchema.parse(plan);
+    const directory = this.planDirectory(parsed.orchestrationId);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    await writeFile(
+      path.join(directory, `contract-${parsed.contractVersion}.json`),
+      `${JSON.stringify(parsed, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  }
+
+  async loadAcceptancePlan(
+    orchestrationId: string,
+    contractVersion: number,
+  ): Promise<ProtectedAcceptancePlan> {
+    await this.initialize();
+    const source = await readFile(
+      path.join(this.planDirectory(orchestrationId), `contract-${contractVersion}.json`),
+      "utf8",
+    );
+    return protectedAcceptancePlanSchema.parse(JSON.parse(source));
   }
 
   async run(
@@ -86,6 +116,11 @@ export class VerificationService {
       records.push(record);
     }
     return records;
+  }
+
+  private planDirectory(orchestrationId: string): string {
+    const safeId = orchestrationId.replace(/[^A-Za-z0-9_.-]/g, "-");
+    return path.join(this.protectedRoot, safeId);
   }
 }
 

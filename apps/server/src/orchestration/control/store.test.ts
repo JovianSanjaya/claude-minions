@@ -75,4 +75,20 @@ describe("OrchestrationStore", () => {
     expect(disk).not.toContain("secret-key-value");
     expect(JSON.stringify(store.snapshot())).toContain("[REDACTED]");
   });
+
+  it("persists collections beyond 250 records without dropping newer entries", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "launchpad-control-history-"));
+    const file = path.join(directory, "orchestrations.json");
+    const store = new OrchestrationStore(file);
+    await store.initialize();
+    await store.mutate((database) => {
+      database.benchmarkReferences.push(
+        ...Array.from({ length: 300 }, (_, index) => ({ index })),
+      );
+    });
+    const reloaded = new OrchestrationStore(file);
+    await reloaded.initialize();
+    expect(reloaded.snapshot().benchmarkReferences).toHaveLength(300);
+    expect(reloaded.snapshot().benchmarkReferences.at(-1)).toEqual({ index: 299 });
+  });
 });

@@ -16,12 +16,16 @@ import type {
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
 import { buildApplicationMap, type DetailedApplicationMap } from "./application-map.js";
+import {
+  comprehensiveAcceptanceTests,
+  plannedAcceptanceTestSchema,
+} from "./acceptance-plan.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker } from "./context-broker.js";
 import { classifyFailure } from "./failure-packet.js";
 import { DeterministicIntegrator } from "./integrator.js";
 import { RoleExecutor, type RoleModelConfiguration } from "./role-executor.js";
-import { selectRoute } from "./router.js";
+import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
 import { BoundedWorkerLoop, type WorkerLoopResult, WorkerLoopError } from "./worker-loop.js";
 import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
@@ -58,6 +62,15 @@ const planSchema = z.object({
     acceptanceCriterionIds: z.array(z.string().max(200)).max(100).default([]),
     requiredArtifactIds: z.array(z.string().max(200)).max(100).default([]),
   })).min(1).max(20),
+  acceptanceTests: z.array(plannedAcceptanceTestSchema).max(200).default([]),
+}).strict();
+
+const acceptanceVerificationSchema = z.object({
+  results: z.array(z.object({
+    testId: z.string().min(1).max(200),
+    status: z.enum(["passed", "failed"]),
+    evidence: z.string().min(1).max(8_000),
+  }).strict()).max(200),
 }).strict();
 
 const conflictSchema = z.object({ content: z.string().max(200_000) }).strict();
@@ -82,6 +95,7 @@ export interface EngineDriverOptions {
   cleanupPolicy?: "clean" | "archive" | "retain";
   id?: () => string;
   clock?: () => Date;
+  modelCallTimeoutMs?: number;
 }
 
 function zeroUsage(): TokenUsage {
@@ -169,6 +183,19 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     this.maps.set(input.orchestration.id, map);
     await sink.recordApplicationMap(map.summary);
     const roles = this.roles(input.orchestration.id, sink);
+    const compactContract = {
+      version: input.contract.version,
+      goal: input.contract.intent.goal,
+      requirements: input.contract.intent.requirements,
+      architectureDecisions: input.contract.intent.architectureDecisions,
+      nonGoals: input.contract.intent.nonGoals,
+      criteria: input.contract.criteria.map(({ id, kind, description, verification }) => ({
+        id,
+        kind,
+        description,
+        verification,
+      })),
+    };
     const result = await roles.structured(
       {
         orchestrationId: input.orchestration.id,
@@ -180,19 +207,44 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         signal,
         prompt: [
           "Create a bounded coding plan for the explicitly confirmed contract. Do not edit files.",
-          `Contract: ${JSON.stringify(input.contract)}`,
+          `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
+          "Keep task objectives concise and implementation-focused. Do not repeat the full contract.",
+          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete, non-destructive, and independently verifiable against the final integrated candidate. Use manual scope only when automation cannot reasonably decide the result.",
+          "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
           "Return this exact JSON shape with no additional task fields:",
-          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}]}',
+          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
           "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative and must never begin with /workspace or contain '..'. Use exact criterion IDs from the confirmed contract.",
         ].join("\n").slice(0, 150_000),
       },
       planSchema,
     );
+    const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
+    await this.verification.saveAcceptancePlan({
+      orchestrationId: input.orchestration.id,
+      contractVersion: input.contract.version,
+      generatedBy: "planner",
+      tests: acceptanceTests,
+    });
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: result.executionId,
+      type: "acceptance-plan-created",
+      actorRole: "planner",
+      modelId: result.actualModelId,
+      summary: "Planner created the protected acceptance-test plan",
+      metadata: {
+        testCount: acceptanceTests.length,
+        coveredCriteria: new Set(acceptanceTests.flatMap((test) => test.criterionIds)).size,
+        contractVersion: input.contract.version,
+      },
+    });
     const route = selectRoute({
       requestedMode: input.orchestration.requestedMode,
       taskCount: result.value.tasks.length,
       changedAreaCount: new Set(result.value.tasks.flatMap((task) => task.allowedPaths.map((entry) => entry.split("/")[0]))).size,
+      hasOverlappingWriteScopes: tasksHaveOverlappingWriteScopes(result.value.tasks),
       coupling: result.value.coupling,
       estimatedCalls: result.value.estimatedCalls,
       estimatedContextTokens: result.value.estimatedContextTokens,
@@ -222,11 +274,16 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       };
     });
     if (route.selectedMode !== "multi-worker" && tasks.length > 1) {
+      const combinedObjective = tasks
+        .map((task) => task.objective.trim())
+        .filter((objective, index, values) => values.indexOf(objective) === index)
+        .join("; ")
+        .slice(0, 6_000);
       tasks = [{
         id: this.newId(),
         orchestrationId: input.orchestration.id,
         title: route.selectedMode === "direct" ? "Direct confirmed execution" : "Focused combined worker",
-        objective: tasks.map((task) => task.objective).join("; "),
+        objective: combinedObjective || input.contract.intent.goal,
         status: "ready",
         dependsOn: [],
         allowedPaths: [...new Set(tasks.flatMap((task) => task.allowedPaths))],
@@ -294,6 +351,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
                 map,
                 mainWorkspacePath: input.workspacePath,
                 signal,
+                deterministicPreflight: input.plan.selectedMode === "one-worker",
               }),
             ),
           );
@@ -351,6 +409,16 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         summary: "Deterministic-first integration candidate created",
         metadata: { changedFiles: candidate.changes.changedFiles.length, conflicts: candidate.conflicts.length },
       });
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: null,
+        executionId: null,
+        type: "verification-step",
+        actorRole: "control-plane",
+        modelId: null,
+        summary: "Started protected and global verification",
+        metadata: {},
+      });
       const verification = await this.verification.run(
         input.orchestration.id,
         null,
@@ -359,7 +427,14 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         sink,
         signal,
       );
-      if (!requiredVerificationPassed(verification)) {
+      const plannedVerification = await this.runPlannedAcceptanceVerification(
+        input,
+        roles,
+        candidate.path,
+        sink,
+        signal,
+      );
+      if (!requiredVerificationPassed([...verification, ...plannedVerification])) {
         await this.integrator.cleanup(candidate);
         await this.cleanup(results, "archive");
         await this.workspaces.cleanupOrchestration(input.orchestration.id, "clean");
@@ -456,6 +531,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       this.options.models,
       this.options.runtimeHomeRoot,
       this.newId,
+      this.options.modelCallTimeoutMs,
     );
     this.activeRoles.set(orchestrationId, roles);
     return roles;
@@ -497,6 +573,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       prompt: `Execute the confirmed direct task in the workspace. Edit only ${task.allowedPaths.join(", ")}. Contract: ${JSON.stringify(input.contract)}`,
     });
     const changes = await this.workspaces.changes(workspace);
+    if (!changes.changedFiles.length && !changes.deletedFiles.length) {
+      throw new Error("Direct execution reported completion without making any workspace changes");
+    }
     const violations = scopeViolations(changes, task.allowedPaths);
     if (violations.length) throw new Error(`Direct execution scope violation: ${violations.join(", ")}`);
     const visible = await this.verification.run(
@@ -532,6 +611,79 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       createdAt: now,
       decidedAt: null,
     };
+  }
+
+  private async runPlannedAcceptanceVerification(
+    input: ExecuteInput,
+    roles: RoleExecutor,
+    candidateWorkspacePath: string,
+    sink: OrchestrationSink,
+    signal: AbortSignal,
+  ) {
+    const plan = await this.verification.loadAcceptancePlan(
+      input.orchestration.id,
+      input.contract.version,
+    );
+    const automated = plan.tests.filter((test) => test.scope !== "manual");
+    const startedAt = this.now().toISOString();
+    const result = automated.length
+      ? await roles.structured(
+          {
+            orchestrationId: input.orchestration.id,
+            agentId: input.orchestration.agentId,
+            taskId: null,
+            role: "verifier",
+            workspacePath: candidateWorkspacePath,
+            sandboxMode: "read-only",
+            signal,
+            prompt: [
+              "Independently verify the integrated candidate. Do not edit any files.",
+              "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
+              "Return exactly one result for every supplied acceptance test. Passing requires concrete evidence; uncertainty, missing test infrastructure, or an unverified claim must fail.",
+              `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
+              `Protected planner-generated acceptance tests: ${JSON.stringify(automated)}`,
+            ].join("\n").slice(0, 150_000),
+          },
+          acceptanceVerificationSchema,
+        )
+      : null;
+    const returned = new Map(result?.value.results.map((entry) => [entry.testId, entry]) ?? []);
+    const records = [];
+    for (const test of plan.tests) {
+      const testResult = returned.get(test.id);
+      const manual = test.scope === "manual";
+      const record = {
+        id: this.newId(),
+        orchestrationId: input.orchestration.id,
+        taskId: null,
+        scope: manual ? "manual" as const : test.scope,
+        commandOrCheck: test.title,
+        status: manual ? "skipped" as const : testResult?.status ?? "failed" as const,
+        outputSummary: manual
+          ? `Manual review required: ${test.expectedOutcome}`
+          : testResult?.evidence ?? "Verifier omitted this required planner-generated acceptance test",
+        startedAt,
+        completedAt: this.now().toISOString(),
+      };
+      await sink.recordVerification(record);
+      records.push(record);
+    }
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: result?.executionId ?? null,
+      type: "acceptance-verification-completed",
+      actorRole: "verifier",
+      modelId: result?.actualModelId ?? this.options.models.verifier,
+      summary: "Big verifier evaluated the planner-generated acceptance tests",
+      metadata: {
+        testCount: records.length,
+        passed: records.filter((record) => record.status === "passed").length,
+        failed: records.filter((record) => record.status === "failed").length,
+        manual: records.filter((record) => record.status === "skipped").length,
+      },
+    });
+    return records;
   }
 
   private async cleanup(

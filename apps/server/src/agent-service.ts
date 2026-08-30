@@ -230,6 +230,8 @@ export class AgentService {
       arkConfigured: isArkConfigured(this.config),
       arkBaseUrl: this.config.arkBaseUrl,
       arkModel: this.config.arkModel || null,
+      orchestrationBigModel: this.config.orchestrationModels.planner || null,
+      orchestrationSmallModel: this.config.orchestrationModels.worker || null,
       codexAvailable: await this.runner.isAvailable(),
       codexSandboxMode: this.config.codexSandboxMode,
       runtimeProvider: this.config.runtimeProvider,

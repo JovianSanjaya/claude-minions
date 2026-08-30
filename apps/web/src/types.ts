@@ -42,6 +42,8 @@ export interface SystemInfo {
   arkConfigured: boolean;
   arkBaseUrl: string;
   arkModel: string | null;
+  orchestrationBigModel: string | null;
+  orchestrationSmallModel: string | null;
   codexAvailable: boolean;
   codexSandboxMode: string;
   runtimeProvider: "local-process" | "container";

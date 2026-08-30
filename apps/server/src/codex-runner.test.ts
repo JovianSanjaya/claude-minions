@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
+import {
+  buildCodexArgs,
+  consumeCodexOutputChunk,
+  parseCodexEventLine,
+} from "./codex-runner.js";
 
 describe("Codex runner protocol", () => {
   it("builds a new-session invocation", () => {
@@ -106,5 +110,23 @@ describe("Codex runner protocol", () => {
     expect(parsed.threadId).toBe("thread-123");
     expect(parsed.messages).toEqual(["Done."]);
     expect(parsed.usage).toEqual({ inputTokens: 10, outputTokens: 4 });
+  });
+
+  it("tail-caps diagnostic stderr without charging it to the stdout result limit", () => {
+    const parsed = { messages: [], threadId: null, usage: null, errors: [] };
+    const accumulator = { stdoutBuffer: "", stderrTail: "", stdoutBytes: 0 };
+    const noisyDiagnostic = Buffer.from("ReasoningSummaryDelta without active item\n".repeat(1_000));
+
+    expect(consumeCodexOutputChunk(accumulator, noisyDiagnostic, "stderr", 128, parsed)).toBe(false);
+    expect(accumulator.stdoutBytes).toBe(0);
+    expect(accumulator.stderrTail.length).toBeLessThanOrEqual(16_384);
+
+    const event = Buffer.from(JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "Done." },
+    }) + "\n");
+    expect(consumeCodexOutputChunk(accumulator, event, "stdout", 256, parsed)).toBe(false);
+    expect(parsed.messages).toEqual(["Done."]);
+    expect(consumeCodexOutputChunk(accumulator, Buffer.alloc(257), "stdout", 256, parsed)).toBe(true);
   });
 });
