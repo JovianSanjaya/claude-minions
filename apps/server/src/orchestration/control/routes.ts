@@ -69,6 +69,9 @@ const confirmBody = z
     answers: z.array(z.string().trim().min(1).max(4_000)).max(50).optional(),
   })
   .strict();
+const amendmentConfirmBody = z.object({
+  response: z.string().trim().min(1).max(20_000).optional(),
+}).strict();
 
 export function registerOrchestrationRoutes(
   app: FastifyInstance,
@@ -159,7 +162,8 @@ export function registerOrchestrationRoutes(
     "/api/orchestrations/:orchestrationId/amendments/:amendmentId/confirm",
     async (request, reply) => {
       const { orchestrationId, amendmentId } = parse(amendmentParams, request.params);
-      const contract = await service.confirmAmendment(orchestrationId, amendmentId);
+      const body = parse(amendmentConfirmBody, request.body ?? {});
+      const contract = await service.confirmAmendment(orchestrationId, amendmentId, body.response);
       return reply.code(202).send({ contract });
     },
   );

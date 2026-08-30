@@ -17,6 +17,7 @@ Trust boundaries exist at browser-to-API authentication, control-plane-to-model 
 | Stale shared artifacts | Versioned artifacts, observed versions, targeted stale-task refresh and new preflight/context. |
 | Malicious package scripts | Trusted verification allowlist; arbitrary browser/model shell strings are not verification commands. Workspace-write execution still carries residual risk. |
 | Partial or conflicting publish | Isolated task copies, base manifest comparison, staging, deterministic-first merge, required global/protected checks, no publish on failure. |
+| Browser/runtime verification escape | Disposable container, read-only candidate mount, read-only root filesystem, bounded temporary filesystem and shared memory, dropped Linux capabilities, no-new-privileges, dedicated Chromium profile under `/tmp`, and no host browser/profile mount. |
 | Restart inconsistency | Interrupted states reconcile to cancellation; reservations are released and evidence retained. |
 
 ## Non-goals and residual risk

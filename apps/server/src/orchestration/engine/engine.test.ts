@@ -16,7 +16,12 @@ import type {
   WorkerAttempt,
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
-import { buildApplicationMap } from "./application-map.js";
+import {
+  buildApplicationMap,
+  isApplicationMapExcluded,
+  isProtectedEnvironmentPath,
+  isSafeEnvironmentTemplatePath,
+} from "./application-map.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker } from "./context-broker.js";
 import { classifyFailure, createFailurePacket } from "./failure-packet.js";
@@ -104,10 +109,11 @@ describe("engine primitives", () => {
     await writeFile(path.join(root, "src", "api.ts"), "export interface Api { ok: boolean }\n");
     await writeFile(path.join(root, "src", "other.ts"), "export const other = 1\n");
     await writeFile(path.join(root, ".env"), "ARK_API_KEY=secret\n");
+    await writeFile(path.join(root, ".env.example"), "ARK_API_KEY=replace-me\n");
     await writeFile(path.join(root, "node_modules", "ignored.js"), "ignored");
     await symlink(path.join(root, ".env"), path.join(root, "src", "escape.ts"));
     const map = await buildApplicationMap(root, "o1");
-    expect(map.entries.map((entry) => entry.path)).toEqual(["src/api.ts", "src/other.ts"]);
+    expect(map.entries.map((entry) => entry.path)).toEqual([".env.example", "src/api.ts", "src/other.ts"]);
     const task: OrchestrationTask = {
       id: "t1", orchestrationId: "o1", title: "API", objective: "Change API",
       status: "ready", dependsOn: [], allowedPaths: ["src/api.ts"],
@@ -124,6 +130,30 @@ describe("engine primitives", () => {
       .toHaveLength(1);
     await expect(bounded.expand(task, map, 1, {}, ["src/api.ts"], "another"))
       .rejects.toThrow("budget exhausted");
+  });
+
+  it("allows environment templates while protecting real environment files at any depth", () => {
+    for (const template of [
+      ".env.example",
+      ".env.sample",
+      ".env.template",
+      "apps/web/.env.example",
+    ]) {
+      expect(isSafeEnvironmentTemplatePath(template)).toBe(true);
+      expect(isProtectedEnvironmentPath(template)).toBe(false);
+      expect(isApplicationMapExcluded(template)).toBe(false);
+    }
+    for (const secretFile of [
+      ".env",
+      ".env.local",
+      ".env.production",
+      "apps/server/.env",
+      "apps/server/.env.production.local",
+    ]) {
+      expect(isSafeEnvironmentTemplatePath(secretFile)).toBe(false);
+      expect(isProtectedEnvironmentPath(secretFile)).toBe(true);
+      expect(isApplicationMapExcluded(secretFile)).toBe(true);
+    }
   });
 
   it("isolates worker changes, detects scope violations, and cleans only task paths", async () => {

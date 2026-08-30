@@ -140,6 +140,28 @@ export class DeterministicIntegrator {
     return touched.sort();
   }
 
+  async refresh(candidate: IntegrationCandidate): Promise<IntegrationCandidate> {
+    const manifest = await workspaceManifest(candidate.path);
+    return {
+      ...candidate,
+      manifest,
+      changes: diffManifest(candidate.base, manifest),
+    };
+  }
+
+  async discard(orchestrationId: string): Promise<void> {
+    const root = await realpath(this.tempRoot);
+    const target = path.join(
+      root,
+      orchestrationId.replace(/[^A-Za-z0-9_.-]/g, "-"),
+      "integration",
+    );
+    if (target === root || !target.startsWith(`${root}${path.sep}`)) {
+      throw new Error("Refusing unsafe integration discard target");
+    }
+    await rm(target, { recursive: true, force: true });
+  }
+
   async cleanup(candidate: IntegrationCandidate): Promise<void> {
     const root = await realpath(this.tempRoot);
     const target = await realpath(candidate.path);

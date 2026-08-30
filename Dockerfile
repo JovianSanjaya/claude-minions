@@ -27,7 +27,7 @@ RUN if [ -n "$DEBIAN_SECURITY_MIRROR" ]; then \
         -exec sed -i "s|http://deb.debian.org/debian|$DEBIAN_MIRROR|g" {} +; \
     fi \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git ripgrep \
+    && apt-get install -y --no-install-recommends ca-certificates git ripgrep chromium fonts-liberation \
     && npm install --global @openai/codex@0.111.0 \
     && codex --version \
     && rm -rf /var/lib/apt/lists/*
@@ -36,6 +36,12 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/apps/server/package.json ./apps/server/package.json
 COPY --from=build /app/apps/server/dist ./apps/server/dist
 COPY --from=build /app/apps/web/dist ./apps/web/dist
+
+ENV CHROME_BIN=/usr/bin/chromium
+ENV TMPDIR=/tmp
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV XDG_CONFIG_HOME=/tmp/.config
+ENV XDG_RUNTIME_DIR=/tmp/runtime
 
 RUN mkdir -p /app/data /app/workspaces /app/codex-home \
     && chown -R node:node /app

@@ -302,6 +302,48 @@ describe("OrchestrationControlService", () => {
     expect(after.amendments[0]?.status).toBe("confirmed");
   });
 
+  it("requires and preserves the user's answer to a recovery question", async () => {
+    const driver = new FakeDriver();
+    driver.reconciledIntent.requirements = ["Use a file URL instead of opening a socket"];
+    const { service } = await fixture(driver);
+    const id = await createReady(service);
+    const current = service.getOrchestration(id);
+    const amendment: ContractAmendment = {
+      id: randomUUID(), orchestrationId: id, baseContractId: current.activeContract!.id,
+      proposedIntent: {
+        ...current.activeDraft!,
+        id: randomUUID(),
+        revision: 2,
+        materialQuestions: ["Allow the local server permission or choose a file URL?"],
+      },
+      proposedCriteria: null,
+      reason: "The verifier cannot bind a local socket without user-controlled permission",
+      material: true,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      decidedAt: null,
+    };
+    driver.outcome = { kind: "needs-user", amendment };
+    await service.start(id);
+    await service.waitForIdle(id);
+
+    await expect(service.confirmAmendment(id, amendment.id)).rejects.toThrow(
+      "A response is required",
+    );
+    await service.confirmAmendment(id, amendment.id, "Use a file URL instead of opening a socket");
+    await service.waitForIdle(id);
+
+    const after = service.getOrchestration(id);
+    expect(after.activeContract?.intent.materialQuestions).toEqual([]);
+    expect(after.activeContract?.intent.requirements.at(-1)).toContain(
+      "Use a file URL instead of opening a socket",
+    );
+    expect(after.events).toContainEqual(expect.objectContaining({
+      type: "amendment-confirmed",
+      metadata: expect.objectContaining({ responseProvided: true }),
+    }));
+  });
+
   it("reconciles interrupted execution to cancelled after restart", async () => {
     const driver = new FakeDriver();
     driver.blockExecution = true;

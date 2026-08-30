@@ -82,6 +82,7 @@ export interface RunnerRequest {
   modelId?: string | undefined;
   runtimeHomePath?: string | undefined;
   sandboxMode?: "read-only" | "workspace-write" | undefined;
+  runtimeProfile?: "default" | "verification" | undefined;
 }
 
 export interface AgentRunner {

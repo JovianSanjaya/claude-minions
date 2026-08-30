@@ -18,6 +18,10 @@ import {
   workerPreflightSchema,
   type PreflightDecision,
 } from "./preflight.js";
+import {
+  recoveryDecisionSchema,
+  type RecoveryDecision,
+} from "./recovery.js";
 import { RoleExecutor } from "./role-executor.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
 import {
@@ -48,7 +52,10 @@ export interface WorkerLoopResult {
 }
 
 export class WorkerLoopError extends Error {
-  constructor(public readonly packet: ReturnType<typeof createFailurePacket>) {
+  constructor(
+    public readonly packet: ReturnType<typeof createFailurePacket>,
+    public readonly supervisorDecision: RecoveryDecision | null = null,
+  ) {
     super(packet.lastError);
     this.name = "WorkerLoopError";
   }
@@ -281,6 +288,7 @@ export class BoundedWorkerLoop {
     let lastDiagnosis = "";
     let lastChanges: WorkspaceChanges = { changedFiles: [], deletedFiles: [], hashes: {} };
     let lastVerifications: Awaited<ReturnType<VerificationService["run"]>> = [];
+    let supervisorGuidance = "";
     const staleTaskIds = new Set<string>();
     for (let number = 1; number <= orchestration.budget.maxWorkerAttempts; number += 1) {
       if (signal.aborted) throw new Error("Worker cancelled");
@@ -333,6 +341,13 @@ export class BoundedWorkerLoop {
               contextText(packet),
               `Relevant confirmed acceptance criteria: ${relevantCriteriaText(task, contract)}.`,
               `Attempt: ${number}`,
+              ...(supervisorGuidance
+                ? [
+                    `Previous attempt failure: ${lastError}`,
+                    `Big-model supervisor guidance: ${supervisorGuidance}`,
+                    "Use that guidance to change the approach. Inspect the current workspace state before editing.",
+                  ]
+                : []),
               "After edits return JSON with summary, diagnosis, and artifacts.",
             ].join("\n"),
           },
@@ -397,6 +412,85 @@ export class BoundedWorkerLoop {
           errorSummary: lastError.slice(0, 2_000),
           completedAt: new Date().toISOString(),
         });
+        if (number < orchestration.budget.maxWorkerAttempts) {
+          const failurePacket = createFailurePacket({
+            taskId: task.id,
+            contractVersion: contract.version,
+            attemptCount: number,
+            error: lastError,
+            verifications: lastVerifications,
+            changes: lastChanges,
+            relevantInterfaces: packet.summary.relevantInterfaces,
+            diagnosis: lastDiagnosis,
+            usage: totalUsage,
+          });
+          await this.sink.recordEvent({
+            orchestrationId: orchestration.id,
+            taskId: task.id,
+            executionId: null,
+            type: "worker-supervisor-escalation",
+            actorRole: "control-plane",
+            modelId: null,
+            summary: "Worker failure was escalated to the big-model supervisor before retry",
+            metadata: { attempt: number, nextAttempt: number + 1 },
+          });
+          try {
+            const supervised = await this.roles.structured(
+              {
+                orchestrationId: orchestration.id,
+                agentId: orchestration.agentId,
+                taskId: task.id,
+                role: "planner",
+                workspacePath: workspace.path,
+                sandboxMode: "read-only",
+                signal,
+                prompt: [
+                  "Act as the big-model supervisor for a smaller implementation worker.",
+                  "Diagnose the failed attempt and decide whether the worker should retry with changed instructions, whether only the user can unblock it, or whether it is genuinely non-recoverable.",
+                  "At this phase use retry-worker for self-repair. Do not choose retry-integrator or retry-verifier.",
+                  "Choose needs-user only for a permission, credential, material product choice, or external action that the system cannot perform itself.",
+                  "Give concrete instructions that the next small-worker attempt can execute. Do not merely restate the error.",
+                  `Task: ${JSON.stringify({ id: task.id, objective: task.objective, allowedPaths: task.allowedPaths })}`,
+                  `Confirmed contract: ${JSON.stringify({ version: contract.version, goal: contract.intent.goal, criteria: contract.criteria })}`,
+                  `Failure packet: ${JSON.stringify(failurePacket)}`,
+                ].join("\n").slice(0, 120_000),
+              },
+              recoveryDecisionSchema,
+            );
+            const decision: RecoveryDecision = supervised.value.action === "retry-direct"
+              ? { ...supervised.value, action: "retry-worker" }
+              : supervised.value;
+            await this.sink.recordEvent({
+              orchestrationId: orchestration.id,
+              taskId: task.id,
+              executionId: supervised.executionId,
+              type: "worker-supervisor-decision",
+              actorRole: "planner",
+              modelId: supervised.actualModelId,
+              summary: decision.reason,
+              metadata: {
+                attempt: number,
+                classification: decision.classification,
+                action: decision.action,
+              },
+            });
+            if (decision.action === "needs-user" || decision.action === "stop") {
+              await this.workspaces.cleanup(workspace, "archive");
+              throw new WorkerLoopError(failurePacket, decision);
+            }
+            supervisorGuidance = decision.instructions || decision.reason;
+          } catch (supervisorError) {
+            if (supervisorError instanceof WorkerLoopError) throw supervisorError;
+            const supervisorReason = supervisorError instanceof Error
+              ? supervisorError.message
+              : String(supervisorError);
+            if (/budget denied/i.test(supervisorReason)) throw supervisorError;
+            supervisorGuidance = [
+              `The supervisor call failed: ${supervisorReason}`,
+              `Independently correct the prior worker failure: ${lastError}`,
+            ].join("\n");
+          }
+        }
         if (
           number < orchestration.budget.maxWorkerAttempts &&
           /429|too many requests|timed out/i.test(lastError)

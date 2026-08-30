@@ -10,7 +10,7 @@ The starter kit already provides Agent CRUD, persistent workspaces, direct resum
 
 ## Run the UI
 
-Requirements: Node.js 22+, npm, Codex CLI (or Docker/Colima/Podman), and a ModelArk endpoint.
+Requirements: Node.js 22+, npm, Docker/Colima/Podman, and a ModelArk endpoint. The disposable Runtime container is the recommended local security boundary and includes Chromium for browser verification.
 
 ```bash
 cp .env.example .env
@@ -20,6 +20,14 @@ npm run dev
 ```
 
 Set `ARK_API_KEY` and `ARK_MODEL` in `.env`, then open [http://localhost:5173](http://localhost:5173). Create an Agent, choose **Auto** or **Orchestrated**, submit a task, review/revise the generated intent, explicitly confirm it, inspect the plan, then press **Start execution**. Direct mode remains available in both the new execution control and classic chat below it.
+
+Build the browser-capable Runtime once before `npm run dev`:
+
+```bash
+docker build -f Dockerfile.runtime -t volc-agent-runtime:local .
+```
+
+Verifier turns receive a read-only candidate mount plus bounded writable `/tmp`, private shared memory, subprocess support, loopback sockets, and bundled Chromium. They do not launch the host browser or use its profile.
 
 The UI itself is visible without Ark credentials, but model-backed intent/planning/execution needs valid credentials. Never place secrets in prompts, Agent workspaces, browser configuration, commits, screenshots, or event metadata.
 

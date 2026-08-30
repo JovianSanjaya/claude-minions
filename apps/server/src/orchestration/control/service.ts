@@ -594,6 +594,7 @@ export class OrchestrationControlService implements OrchestrationSink {
   async confirmAmendment(
     orchestrationId: string,
     amendmentId: string,
+    response?: string,
   ): Promise<ExecutionContract> {
     const model = this.getOrchestration(orchestrationId);
     const amendment = model.amendments.find((entry) => entry.id === amendmentId);
@@ -601,13 +602,64 @@ export class OrchestrationControlService implements OrchestrationSink {
       throw new OrchestrationSemanticError("Pending amendment not found");
     }
     const agent = await this.requireRunnableAgent(model.orchestration.agentId);
-    const criteria = amendment.proposedCriteria ?? model.activeContract?.criteria ?? [];
+    let proposedIntent = structuredClone(amendment.proposedIntent);
+    const recoveryQuestion = proposedIntent.materialQuestions.join("\n").trim();
+    const normalizedResponse = response?.trim() ?? "";
+    if (recoveryQuestion && !normalizedResponse) {
+      throw new OrchestrationSemanticError("A response is required to resume this recovery request");
+    }
+    let confirmedEstimate = model.orchestration.estimate;
+    if (recoveryQuestion) {
+      const reconciled = await this.driver.elaborateIntent(
+        {
+          orchestrationId,
+          agentId: model.orchestration.agentId,
+          prompt: redactString(
+            clarificationReconciliationPrompt(
+              model.orchestration.prompt,
+              proposedIntent,
+              [normalizedResponse],
+            ),
+            50_000,
+          ),
+          requestedMode: model.orchestration.requestedMode,
+          budget: model.orchestration.budget,
+          workspacePath: agent.workspacePath,
+        },
+        this,
+        new AbortController().signal,
+      );
+      if (reconciled.draft.materialQuestions.length) {
+        throw new OrchestrationSemanticError(
+          "The supervisor found new unresolved questions while reconciling the recovery response",
+        );
+      }
+      proposedIntent = {
+        ...redactClone(reconciled.draft),
+        id: amendment.proposedIntent.id,
+        orchestrationId,
+        revision: amendment.proposedIntent.revision,
+        materialQuestions: [],
+        createdAt: this.now().toISOString(),
+      };
+      confirmedEstimate = redactClone(reconciled.estimate);
+    }
+    if (confirmedEstimate) {
+      const budgetConflict = estimateExceedsBudget(
+        confirmedEstimate,
+        model.orchestration.budget,
+      );
+      if (budgetConflict) throw new OrchestrationSemanticError(budgetConflict);
+    }
+    const criteria = recoveryQuestion
+      ? this.deriveCriteria(proposedIntent)
+      : amendment.proposedCriteria ?? model.activeContract?.criteria ?? [];
     this.validateCriteria(criteria);
     const contract: ExecutionContract = {
       id: this.newId(),
       orchestrationId,
       version: model.contractHistory.length + 1,
-      intent: structuredClone(amendment.proposedIntent),
+      intent: proposedIntent,
       criteria: structuredClone(criteria),
       confirmedBy: "user",
       confirmedAt: this.now().toISOString(),
@@ -619,15 +671,23 @@ export class OrchestrationControlService implements OrchestrationSink {
       const stored = database.amendments.find((entry) => entry.id === amendmentId)!;
       stored.status = "confirmed";
       stored.decidedAt = this.now().toISOString();
+      stored.proposedIntent = structuredClone(proposedIntent);
+      const storedDraftIndex = database.intentDrafts.findIndex(
+        (entry) => entry.id === proposedIntent.id,
+      );
+      if (storedDraftIndex >= 0) database.intentDrafts[storedDraftIndex] = structuredClone(proposedIntent);
       database.contracts.push(contract);
       orchestration.activeContractId = contract.id;
       orchestration.currentIntentDraftId = contract.intent.id;
       orchestration.status = "planning";
+      orchestration.estimate = confirmedEstimate;
       orchestration.updatedAt = this.now().toISOString();
       database.events.push(
         this.makeEvent(orchestrationId, "amendment-confirmed", `User confirmed material amendment as contract v${contract.version}`, {
           amendmentId,
           contractVersion: contract.version,
+          responseProvided: Boolean(normalizedResponse),
+          criteriaRegenerated: Boolean(recoveryQuestion),
         }),
       );
     });

@@ -41,6 +41,10 @@ workspace copies. Shared coordination happens through versioned artifacts.
 Protected and global checks run outside worker authority. Integration is
 deterministic for non-overlapping edits; a focused integrator handles remaining
 conflicts. The main Agent workspace is updated only after required verification.
+Verifier model turns run in the disposable Runtime with the candidate mounted
+read-only. A bounded temporary filesystem, private shared memory, subprocesses,
+loopback sockets, and bundled Chromium provide runtime-test capability without
+granting access to the host browser profile or allowing candidate modification.
 
 ### Fastify API
 
@@ -88,7 +92,7 @@ the stored Codex thread, and escalate termination after a grace period.
 | --- | --- | --- |
 | Local POC | Host Node.js | Disposable local container |
 | ECS | Application container | Codex process in the same container |
-| Local development | Host Node.js | Host Codex process |
+| Local development | Host Node.js | Disposable browser-capable Runtime container (recommended); host Codex remains an explicit compatibility option |
 
 ## Extension seams
 

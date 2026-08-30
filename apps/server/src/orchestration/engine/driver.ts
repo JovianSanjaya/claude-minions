@@ -7,6 +7,7 @@ import type {
   ExecuteInput,
   ExecutionOutcome,
   IntentDraft,
+  Orchestration,
   OrchestrationExecutionDriver,
   OrchestrationSink,
   OrchestrationTask,
@@ -15,7 +16,11 @@ import type {
   TokenUsage,
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
-import { buildApplicationMap, type DetailedApplicationMap } from "./application-map.js";
+import {
+  buildApplicationMap,
+  isProtectedEnvironmentPath,
+  type DetailedApplicationMap,
+} from "./application-map.js";
 import {
   comprehensiveAcceptanceTests,
   plannedAcceptanceTestSchema,
@@ -24,7 +29,13 @@ import {
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker } from "./context-broker.js";
 import { classifyFailure } from "./failure-packet.js";
-import { DeterministicIntegrator } from "./integrator.js";
+import { DeterministicIntegrator, type IntegrationCandidate } from "./integrator.js";
+import {
+  looksUserActionableFailure,
+  recoveryDecisionSchema,
+  recoveryEvidence,
+  type RecoveryDecision,
+} from "./recovery.js";
 import { RoleExecutor, type RoleModelConfiguration } from "./role-executor.js";
 import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
@@ -66,20 +77,49 @@ const intentSchema = z.object({
   }),
 }).strict();
 
-const planSchema = z.object({
+function normalizedAllowedPath(value: string): string {
+  return value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function allowedPathProblem(value: string): string | null {
+  const normalized = normalizedAllowedPath(value);
+  if (!normalized) return "Allowed paths must not be empty";
+  if (normalized.startsWith("/")) return "Allowed paths must be repository-relative";
+  if (normalized.split("/").includes("..")) return "Allowed paths must not contain '..'";
+  if (isProtectedEnvironmentPath(normalized)) {
+    return "Protected environment files are not allowed; use .env.example, .env.sample, or .env.template for non-secret configuration templates";
+  }
+  return null;
+}
+
+const allowedPathSchema = z.string().min(1).max(500).superRefine((value, context) => {
+  const problem = allowedPathProblem(value);
+  if (problem) context.addIssue({ code: "custom", message: problem });
+});
+
+const planSchema = (maximumEstimatedCalls: number) => z.object({
   coupling: z.preprocess((value) => typeof value === "string" ? value.toLowerCase() : value, z.enum(["low", "medium", "high"])),
-  estimatedCalls: z.coerce.number().int().positive().max(500),
+  estimatedCalls: z.coerce.number().int().positive().max(maximumEstimatedCalls),
   estimatedContextTokens: z.coerce.number().int().nonnegative(),
   tasks: z.array(z.object({
     title: z.string().min(1).max(500),
     objective: z.string().min(1).max(4_000),
     dependsOn: z.array(z.coerce.number().int().nonnegative()).max(50).default([]),
-    allowedPaths: z.array(z.string().min(1).max(500)).min(1).max(100),
+    allowedPaths: z.array(allowedPathSchema).min(1).max(100),
     acceptanceCriterionIds: z.array(z.string().max(200)).max(100).default([]),
     requiredArtifactIds: z.array(z.string().max(200)).max(100).default([]),
   })).min(1).max(20),
   acceptanceTests: z.array(plannedAcceptanceTestSchema).max(200).default([]),
 }).strict();
+
+const MAXIMUM_PLANNER_RESPONSE_CALLS = 2;
+
+function consumedModelCalls(orchestration: Orchestration): number {
+  return Object.values(orchestration.usage.byRole).reduce(
+    (total, usage) => total + (usage?.modelCalls ?? 0),
+    0,
+  );
+}
 
 const acceptanceVerificationSchema = z.object({
   results: z.array(z.object({
@@ -130,12 +170,31 @@ function zeroUsage(): TokenUsage {
   return { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
 }
 
+const addUsage = (left: TokenUsage, right: TokenUsage): TokenUsage => ({
+  inputTokens: left.inputTokens + right.inputTokens,
+  cachedInputTokens: left.cachedInputTokens + right.cachedInputTokens,
+  outputTokens: left.outputTokens + right.outputTokens,
+});
+
+type IncompleteExecutionOutcome = Exclude<ExecutionOutcome, { kind: "completed" }>;
+type IntegrationGateResult =
+  | { kind: "verified"; candidate: IntegrationCandidate }
+  | { kind: "outcome"; outcome: IncompleteExecutionOutcome };
+
 function safeAllowedPath(value: string): string {
-  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
-  if (!normalized || normalized.startsWith("/") || normalized.split("/").includes("..") || normalized.startsWith(".env")) {
-    throw new Error(`Planner produced unsafe allowed path: ${value}`);
-  }
-  return normalized;
+  const problem = allowedPathProblem(value);
+  if (problem) throw new Error(`Planner produced unsafe allowed path: ${value} (${problem})`);
+  return normalizedAllowedPath(value);
+}
+
+function resultsForSupervisor(tasks: OrchestrationTask[]) {
+  return tasks.map((task) => ({
+    id: task.id,
+    title: task.title,
+    objective: task.objective,
+    allowedPaths: task.allowedPaths,
+    acceptanceCriterionIds: task.acceptanceCriterionIds,
+  }));
 }
 
 function hasExistingRegressionInfrastructure(map: DetailedApplicationMap): boolean {
@@ -225,6 +284,20 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
   }
 
   async plan(input: PlanInput, sink: OrchestrationSink, signal: AbortSignal): Promise<PlanResult> {
+    const alreadyConsumedModelCalls = consumedModelCalls(input.orchestration);
+    const availableExecutionModelCalls = Math.min(
+      500,
+      Math.floor(
+        input.orchestration.budget.maxModelCalls
+          - alreadyConsumedModelCalls
+          - MAXIMUM_PLANNER_RESPONSE_CALLS,
+      ),
+    );
+    if (availableExecutionModelCalls < 1) {
+      throw new Error(
+        "No model-call budget remains for execution after reserving the bounded planning call",
+      );
+    }
     const map = await buildApplicationMap(input.workspacePath, input.orchestration.id, 1, this.now());
     this.maps.set(input.orchestration.id, map);
     await sink.recordApplicationMap(map.summary);
@@ -255,17 +328,24 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           "Create a bounded coding plan for the explicitly confirmed contract. Do not edit files.",
           `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
+          `Total model-call budget: ${input.orchestration.budget.maxModelCalls}`,
+          `Model calls already consumed before this planning response: ${alreadyConsumedModelCalls}`,
+          `Model calls reserved for this response and one possible format-repair response: ${MAXIMUM_PLANNER_RESPONSE_CALLS}`,
+          `Maximum future model calls this plan may estimate: ${availableExecutionModelCalls}`,
+          "The estimatedCalls value counts every model call after this planning response, including worker preflight and implementation calls, integration, verification, supervision, retries, and recovery.",
+          `Return estimatedCalls no greater than ${availableExecutionModelCalls}. Plan the complete confirmed scope within that allowance by minimizing handoffs, combining tightly coupled work, and preferring deterministic tools and checks where they do not require a model call. Do not drop or weaken confirmed requirements to meet the budget.`,
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract.",
           "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
           "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
           "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
+          "Protect configuration secrets: allowedPaths must never include .env, .env.local, .env.production, or any other real environment file at any directory depth. Non-secret templates named exactly .env.example, .env.sample, or .env.template are allowed.",
           "Return this exact JSON shape with no additional task fields:",
           '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
-          "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative and must never begin with /workspace or contain '..'. Use exact criterion IDs from the confirmed contract.",
+          "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative, must never begin with /workspace or contain '..', and must follow the environment-file rule above. Use exact criterion IDs from the confirmed contract.",
         ].join("\n").slice(0, 150_000),
       },
-      planSchema,
+      planSchema(availableExecutionModelCalls),
     );
     const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
     await this.verification.saveAcceptancePlan({
@@ -312,7 +392,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       coupling: result.value.coupling,
       estimatedCalls: result.value.estimatedCalls,
       estimatedContextTokens: result.value.estimatedContextTokens,
-      budget: input.orchestration.budget,
+      budget: {
+        ...input.orchestration.budget,
+        maxModelCalls: availableExecutionModelCalls,
+      },
     });
     const ids = result.value.tasks.map(() => this.newId());
     const criterionIds = new Set(input.contract.criteria.map((criterion) => criterion.id));
@@ -367,7 +450,14 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       actorRole: "planner",
       modelId: result.actualModelId,
       summary: route.reason,
-      metadata: { selectedMode: route.selectedMode, taskCount: tasks.length },
+      metadata: {
+        selectedMode: route.selectedMode,
+        taskCount: tasks.length,
+        estimatedCalls: result.value.estimatedCalls,
+        availableExecutionModelCalls,
+        alreadyConsumedModelCalls,
+        reservedPlanningModelCalls: MAXIMUM_PLANNER_RESPONSE_CALLS,
+      },
     });
     return { selectedMode: route.selectedMode, routeReason: route.reason, tasks, applicationMap: map.summary };
   }
@@ -424,86 +514,19 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         }
       }
 
-      await sink.recordEvent({
-        orchestrationId: input.orchestration.id,
-        taskId: null,
-        executionId: null,
-        type: "integration-step",
-        actorRole: "control-plane",
-        modelId: null,
-        summary: "Started deterministic-first integration",
-        metadata: { workerResultCount: results.length },
-      });
-      const candidate = await this.integrator.integrate(
-        input.orchestration.id,
-        input.workspacePath,
-        results.map((result) => ({
-          taskId: result.task.id,
-          workspacePath: result.workspace.path,
-          changes: result.changes,
-        })),
-        async (conflict) => {
-          const resolved = await roles.structured(
-            {
-              orchestrationId: input.orchestration.id,
-              agentId: input.orchestration.agentId,
-              taskId: null,
-              role: "integrator",
-              workspacePath: input.workspacePath,
-              sandboxMode: "read-only",
-              signal,
-              prompt: [
-                `Resolve only conflict ${conflict.path} against contract v${input.contract.version}.`,
-                ...conflict.variants.map((variant) => `Task ${variant.taskId}:\n${variant.content.toString("utf8").slice(0, 30_000)}`),
-                "Return JSON with content only.",
-              ].join("\n"),
-            },
-            conflictSchema,
-          );
-          return Buffer.from(resolved.value.content);
-        },
-      );
-      await sink.recordEvent({
-        orchestrationId: input.orchestration.id,
-        taskId: null,
-        executionId: null,
-        type: "integration-candidate",
-        actorRole: "control-plane",
-        modelId: null,
-        summary: "Deterministic-first integration candidate created",
-        metadata: { changedFiles: candidate.changes.changedFiles.length, conflicts: candidate.conflicts.length },
-      });
-      await sink.recordEvent({
-        orchestrationId: input.orchestration.id,
-        taskId: null,
-        executionId: null,
-        type: "verification-step",
-        actorRole: "control-plane",
-        modelId: null,
-        summary: "Started protected and global verification",
-        metadata: {},
-      });
-      const verification = await this.verification.run(
-        input.orchestration.id,
-        null,
-        candidate.path,
-        ["protected", "global", "manual"],
-        sink,
-        signal,
-      );
-      const plannedVerification = await this.runPlannedAcceptanceVerification(
+      const recovered = await this.integrateAndVerify(
         input,
-        roles,
-        candidate.path,
         sink,
+        roles,
+        results,
         signal,
       );
-      if (!requiredVerificationPassed([...verification, ...plannedVerification])) {
-        await this.integrator.cleanup(candidate);
+      if (recovered.kind !== "verified") {
         await this.cleanup(results, "archive");
         await this.workspaces.cleanupOrchestration(input.orchestration.id, "clean");
-        return { kind: "failed", reason: "Protected or global verification failed; main workspace was not changed" };
+        return recovered.outcome;
       }
+      const candidate = recovered.candidate;
       const published = await this.integrator.publish(candidate, input.workspacePath);
       const refreshed = await buildApplicationMap(
         input.workspacePath,
@@ -545,6 +568,19 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           summary: "Bounded worker failure compressed for planner diagnosis",
           metadata: { attemptCount: error.packet.attemptCount, classification: classifyFailure(error.packet) },
         });
+        if (error.supervisorDecision) {
+          if (error.supervisorDecision.action === "needs-user") {
+            return {
+              kind: "needs-user",
+              amendment: this.amendment(
+                input,
+                error.supervisorDecision.reason,
+                error.supervisorDecision.userQuestion ?? error.supervisorDecision.reason,
+              ),
+            };
+          }
+          return { kind: "failed", reason: error.supervisorDecision.reason };
+        }
         try {
           const diagnosis = await roles.structured(
             {
@@ -562,7 +598,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           if (diagnosis.value.outcome === "needs-user") {
             return {
               kind: "needs-user",
-              amendment: this.amendment(input, diagnosis.value.reason),
+              amendment: this.amendment(input, diagnosis.value.reason, diagnosis.value.reason),
             };
           }
           return { kind: "failed", reason: diagnosis.value.reason };
@@ -599,6 +635,598 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     );
     this.activeRoles.set(orchestrationId, roles);
     return roles;
+  }
+
+  private async integrateAndVerify(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    roles: RoleExecutor,
+    results: WorkerLoopResult[],
+    signal: AbortSignal,
+  ): Promise<IntegrationGateResult> {
+    const maximumRecoveryRounds = Math.max(1, input.orchestration.budget.maxWorkerAttempts);
+    const recoveryHistory: string[] = [];
+    let recoveryRound = 0;
+    let candidate: IntegrationCandidate | null = null;
+    let integratorGuidance = "";
+    let verifierGuidance = "";
+
+    while (true) {
+      if (signal.aborted) {
+        if (candidate) await this.integrator.cleanup(candidate).catch(() => undefined);
+        return { kind: "outcome", outcome: { kind: "cancelled", reason: "Orchestration cancelled" } };
+      }
+      if (!candidate) {
+        try {
+          candidate = await this.createIntegrationCandidate(
+            input,
+            sink,
+            roles,
+            results,
+            signal,
+            recoveryRound,
+            integratorGuidance,
+          );
+        } catch (integrationError) {
+          await this.integrator.discard(input.orchestration.id).catch(() => undefined);
+          const evidence = integrationError instanceof Error
+            ? integrationError.message
+            : String(integrationError);
+          const decision = await this.requestRecoveryDecision(
+            input,
+            sink,
+            roles,
+            "integration",
+            evidence,
+            recoveryHistory,
+            input.workspacePath,
+            recoveryRound,
+            signal,
+          );
+          const outcome = this.recoveryOutcome(
+            input,
+            decision,
+            evidence,
+            recoveryRound >= maximumRecoveryRounds,
+          );
+          if (outcome) return { kind: "outcome", outcome };
+          try {
+            if (decision.action === "retry-direct") {
+              await this.runDirectRecovery(
+                input,
+                sink,
+                roles,
+                results,
+                decision,
+                evidence,
+                recoveryRound + 1,
+                signal,
+              );
+            } else if (decision.action === "retry-worker") {
+              await this.runRecoveryWorkers(input, sink, roles, results, decision, evidence, recoveryRound + 1, signal);
+            }
+            integratorGuidance = decision.instructions || decision.reason;
+            recoveryHistory.push(
+              `Round ${recoveryRound + 1}: supervisor selected ${decision.action} after integration failure: ${decision.reason}`,
+            );
+          } catch (recoveryError) {
+            const reason = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+            recoveryHistory.push(`Round ${recoveryRound + 1}: ${decision.action} failed: ${reason}`);
+            await this.recordRecoveryActionFailure(input, sink, decision, recoveryRound + 1, reason);
+          }
+          recoveryRound += 1;
+          continue;
+        }
+      }
+
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: null,
+        executionId: null,
+        type: "verification-step",
+        actorRole: "control-plane",
+        modelId: null,
+        summary: recoveryRound
+          ? `Started protected and global verification recovery round ${recoveryRound}`
+          : "Started protected and global verification",
+        metadata: { recoveryRound },
+      });
+      const verification = await this.verification.run(
+        input.orchestration.id,
+        null,
+        candidate.path,
+        ["protected", "global", "manual"],
+        sink,
+        signal,
+      );
+      const plannedVerification = await this.runPlannedAcceptanceVerification(
+        input,
+        roles,
+        candidate.path,
+        sink,
+        signal,
+        verifierGuidance
+          ? { round: recoveryRound, instructions: verifierGuidance, history: recoveryHistory }
+          : undefined,
+      );
+      const records = [...verification, ...plannedVerification];
+      if (requiredVerificationPassed(records)) return { kind: "verified", candidate };
+
+      const evidence = recoveryEvidence(records);
+      const decision = await this.requestRecoveryDecision(
+        input,
+        sink,
+        roles,
+        "verification",
+        evidence,
+        recoveryHistory,
+        candidate.path,
+        recoveryRound,
+        signal,
+      );
+      const outcome = this.recoveryOutcome(
+        input,
+        decision,
+        evidence,
+        recoveryRound >= maximumRecoveryRounds,
+      );
+      if (outcome) {
+        await this.integrator.cleanup(candidate).catch(() => undefined);
+        return { kind: "outcome", outcome };
+      }
+
+      try {
+        if (decision.action === "retry-direct") {
+          await this.integrator.cleanup(candidate);
+          candidate = null;
+          await this.runDirectRecovery(
+            input,
+            sink,
+            roles,
+            results,
+            decision,
+            evidence,
+            recoveryRound + 1,
+            signal,
+          );
+          integratorGuidance = "";
+          verifierGuidance = "";
+        } else if (decision.action === "retry-worker") {
+          await this.integrator.cleanup(candidate);
+          candidate = null;
+          await this.runRecoveryWorkers(
+            input,
+            sink,
+            roles,
+            results,
+            decision,
+            evidence,
+            recoveryRound + 1,
+            signal,
+          );
+          integratorGuidance = "";
+          verifierGuidance = "";
+        } else if (decision.action === "retry-integrator") {
+          candidate = await this.runIntegratorRecovery(
+            input,
+            sink,
+            roles,
+            candidate,
+            results,
+            decision,
+            evidence,
+            recoveryRound + 1,
+            signal,
+          );
+          verifierGuidance = "";
+        } else {
+          verifierGuidance = decision.instructions || decision.reason;
+        }
+        recoveryHistory.push(
+          `Round ${recoveryRound + 1}: supervisor selected ${decision.action}: ${decision.reason}`,
+        );
+      } catch (recoveryError) {
+        const reason = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+        recoveryHistory.push(`Round ${recoveryRound + 1}: ${decision.action} failed: ${reason}`);
+        await this.recordRecoveryActionFailure(input, sink, decision, recoveryRound + 1, reason);
+        if (!candidate) {
+          for (const result of results) result.changes = await this.workspaces.changes(result.workspace);
+        } else if (decision.action === "retry-integrator") {
+          candidate = await this.integrator.refresh(candidate).catch(() => candidate);
+        }
+      }
+      recoveryRound += 1;
+    }
+  }
+
+  private async createIntegrationCandidate(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    roles: RoleExecutor,
+    results: WorkerLoopResult[],
+    signal: AbortSignal,
+    recoveryRound: number,
+    supervisorInstructions: string,
+  ): Promise<IntegrationCandidate> {
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: null,
+      type: "integration-step",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: recoveryRound
+        ? `Restarted deterministic-first integration for recovery round ${recoveryRound}`
+        : "Started deterministic-first integration",
+      metadata: { workerResultCount: results.length, recoveryRound },
+    });
+    const candidate = await this.integrator.integrate(
+      input.orchestration.id,
+      input.workspacePath,
+      results.map((result) => ({
+        taskId: result.task.id,
+        workspacePath: result.workspace.path,
+        changes: result.changes,
+      })),
+      async (conflict) => {
+        const resolved = await roles.structured(
+          {
+            orchestrationId: input.orchestration.id,
+            agentId: input.orchestration.agentId,
+            taskId: null,
+            role: "integrator",
+            workspacePath: input.workspacePath,
+            sandboxMode: "read-only",
+            signal,
+            prompt: [
+              `Resolve only conflict ${conflict.path} against contract v${input.contract.version}.`,
+              ...(supervisorInstructions
+                ? [`Big-model supervisor guidance: ${supervisorInstructions}`]
+                : []),
+              ...conflict.variants.map((variant) => `Task ${variant.taskId}:\n${variant.content.toString("utf8").slice(0, 30_000)}`),
+              "Return JSON with content only.",
+            ].join("\n"),
+          },
+          conflictSchema,
+        );
+        return Buffer.from(resolved.value.content);
+      },
+    );
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: null,
+      type: "integration-candidate",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: "Deterministic-first integration candidate created",
+      metadata: {
+        changedFiles: candidate.changes.changedFiles.length,
+        conflicts: candidate.conflicts.length,
+        recoveryRound,
+      },
+    });
+    return candidate;
+  }
+
+  private async requestRecoveryDecision(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    roles: RoleExecutor,
+    phase: "integration" | "verification",
+    failureEvidence: string,
+    recoveryHistory: string[],
+    workspacePath: string,
+    recoveryRound: number,
+    signal: AbortSignal,
+  ): Promise<RecoveryDecision> {
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: null,
+      type: "supervisor-recovery-escalation",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: `Escalated ${phase} failure to the big-model supervisor`,
+      metadata: { phase, recoveryRound },
+    });
+    const call = await roles.structured(
+      {
+        orchestrationId: input.orchestration.id,
+        agentId: input.orchestration.agentId,
+        taskId: null,
+        role: "planner",
+        workspacePath,
+        sandboxMode: "read-only",
+        signal,
+        prompt: [
+          "Act as the big-model supervisor for the configured execution roles.",
+          `The ${phase} phase failed. Diagnose the evidence and choose the next action that is most likely to produce a verified result.`,
+          input.plan.selectedMode === "direct"
+            ? "This is Direct mode. There are no small workers or small integrator. Use retry-direct for implementation or candidate corrections so the same big Direct executor performs the fix. Never choose retry-worker or retry-integrator."
+            : "This is an orchestrated worker mode. Use retry-worker for implementation defects, retry-integrator for merge/composition defects, and retry-verifier when a different valid verification method can establish evidence. Do not choose retry-direct.",
+          "Use retry-verifier when a different valid verification method can establish evidence without weakening the confirmed criteria.",
+          "Choose needs-user only when a permission, credential, material choice, or external action is genuinely required from the user. Include one precise userQuestion in that case.",
+          "Choose stop only for a demonstrated non-recoverable contradiction. Never waive a confirmed acceptance criterion, fabricate evidence, or mark an uncertain check as passed.",
+          "For any retry, provide concrete instructions for the selected smaller model. For retry-worker, include the exact target task IDs.",
+          `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
+          `Available tasks: ${JSON.stringify(resultsForSupervisor(input.plan.tasks))}`,
+          `Failure evidence: ${failureEvidence}`,
+          `Prior recovery history: ${JSON.stringify(recoveryHistory.slice(-8))}`,
+          `Recovery round: ${recoveryRound}`,
+        ].join("\n").slice(0, 150_000),
+      },
+      recoveryDecisionSchema,
+    );
+    const requestedAction = call.value.action;
+    const decision: RecoveryDecision = input.plan.selectedMode === "direct"
+      ? requestedAction === "retry-worker" || requestedAction === "retry-integrator"
+        ? { ...call.value, action: "retry-direct" }
+        : call.value
+      : requestedAction === "retry-direct"
+        ? { ...call.value, action: "retry-worker" }
+        : call.value;
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: call.executionId,
+      type: "supervisor-recovery-decision",
+      actorRole: "planner",
+      modelId: call.actualModelId,
+      summary: decision.reason,
+      metadata: {
+        phase,
+        recoveryRound,
+        classification: decision.classification,
+        action: decision.action,
+        requestedAction,
+        targetTaskCount: decision.targetTaskIds.length,
+      },
+    });
+    return decision;
+  }
+
+  private recoveryOutcome(
+    input: ExecuteInput,
+    decision: RecoveryDecision,
+    failureEvidence: string,
+    exhausted: boolean,
+  ): IncompleteExecutionOutcome | null {
+    const userActionable =
+      decision.classification === "permission-required" ||
+      looksUserActionableFailure(`${decision.reason}\n${failureEvidence}`);
+    if (decision.action === "needs-user" || (decision.action === "stop" && userActionable)) {
+      const question = decision.userQuestion ??
+        "What permission, credential, or external action should be used to unblock verification?";
+      return {
+        kind: "needs-user",
+        amendment: this.amendment(input, decision.reason, question),
+      };
+    }
+    if (decision.action === "stop") return { kind: "failed", reason: decision.reason };
+    if (!exhausted) return null;
+    if (userActionable || decision.classification === "environment-capability") {
+      return {
+        kind: "needs-user",
+        amendment: this.amendment(
+          input,
+          `Automatic recovery was exhausted. ${decision.reason}`,
+          decision.userQuestion ??
+            "Automatic recovery could not overcome the environment limitation. What permission or alternative execution approach should be used?",
+        ),
+      };
+    }
+    return {
+      kind: "failed",
+      reason: `Automatic recovery was exhausted: ${decision.reason}`,
+    };
+  }
+
+  private async runDirectRecovery(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    roles: RoleExecutor,
+    results: WorkerLoopResult[],
+    decision: RecoveryDecision,
+    failureEvidence: string,
+    recoveryRound: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (input.plan.selectedMode !== "direct") {
+      throw new Error("Direct recovery is only valid for a Direct execution plan");
+    }
+    const result = results[0];
+    if (!result) throw new Error("Direct recovery requires the original Direct execution workspace");
+    result.task.status = "running";
+    result.task.attemptCount += 1;
+    await sink.upsertTask(result.task);
+    const call = await roles.text({
+      orchestrationId: input.orchestration.id,
+      agentId: input.orchestration.agentId,
+      taskId: result.task.id,
+      role: "planner",
+      workspacePath: result.workspace.path,
+      sandboxMode: "workspace-write",
+      signal,
+      prompt: [
+        "Resume the confirmed Direct execution as the same big-model executor.",
+        "Integrated verification failed. Diagnose the evidence, implement the fix yourself in the existing Direct workspace, and run relevant checks.",
+        "Do not delegate to smaller workers or an integration model, and do not merely explain the failure.",
+        `Allowed edit paths: ${JSON.stringify(result.task.allowedPaths)}`,
+        `Confirmed contract: ${JSON.stringify({ goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
+        `Failed verification evidence: ${failureEvidence}`,
+        `Supervisor instructions: ${decision.instructions || decision.reason}`,
+      ].join("\n").slice(0, 140_000),
+    });
+    const changes = await this.workspaces.changes(result.workspace);
+    const violations = scopeViolations(changes, result.task.allowedPaths);
+    if (violations.length) throw new Error(`Direct recovery scope violation: ${violations.join(", ")}`);
+    const visible = await this.verification.run(
+      input.orchestration.id,
+      result.task.id,
+      result.workspace.path,
+      ["worker-visible"],
+      sink,
+      signal,
+    );
+    if (!requiredVerificationPassed(visible)) {
+      throw new Error("Direct recovery visible verification failed");
+    }
+    result.changes = changes;
+    result.summary = call.rawOutput.slice(0, 8_000);
+    result.usage = addUsage(result.usage, call.usage);
+    result.task.status = "passed";
+    await sink.upsertTask(result.task);
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: result.task.id,
+      executionId: call.executionId,
+      type: "recovery-direct-completed",
+      actorRole: "planner",
+      modelId: call.actualModelId,
+      summary: "Big Direct executor completed supervisor-directed recovery work",
+      metadata: {
+        recoveryRound,
+        changedFiles: changes.changedFiles.length,
+        deletedFiles: changes.deletedFiles.length,
+      },
+    });
+  }
+
+  private async runRecoveryWorkers(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    roles: RoleExecutor,
+    results: WorkerLoopResult[],
+    decision: RecoveryDecision,
+    failureEvidence: string,
+    recoveryRound: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const requested = new Set(decision.targetTaskIds);
+    const selected = results.filter((result) => requested.has(result.task.id));
+    const targets = selected.length ? selected : results;
+    await Promise.all(targets.map(async (result) => {
+      result.task.status = "running";
+      result.task.attemptCount += 1;
+      await sink.upsertTask(result.task);
+      const call = await roles.text({
+        orchestrationId: input.orchestration.id,
+        agentId: input.orchestration.agentId,
+        taskId: result.task.id,
+        role: "worker",
+        workspacePath: result.workspace.path,
+        sandboxMode: "workspace-write",
+        signal,
+        prompt: [
+          "A big-model supervisor is asking you to repair a failed integrated verification.",
+          "Inspect the current task workspace and implement the supervisor instructions. Do not merely explain the issue.",
+          `Task: ${JSON.stringify({ id: result.task.id, objective: result.task.objective, allowedPaths: result.task.allowedPaths })}`,
+          `Confirmed criteria: ${JSON.stringify(input.contract.criteria.filter((criterion) => result.task.acceptanceCriterionIds.includes(criterion.id)))}`,
+          `Failed verification evidence: ${failureEvidence}`,
+          `Supervisor instructions: ${decision.instructions || decision.reason}`,
+          "Edit only the allowed paths, run relevant checks, and summarize what you changed.",
+        ].join("\n").slice(0, 140_000),
+      });
+      const changes = await this.workspaces.changes(result.workspace);
+      const violations = scopeViolations(changes, result.task.allowedPaths);
+      if (violations.length) throw new Error(`Recovery worker scope violation: ${violations.join(", ")}`);
+      const visible = await this.verification.run(
+        input.orchestration.id,
+        result.task.id,
+        result.workspace.path,
+        ["worker-visible"],
+        sink,
+        signal,
+      );
+      if (!requiredVerificationPassed(visible)) {
+        throw new Error(`Recovery worker-visible verification failed for task ${result.task.id}`);
+      }
+      result.changes = changes;
+      result.summary = call.rawOutput.slice(0, 8_000);
+      result.usage = addUsage(result.usage, call.usage);
+      result.task.status = "passed";
+      await sink.upsertTask(result.task);
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: result.task.id,
+        executionId: call.executionId,
+        type: "recovery-worker-completed",
+        actorRole: "worker",
+        modelId: call.actualModelId,
+        summary: "Small worker completed big-model-directed recovery work",
+        metadata: {
+          recoveryRound,
+          changedFiles: changes.changedFiles.length,
+          deletedFiles: changes.deletedFiles.length,
+        },
+      });
+    }));
+  }
+
+  private async runIntegratorRecovery(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    roles: RoleExecutor,
+    candidate: IntegrationCandidate,
+    results: WorkerLoopResult[],
+    decision: RecoveryDecision,
+    failureEvidence: string,
+    recoveryRound: number,
+    signal: AbortSignal,
+  ): Promise<IntegrationCandidate> {
+    const allowedPaths = [...new Set(results.flatMap((result) => result.task.allowedPaths))];
+    const call = await roles.text({
+      orchestrationId: input.orchestration.id,
+      agentId: input.orchestration.agentId,
+      taskId: null,
+      role: "integrator",
+      workspacePath: candidate.path,
+      sandboxMode: "workspace-write",
+      signal,
+      prompt: [
+        "Apply the supervisor's integration recovery instructions to the integrated candidate.",
+        "Inspect the candidate and make only integration/composition corrections. Do not weaken tests or confirmed criteria.",
+        `Allowed edit paths across confirmed tasks: ${JSON.stringify(allowedPaths)}`,
+        `Confirmed contract: ${JSON.stringify({ goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
+        `Failed verification evidence: ${failureEvidence}`,
+        `Supervisor instructions: ${decision.instructions || decision.reason}`,
+        "Edit the candidate directly, run relevant non-destructive checks, and summarize the correction.",
+      ].join("\n").slice(0, 140_000),
+    });
+    const refreshed = await this.integrator.refresh(candidate);
+    const violations = scopeViolations(refreshed.changes, allowedPaths);
+    if (violations.length) throw new Error(`Recovery integrator scope violation: ${violations.join(", ")}`);
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: call.executionId,
+      type: "recovery-integrator-completed",
+      actorRole: "integrator",
+      modelId: call.actualModelId,
+      summary: "Small integrator completed big-model-directed recovery work",
+      metadata: { recoveryRound, changedFiles: refreshed.changes.changedFiles.length },
+    });
+    return refreshed;
+  }
+
+  private async recordRecoveryActionFailure(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    decision: RecoveryDecision,
+    recoveryRound: number,
+    reason: string,
+  ): Promise<void> {
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: null,
+      type: "recovery-action-failed",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: reason.slice(0, 2_000),
+      metadata: { recoveryRound, action: decision.action },
+    });
   }
 
   private async runDirect(
@@ -665,7 +1293,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     return { task, workspace, changes, summary: call.rawOutput.slice(0, 8_000), usage: call.usage, staleTaskIds: [] };
   }
 
-  private amendment(input: ExecuteInput, reason: string): ContractAmendment {
+  private amendment(input: ExecuteInput, reason: string, userQuestion?: string): ContractAmendment {
     const now = this.now().toISOString();
     return {
       id: this.newId(),
@@ -675,6 +1303,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         ...structuredClone(input.contract.intent),
         id: this.newId(),
         revision: input.contract.intent.revision + 1,
+        materialQuestions: userQuestion ? [userQuestion] : [],
         createdAt: now,
       },
       proposedCriteria: null,
@@ -692,6 +1321,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     candidateWorkspacePath: string,
     sink: OrchestrationSink,
     signal: AbortSignal,
+    recovery?: { round: number; instructions: string; history: string[] },
   ) {
     const plan = await this.verification.loadAcceptancePlan(
       input.orchestration.id,
@@ -725,11 +1355,23 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
             role: "verifier",
             workspacePath: candidateWorkspacePath,
             sandboxMode: "read-only",
+            runtimeProfile: "verification",
             signal,
             prompt: [
               "Independently verify the integrated candidate. Do not edit any files.",
               "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
+              "The candidate workspace is intentionally read-only. Put temporary test scripts, browser profiles, screenshots, caches, and logs under /tmp only.",
+              "This verification runtime supports subprocesses, ephemeral loopback servers, and bundled Chromium. Use $CHROME_BIN or /usr/bin/chromium with a fresh --user-data-dir under /tmp; never launch a host GUI browser or use a host browser profile.",
+              "The disposable outer container is the security boundary. Chromium may use --no-sandbox inside it when required. Prefer 127.0.0.1 with an ephemeral unprivileged port and shut down every server you start.",
               "Return exactly one result for every supplied acceptance test. Passing requires concrete evidence; uncertainty or an unverified claim must fail. Baseline regression tests are supplied only when the starting workspace has relevant automated-check infrastructure.",
+              ...(recovery
+                ? [
+                    `This is verification recovery round ${recovery.round}.`,
+                    `Big-model supervisor instructions: ${recovery.instructions}`,
+                    `Prior recovery history: ${JSON.stringify(recovery.history.slice(-8))}`,
+                    "Use a different valid verification strategy where instructed, but do not waive criteria or fabricate evidence.",
+                  ]
+                : []),
               `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
               `Protected planner-generated acceptance tests: ${JSON.stringify(automated)}`,
             ].join("\n").slice(0, 150_000),
@@ -782,6 +1424,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         manual: records.filter((record) => record.scope === "manual").length,
         regressionNotApplicable: skippedRegressionIds.size,
         deferredPostRelease: postReleaseIds.size,
+        recoveryRound: recovery?.round ?? 0,
       },
     });
     return records;

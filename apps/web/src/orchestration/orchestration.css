@@ -78,7 +78,21 @@
 /* Integrated chat workflow */
 .orchestration-chat {
   max-width: 1180px;
+  min-height: 0;
   position: relative;
+}
+
+.orchestration-chat .messages {
+  overflow-y: scroll;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+.orchestration-chat .messages:focus-visible {
+  outline: 2px solid rgba(105, 84, 217, .4);
+  outline-offset: -2px;
 }
 
 .orchestration-chat .message-body {
@@ -186,6 +200,16 @@
   background: #fff0c9;
 }
 
+.orch-badge-answered {
+  color: #277756;
+  background: #dcf2e9;
+}
+
+.orch-question-card-answered {
+  padding-block: 11px;
+  background: #fbfaf7;
+}
+
 .orch-question-prompt {
   margin: 1px 0 0;
   color: #2f3030;
@@ -221,11 +245,74 @@
   border-top: 1px solid #ebe8f5;
 }
 
+.orch-question-freetext label {
+  font-weight: 750;
+}
+
 .orch-question-freetext-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: end;
   gap: 8px;
+}
+
+.orch-question-freetext textarea {
+  min-height: 72px;
+  box-sizing: border-box;
+}
+
+.orch-question-freetext small {
+  display: block;
+  margin-top: 5px;
+  color: #89877f;
+  font-size: 9px;
+}
+
+.orch-recovery-request {
+  border: 1px solid #e1c77f;
+  border-radius: 14px;
+  padding: 15px;
+  background: linear-gradient(145deg, #fffdf7, #fff5d8);
+}
+
+.orch-recovery-request h3 {
+  margin: 10px 0 5px;
+  color: #353125;
+  font-size: 14px;
+}
+
+.orch-recovery-request p {
+  margin: 0 0 12px;
+  color: #71694f;
+  font-size: 11px;
+}
+
+.orch-recovery-request label {
+  display: grid;
+  gap: 5px;
+  color: #4d493c;
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.orch-recovery-request textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid #d8c58e;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fff;
+  color: #2f3030;
+  font: inherit;
+  font-weight: 400;
+}
+
+.orch-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .orch-executing-head,

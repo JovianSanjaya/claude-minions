@@ -39,6 +39,14 @@ const envSchema = z.object({
     .regex(/^\d+(?:\.\d+)?[bkmg]$/i)
     .default("2g"),
   CONTAINER_PIDS_LIMIT: z.coerce.number().int().positive().default(256),
+  CONTAINER_TMPFS_SIZE: z
+    .string()
+    .regex(/^\d+(?:\.\d+)?[bkmg]$/i)
+    .default("512m"),
+  CONTAINER_SHM_SIZE: z
+    .string()
+    .regex(/^\d+(?:\.\d+)?[bkmg]$/i)
+    .default("256m"),
   CONTAINER_USER: z.string().optional(),
   RUNTIME_INSTANCE_ID: z
     .string()
@@ -135,6 +143,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerCpuLimit: env.CONTAINER_CPU_LIMIT,
     containerMemoryLimit: env.CONTAINER_MEMORY_LIMIT,
     containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
+    containerTmpfsSize: env.CONTAINER_TMPFS_SIZE,
+    containerShmSize: env.CONTAINER_SHM_SIZE,
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,

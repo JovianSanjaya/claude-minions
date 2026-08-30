@@ -213,6 +213,9 @@ export function workflowState(view: OrchestrationReadModel): {
     reachedIndex >= 2 &&
     (view.attempts.length > 0 ||
       view.events.some((event) => event.actorRole === "worker") ||
+      view.events.some((event) =>
+        /direct-step|worker-step|integration-step|verification-step|supervisor-recovery/i.test(event.type),
+      ) ||
       ["running", "integrating", "verifying", "completed"].includes(status))
   ) {
     reachedIndex = 3;

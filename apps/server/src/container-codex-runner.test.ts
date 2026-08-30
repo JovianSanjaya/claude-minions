@@ -63,13 +63,46 @@ describe("Container Codex runner", () => {
     expect(args).toContain("501:20");
     expect(args).toContain("danger-full-access");
     expect(args).not.toContain("read-only");
+    expect(args).toContain("--read-only");
+    expect(args).toContain("/tmp:rw,nosuid,nodev,size=512m,mode=1777");
+    expect(args).toContain("256m");
+    expect(args).toContain("TMPDIR=/tmp");
+    expect(args).toContain("XDG_RUNTIME_DIR=/tmp/runtime");
+    expect(args).toContain("CHROME_BIN=/usr/bin/chromium");
     expect(args).toContain("/workspace");
     expect(args).toContain("io.codejam.instance-id=test-instance");
     expect(args).toContain("io.codejam.execution-id=execution/unsafe");
     expect(args).toContain("io.codejam.orchestration-id=orch-1");
     expect(args).toContain("io.codejam.task-id=task-1");
+    expect(args).toContain("io.codejam.runtime-profile=default");
     expect(args).toContain("keep-id");
     expect(args).not.toContain("secret-that-must-not-appear-in-argv");
+  });
+
+  it("labels browser-capable verification without making the candidate writable", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      CODEX_HOME: "/tmp/codex-home",
+      RUNTIME_PROVIDER: "container",
+      CONTAINER_TMPFS_SIZE: "768m",
+      CONTAINER_SHM_SIZE: "384m",
+    });
+    const args = buildContainerRunArgs({
+      executionId: "verify-execution",
+      agentId: "agent",
+      workspacePath: "/tmp/candidate",
+      prompt: "verify",
+      threadId: null,
+      role: "verifier",
+      sandboxMode: "read-only",
+      runtimeProfile: "verification",
+    }, config);
+
+    expect(args).toContain("io.codejam.runtime-profile=verification");
+    expect(args).toContain("type=bind,src=/tmp/candidate,dst=/workspace,readonly");
+    expect(args).toContain("/tmp:rw,nosuid,nodev,size=768m,mode=1777");
+    expect(args).toContain("384m");
+    expect(args).toContain("bridge");
   });
 
   it("uses the outer container as the writable sandbox boundary", () => {

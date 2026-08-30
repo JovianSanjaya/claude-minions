@@ -91,8 +91,8 @@ export default function App() {
   useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setMessages([]);
     if (!selectedId) {
-      setMessages([]);
       return;
     }
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])

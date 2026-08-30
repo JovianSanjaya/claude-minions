@@ -90,20 +90,32 @@ function contract(): ExecutionContract {
 
 function fakeRunner(
   failWorkers = false,
-  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [],
+  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; runtimeProfile: string | undefined; role: string | undefined; prompt: string }> = [],
   badPreflightOnce = false,
   failAcceptance = false,
   includePostReleaseAcceptance = false,
   allowNoChangeDirect = false,
+  recoveryAction: "retry-direct" | "retry-worker" | "retry-integrator" | "retry-verifier" | "needs-user" | "stop" = "stop",
+  firstPlanAllowedPath: string | null = null,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
+  let recoveryApplied = false;
+  let acceptanceCalls = 0;
+  let planningResponses = 0;
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, role: request.role, prompt: request.prompt });
+      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt });
       let output: string;
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
-      } else if (request.prompt.includes("Create a bounded coding plan")) {
+      } else if (
+        request.prompt.includes("Create a bounded coding plan") ||
+        (firstPlanAllowedPath !== null && request.prompt.includes("Invalid output to repair"))
+      ) {
+        const firstTaskAllowedPath = planningResponses === 0 && firstPlanAllowedPath
+          ? firstPlanAllowedPath
+          : "src/a.ts";
+        planningResponses += 1;
         const acceptanceTests = [
           { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
           { id: "accept-b", title: "Module B works", criterionIds: ["c2"], category: "functional", scope: "protected", procedure: "Inspect and exercise module B", expectedOutcome: "B exports the expected value" },
@@ -123,7 +135,7 @@ function fakeRunner(
         output = JSON.stringify({
           coupling: "LOW", estimatedCalls: "8", estimatedContextTokens: "1000",
           tasks: [
-            { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: ["src/a.ts"], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
+            { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
             { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"] },
           ],
           acceptanceTests,
@@ -139,6 +151,25 @@ function fakeRunner(
           publishedArtifacts: isA ? ["api-contract"] : [],
           approach: ["Implement module"], missingContext: [], plannedChecks: ["typecheck"],
         });
+      } else if (request.prompt.includes("A big-model supervisor is asking you to repair")) {
+        const isA = request.prompt.includes("Add A");
+        await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
+        await writeFile(
+          path.join(request.workspacePath, isA ? "src/a.ts" : "src/b.ts"),
+          isA ? "export const a = 11;\n" : "export const b = 22;\n",
+        );
+        recoveryApplied = true;
+        output = "Applied supervisor-directed worker repair";
+      } else if (request.prompt.includes("Apply the supervisor's integration recovery instructions")) {
+        await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
+        await writeFile(path.join(request.workspacePath, "src", "a.ts"), "export const a = 12;\n");
+        recoveryApplied = true;
+        output = "Applied supervisor-directed integration repair";
+      } else if (request.prompt.includes("Resume the confirmed Direct execution as the same big-model executor")) {
+        await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
+        await writeFile(path.join(request.workspacePath, "src", "a.ts"), "export const a = 13;\n");
+        recoveryApplied = true;
+        output = "Applied big-model Direct recovery";
       } else if (request.prompt.includes("Implement only this confirmed task")) {
         const isA = request.prompt.includes("Task: Add A");
         if (!failWorkers) {
@@ -160,6 +191,30 @@ function fakeRunner(
         });
       } else if (request.prompt.includes("Diagnose this compact failure packet")) {
         output = JSON.stringify({ classification: "implementation-bug", outcome: "stop", reason: "Worker failed after bounded retries" });
+      } else if (request.prompt.includes("Act as the big-model supervisor for a smaller implementation worker")) {
+        output = JSON.stringify({
+          classification: "implementation-defect",
+          action: "retry-worker",
+          reason: "The smaller worker should change its implementation approach",
+          instructions: "Inspect the previous failure and implement the missing files before rerunning checks",
+          targetTaskIds: request.taskId ? [request.taskId] : [],
+          userQuestion: null,
+        });
+      } else if (request.prompt.includes("Act as the big-model supervisor for the configured execution roles")) {
+        output = JSON.stringify({
+          classification: recoveryAction === "needs-user" ? "permission-required" :
+            recoveryAction === "retry-integrator" ? "integration-defect" :
+              recoveryAction === "retry-verifier" ? "verification-strategy" : "implementation-defect",
+          action: recoveryAction,
+          reason: recoveryAction === "stop"
+            ? "Protected or global verification failed; main workspace was not changed"
+            : `Supervisor selected ${recoveryAction}`,
+          instructions: `Use the ${recoveryAction} recovery strategy and gather fresh evidence`,
+          targetTaskIds: [],
+          userQuestion: recoveryAction === "needs-user"
+            ? "Please grant the required permission or provide an approved alternative"
+            : null,
+        });
       } else if (request.prompt.includes("Execute the confirmed direct task")) {
         if (!allowNoChangeDirect) {
           await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
@@ -170,9 +225,13 @@ function fakeRunner(
           ? "Read-only direct execution completed"
           : "Direct execution completed";
       } else if (request.prompt.includes("Independently verify the integrated candidate")) {
+        acceptanceCalls += 1;
+        const acceptanceShouldFail = failAcceptance && !recoveryApplied && !(
+          recoveryAction === "retry-verifier" && acceptanceCalls > 1
+        );
         output = JSON.stringify({
           results: [
-            { testId: "accept-a", status: failAcceptance ? "failed" : "passed", evidence: failAcceptance ? "Module A did not satisfy its protected behavior check" : "Inspected src/a.ts and confirmed its export" },
+            { testId: "accept-a", status: acceptanceShouldFail ? "failed" : "passed", evidence: acceptanceShouldFail ? "Module A did not satisfy its protected behavior check" : "Inspected src/a.ts and confirmed its export" },
             { testId: "accept-b", status: "passed", evidence: "Inspected src/b.ts and confirmed its export" },
             { testId: "regression", status: "passed", evidence: "Relevant regression inspection passed" },
           ],
@@ -200,6 +259,8 @@ async function setup(
   failAcceptance = false,
   includePostReleaseAcceptance = false,
   allowNoChangeDirect = false,
+  recoveryAction: "retry-direct" | "retry-worker" | "retry-integrator" | "retry-verifier" | "needs-user" | "stop" = "stop",
+  firstPlanAllowedPath: string | null = null,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
@@ -216,7 +277,7 @@ async function setup(
         : "expected task file missing",
     };
   };
-  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [];
+  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; runtimeProfile: string | undefined; role: string | undefined; prompt: string }> = [];
   const driver = new ContextAwareExecutionDriver({
     runner: fakeRunner(
       failWorkers,
@@ -225,6 +286,8 @@ async function setup(
       failAcceptance,
       includePostReleaseAcceptance,
       allowNoChangeDirect,
+      recoveryAction,
+      firstPlanAllowedPath,
     ),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
@@ -296,11 +359,98 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       ]));
     expect(calls.filter((call) => call.role === "worker").map((call) => call.prompt).join("\n"))
       .not.toContain("Inspect and exercise module A");
+    expect(calls.filter((call) => call.role === "verifier")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sandboxMode: "read-only",
+          runtimeProfile: "verification",
+          prompt: expect.stringContaining("bundled Chromium"),
+        }),
+      ]),
+    );
     for (const task of plan.tasks) {
       const taskCalls = calls.filter((call) => call.taskId === task.id);
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
         .toBeLessThan(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write"));
     }
+  });
+
+  it("plans against the model calls remaining after prior planning usage", async () => {
+    const { workspace, driver, calls } = await setup();
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    item.usage.byRole.planner = {
+      modelId: "strong",
+      inputTokens: 1_000,
+      cachedInputTokens: 500,
+      outputTokens: 250,
+      estimatedUsd: null,
+      modelCalls: 3,
+    };
+
+    await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    const planningCall = calls.find((call) =>
+      call.role === "planner" && call.prompt.includes("Create a bounded coding plan")
+    );
+    expect(planningCall?.prompt).toContain("Total model-call budget: 100");
+    expect(planningCall?.prompt).toContain(
+      "Model calls already consumed before this planning response: 3",
+    );
+    expect(planningCall?.prompt).toContain(
+      "Maximum future model calls this plan may estimate: 95",
+    );
+    expect(planningCall?.prompt).toContain("Return estimatedCalls no greater than 95");
+    expect(planningCall?.prompt).toContain('"estimatedCalls"');
+    expect(planningCall?.prompt).toContain('"maximum":95');
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "route-decision",
+      metadata: expect.objectContaining({
+        estimatedCalls: 8,
+        availableExecutionModelCalls: 95,
+        alreadyConsumedModelCalls: 3,
+        reservedPlanningModelCalls: 2,
+      }),
+    }));
+  });
+
+  it("allows safe environment templates and repairs a genuinely unsafe planner path once", async () => {
+    const safeSetup = await setup(
+      false, false, false, false, false, false, "stop", ".env.example",
+    );
+    const safeSink = new Sink();
+    const safePlan = await safeSetup.driver.plan({
+      orchestration: orchestration(safeSetup.workspace),
+      contract: contract(),
+      workspacePath: safeSetup.workspace,
+    }, safeSink, new AbortController().signal);
+    expect(safePlan.tasks.flatMap((task) => task.allowedPaths)).toContain(".env.example");
+    expect(
+      safeSetup.calls.filter((call) => call.role === "planner"),
+    ).toHaveLength(1);
+    expect(safeSetup.calls[0]?.prompt).toContain(
+      "Non-secret templates named exactly .env.example, .env.sample, or .env.template are allowed",
+    );
+
+    const repairedSetup = await setup(
+      false, false, false, false, false, false, "stop", "apps/server/.env.production",
+    );
+    const repairedSink = new Sink();
+    const repairedPlan = await repairedSetup.driver.plan({
+      orchestration: orchestration(repairedSetup.workspace),
+      contract: contract(),
+      workspacePath: repairedSetup.workspace,
+    }, repairedSink, new AbortController().signal);
+    expect(repairedPlan.tasks.flatMap((task) => task.allowedPaths))
+      .not.toContain("apps/server/.env.production");
+    const plannerCalls = repairedSetup.calls.filter((call) => call.role === "planner");
+    expect(plannerCalls).toHaveLength(2);
+    expect(plannerCalls[1]?.prompt).toContain("Protected environment files are not allowed");
+    expect(plannerCalls[1]?.prompt).toContain("Invalid output to repair");
   });
 
   it("defers post-release effects without sending them to the release verifier", async () => {
@@ -341,7 +491,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
   });
 
   it("bounds repeated failure, emits compact escalation, and never publishes", async () => {
-    const { workspace, driver } = await setup(true);
+    const { workspace, driver, calls } = await setup(true);
     const sink = new Sink();
     const signal = new AbortController().signal;
     const item = orchestration(workspace);
@@ -350,6 +500,10 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
     expect(outcome).toEqual({ kind: "failed", reason: "Worker failed after bounded retries" });
     expect(sink.attempts.filter((attempt) => attempt.status === "failed")).toHaveLength(2);
+    expect(sink.events.some((event) => event.type === "worker-supervisor-decision")).toBe(true);
+    expect(
+      calls.filter((call) => call.role === "worker").at(-1)?.prompt,
+    ).toContain("Big-model supervisor guidance");
     expect(sink.events.some((event) => event.type === "failure-escalation")).toBe(true);
     expect(await readFile(path.join(workspace, "src", "base.ts"), "utf8")).toBe(before);
     await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
@@ -404,6 +558,114 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       .toBe("failed");
     await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
     expect(sink.events.some((event) => event.type === "verified-publish")).toBe(false);
+  });
+
+  it("lets the big supervisor send failed verification back to smaller workers", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, true, false, false, "retry-worker",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(await readFile(path.join(workspace, "src", "a.ts"), "utf8")).toContain("a = 11");
+    expect(calls.some((call) => call.role === "worker" && call.prompt.includes("repair a failed integrated verification"))).toBe(true);
+    expect(sink.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "supervisor-recovery-decision", metadata: expect.objectContaining({ action: "retry-worker" }) }),
+      expect.objectContaining({ type: "recovery-worker-completed" }),
+      expect.objectContaining({ type: "verified-publish" }),
+    ]));
+  });
+
+  it("lets the big supervisor redirect integration and then reverifies", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, true, false, false, "retry-integrator",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(await readFile(path.join(workspace, "src", "a.ts"), "utf8")).toContain("a = 12");
+    expect(calls.some((call) => call.role === "integrator" && call.sandboxMode === "workspace-write")).toBe(true);
+    expect(sink.events).toContainEqual(expect.objectContaining({ type: "recovery-integrator-completed" }));
+  });
+
+  it("lets the big supervisor give the verifier a different evidence strategy", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, true, false, false, "retry-verifier",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(
+      calls.filter((call) => call.role === "verifier").at(-1)?.prompt,
+    ).toContain("Big-model supervisor instructions");
+    expect(sink.events.filter((event) => event.type === "acceptance-verification-completed")).toHaveLength(2);
+  });
+
+  it("raises permission-dependent recovery to the user with a concrete question", async () => {
+    const { workspace, driver } = await setup(
+      false, false, false, true, false, false, "needs-user",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+
+    expect(outcome.kind).toBe("needs-user");
+    if (outcome.kind !== "needs-user") throw new Error("Expected needs-user outcome");
+    expect(outcome.amendment.reason).toContain("needs-user");
+    expect(outcome.amendment.proposedIntent.materialQuestions).toEqual([
+      "Please grant the required permission or provide an approved alternative",
+    ]);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "supervisor-recovery-decision",
+      metadata: expect.objectContaining({ action: "needs-user" }),
+    }));
+    expect(sink.events.some((event) => event.type === "verified-publish")).toBe(false);
+  });
+
+  it("keeps Direct recovery on the big executor even if the supervisor requests a worker", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, true, false, false, "retry-worker",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    item.requestedMode = "direct";
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+    expect(plan.selectedMode).toBe("direct");
+
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(await readFile(path.join(workspace, "src", "a.ts"), "utf8")).toContain("a = 13");
+    expect(calls.some((call) => call.role === "worker")).toBe(false);
+    expect(calls.some((call) =>
+      call.role === "planner" &&
+      call.sandboxMode === "workspace-write" &&
+      call.prompt.includes("same big-model executor")
+    )).toBe(true);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "supervisor-recovery-decision",
+      metadata: expect.objectContaining({ action: "retry-direct", requestedAction: "retry-worker" }),
+    }));
+    expect(sink.events).toContainEqual(expect.objectContaining({ type: "recovery-direct-completed" }));
   });
 
   it("keeps direct execution real, budgeted, verified, and published", async () => {

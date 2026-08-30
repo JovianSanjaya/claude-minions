@@ -7,7 +7,9 @@ const excludedNames = new Set([
   ".git", "node_modules", "dist", "build", "coverage", ".next", ".cache",
   ".codex", ".orchestration", "orchestration-work", "protected-evaluators",
 ]);
-const protectedName = /(?:^|\/)(?:\.env(?:\..*)?|[^/]*(?:private[-_]?key|credential|secret)[^/]*)$/i;
+const protectedSecretName = /(?:^|\/)[^/]*(?:private[-_]?key|credential|secret)[^/]*$/i;
+const environmentName = /(?:^|\/)\.env(?:\..*)?$/i;
+const safeEnvironmentTemplateName = /(?:^|\/)\.env\.(?:example|sample|template)$/i;
 const textExtensions = new Set([
   ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".py",
   ".go", ".rs", ".java", ".kt", ".css", ".scss", ".html", ".yaml", ".yml",
@@ -29,9 +31,20 @@ export interface DetailedApplicationMap {
   packageBoundaries: string[];
 }
 
+export function isSafeEnvironmentTemplatePath(relativePath: string): boolean {
+  return safeEnvironmentTemplateName.test(relativePath.replaceAll(path.sep, "/"));
+}
+
+export function isProtectedEnvironmentPath(relativePath: string): boolean {
+  const normalized = relativePath.replaceAll(path.sep, "/");
+  return environmentName.test(normalized) && !safeEnvironmentTemplateName.test(normalized);
+}
+
 export function isApplicationMapExcluded(relativePath: string): boolean {
   const normalized = relativePath.replaceAll(path.sep, "/");
-  return normalized.split("/").some((part) => excludedNames.has(part)) || protectedName.test(normalized);
+  return normalized.split("/").some((part) => excludedNames.has(part)) ||
+    isProtectedEnvironmentPath(normalized) ||
+    protectedSecretName.test(normalized);
 }
 
 function semanticSummary(relativePath: string, source: string): string {

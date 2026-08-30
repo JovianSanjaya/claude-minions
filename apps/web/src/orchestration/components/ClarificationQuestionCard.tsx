@@ -13,8 +13,13 @@ export function ClarificationQuestionCard({
   onAnswer,
   disabled,
 }: ClarificationQuestionCardProps) {
-  const [showOther, setShowOther] = useState(false);
   const [freeText, setFreeText] = useState("");
+
+  const submitFreeText = () => {
+    const answer = freeText.trim();
+    if (!answer || disabled) return;
+    onAnswer(answer);
+  };
 
   return (
     <div className="orch-question-card">
@@ -45,38 +50,40 @@ export function ClarificationQuestionCard({
             {item.label}
           </button>
         ))}
-        <button
-          type="button"
-          className="button button-ghost orch-question-option"
-          disabled={disabled}
-          onClick={() => setShowOther((value) => !value)}
-          aria-expanded={showOther}
-        >
-          Other…
-        </button>
       </div>
-      {showOther && (
-        <div className="orch-question-freetext">
-          <label htmlFor={`freetext-${question.id}`}>Your own answer</label>
-          <div className="orch-question-freetext-row">
-            <input
-              id={`freetext-${question.id}`}
-              value={freeText}
-              onChange={(event) => setFreeText(event.target.value)}
-              disabled={disabled}
-              autoFocus
-            />
-            <button
-              type="button"
-              className="button button-primary"
-              disabled={disabled || !freeText.trim()}
-              onClick={() => onAnswer(freeText.trim())}
-            >
-              Submit
-            </button>
-          </div>
+      <form
+        className="orch-question-freetext"
+        onSubmit={(event) => {
+          event.preventDefault();
+          submitFreeText();
+        }}
+      >
+        <label htmlFor={`freetext-${question.id}`}>Or write your own answer</label>
+        <div className="orch-question-freetext-row">
+          <textarea
+            id={`freetext-${question.id}`}
+            value={freeText}
+            onChange={(event) => setFreeText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                submitFreeText();
+              }
+            }}
+            disabled={disabled}
+            rows={3}
+            placeholder="Add context or provide an answer that is not listed above…"
+          />
+          <button
+            type="submit"
+            className="button button-primary"
+            disabled={disabled || !freeText.trim()}
+          >
+            Send answer
+          </button>
         </div>
-      )}
+        <small>Press ⌘ Enter or Ctrl Enter to send.</small>
+      </form>
     </div>
   );
 }

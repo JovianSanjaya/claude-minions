@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentRun, Message } from "../types";
 import type { OrchestrationApi } from "./api-port";
-import type { OrchestrationReadModel, RequestedMode } from "./contracts";
+import type {
+  ClarificationQuestionView,
+  OrchestrationReadModel,
+  OrchestrationSummary,
+  RequestedMode,
+} from "./contracts";
 import { ClarificationQuestionCard } from "./components/ClarificationQuestionCard";
 import { DetailsPage } from "./components/DetailsPage";
 import { IntegrationResultPage } from "./components/IntegrationResultPage";
@@ -69,12 +74,16 @@ export function OrchestrationPanel({
   const [prompt, setPrompt] = useState("");
   const [view, setView] = useState<OrchestrationReadModel | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [orchestrationHistory, setOrchestrationHistory] = useState<OrchestrationSummary[]>([]);
   const [answers, setAnswers] = useState<string[]>([]);
+  const [questionHistory, setQuestionHistory] = useState<ClarificationQuestionView[]>([]);
+  const [recoveryResponse, setRecoveryResponse] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<WorkflowStepId | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [followingLatest, setFollowingLatest] = useState(true);
+  const [messagesScrollable, setMessagesScrollable] = useState(false);
   const autoStarted = useRef(new Set<string>());
   const messagesContainer = useRef<HTMLDivElement>(null);
   const followLatest = useRef(true);
@@ -82,13 +91,18 @@ export function OrchestrationPanel({
   useEffect(() => {
     setView(null);
     setActiveId(null);
+    setOrchestrationHistory([]);
     setAnswers([]);
+    setQuestionHistory([]);
+    setRecoveryResponse("");
     setError(null);
     followLatest.current = true;
     setFollowingLatest(true);
+    setMessagesScrollable(false);
     void api
       .list(agentId)
       .then(({ orchestrations }) => {
+        setOrchestrationHistory(orchestrations);
         const current =
           orchestrations.find((item) => !isTerminal(item.status)) ?? orchestrations[0];
         if (current) setActiveId(current.id);
@@ -97,12 +111,20 @@ export function OrchestrationPanel({
   }, [agentId, api]);
 
   useEffect(() => {
+    setRecoveryResponse("");
+  }, [view?.pendingAmendment?.id]);
+
+  useEffect(() => {
     if (!activeId) return;
     const handle = pollOrchestration(
       api,
       activeId,
       (next) => {
         setView(next);
+        setOrchestrationHistory((current) =>
+          [next.orchestration, ...current.filter((item) => item.id !== next.orchestration.id)]
+            .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+        );
         if (isTerminal(next.orchestration.status)) onTerminal?.();
       },
       (reason) => setError(`Refresh delayed: ${reason.message}`),
@@ -115,14 +137,29 @@ export function OrchestrationPanel({
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    if (!followLatest.current) return;
+  useLayoutEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       const container = messagesContainer.current;
-      if (container) container.scrollTop = container.scrollHeight;
+      if (!container) return;
+      const canScroll = container.scrollHeight - container.clientHeight > 1;
+      setMessagesScrollable(canScroll);
+      if (!canScroll) {
+        followLatest.current = true;
+        setFollowingLatest(true);
+        return;
+      }
+      if (followLatest.current) container.scrollTop = container.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [directMessages.length, directRun?.status, view?.orchestration.status, answers.length]);
+  }, [
+    answers.length,
+    directMessages.length,
+    directRun?.status,
+    error,
+    orchestrationHistory,
+    pending,
+    view,
+  ]);
 
   useEffect(() => {
     if (!view || view.orchestration.status !== "ready") return;
@@ -146,10 +183,25 @@ export function OrchestrationPanel({
     [view, nowMs],
   );
   const steps = view ? workflowState(view) : null;
-  const questions =
-    view?.activeDraft?.materialQuestions.map(toClarificationQuestion) ?? [];
+  const currentDraftQuestions = useMemo(
+    () => view?.activeDraft?.materialQuestions.map(toClarificationQuestion) ?? [],
+    [view?.activeDraft?.materialQuestions],
+  );
+  const questions = currentDraftQuestions.length ? currentDraftQuestions : questionHistory;
   const currentQuestion = questions[answers.length] ?? null;
   const orchestrationBusy = Boolean(view && !isTerminal(view.orchestration.status));
+  const previousOrchestrations = useMemo(
+    () =>
+      orchestrationHistory
+        .filter((item) => item.id !== (view?.orchestration.id ?? activeId))
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+    [activeId, orchestrationHistory, view?.orchestration.id],
+  );
+
+  useEffect(() => {
+    if (!currentDraftQuestions.length) return;
+    setQuestionHistory(currentDraftQuestions);
+  }, [currentDraftQuestions]);
 
   const refresh = async () => {
     if (activeId) setView(await api.get(activeId));
@@ -186,7 +238,13 @@ export function OrchestrationPanel({
           prompt: content,
           requestedMode: mode,
         });
+        setOrchestrationHistory((current) => [
+          result.orchestration,
+          ...current.filter((item) => item.id !== result.orchestration.id),
+        ]);
         setAnswers([]);
+        setQuestionHistory([]);
+        setRecoveryResponse("");
         setActivePage(null);
         setView(null);
         setActiveId(result.orchestration.id);
@@ -217,6 +275,28 @@ export function OrchestrationPanel({
     await runAction(() => api.confirm(view.orchestration.id));
   };
 
+  const resumeRecovery = async () => {
+    if (!view?.pendingAmendment) return;
+    const response = recoveryResponse.trim();
+    if (!response) return;
+    const resumed = await runAction(() =>
+      api.confirmAmendment(
+        view.orchestration.id,
+        view.pendingAmendment!.id,
+        response,
+      ),
+    );
+    if (resumed) setRecoveryResponse("");
+  };
+
+  const stopRecovery = async () => {
+    if (!view?.pendingAmendment) return;
+    await runAction(async () => {
+      await api.rejectAmendment(view.orchestration.id, view.pendingAmendment!.id);
+      await api.cancel(view.orchestration.id);
+    });
+  };
+
   const openStep = (stepId: WorkflowStepId, index: number) => {
     if (!steps || index > steps.reachedIndex) return;
     setActivePage(stepId);
@@ -225,9 +305,32 @@ export function OrchestrationPanel({
   const handleMessagesScroll = () => {
     const container = messagesContainer.current;
     if (!container) return;
+    const canScroll = container.scrollHeight - container.clientHeight > 1;
+    setMessagesScrollable(canScroll);
+    if (!canScroll) {
+      followLatest.current = true;
+      setFollowingLatest(true);
+      return;
+    }
     const next = container.scrollHeight - container.scrollTop - container.clientHeight < 72;
+    if (followLatest.current) {
+      if (!next) {
+        window.requestAnimationFrame(() => {
+          if (followLatest.current && messagesContainer.current) {
+            messagesContainer.current.scrollTop = messagesContainer.current.scrollHeight;
+          }
+        });
+      }
+      return;
+    }
     followLatest.current = next;
     setFollowingLatest(next);
+  };
+
+  const stopFollowingLatest = () => {
+    if (!followLatest.current) return;
+    followLatest.current = false;
+    setFollowingLatest(false);
   };
 
   const jumpToLatest = () => {
@@ -251,8 +354,38 @@ export function OrchestrationPanel({
           </div>
         </div>
 
-        <div className="messages" ref={messagesContainer} onScroll={handleMessagesScroll}>
-          {directMessages.length === 0 && !directRun && !view ? (
+        <div
+          key={agentId}
+          className="messages"
+          ref={messagesContainer}
+          onScroll={handleMessagesScroll}
+          onWheel={(event) => {
+            const container = messagesContainer.current;
+            if (
+              event.deltaY < 0 &&
+              container &&
+              container.scrollHeight - container.clientHeight > 1
+            ) {
+              stopFollowingLatest();
+            }
+          }}
+          onTouchStart={stopFollowingLatest}
+          onPointerDown={(event) => {
+            const bounds = event.currentTarget.getBoundingClientRect();
+            if (event.clientX >= bounds.right - 20) stopFollowingLatest();
+          }}
+          onKeyDown={(event) => {
+            if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+              stopFollowingLatest();
+            }
+          }}
+          tabIndex={0}
+          aria-label="Conversation history"
+        >
+          {directMessages.length === 0 &&
+          previousOrchestrations.length === 0 &&
+          !directRun &&
+          !view ? (
             <div className="welcome">
               <div className="welcome-orbit">
                 <div>⌁</div>
@@ -283,6 +416,31 @@ export function OrchestrationPanel({
             ))
           )}
 
+          {previousOrchestrations.map((orchestration) => (
+            <Fragment key={orchestration.id}>
+              <article className="message message-user orch-user-request">
+                <div className="message-meta">
+                  <strong>You</strong>
+                  <span>{formatTime(orchestration.createdAt)}</span>
+                </div>
+                <div className="message-body">{orchestration.prompt}</div>
+              </article>
+              <AssistantMessage
+                agentName={agentName}
+                meta={statusLabel(orchestration.status)}
+              >
+                <div className={`orch-inline-result state-${orchestration.status}`}>
+                  <strong>{statusLabel(orchestration.status)}</strong>
+                  <p>
+                    {orchestration.finalOutput ??
+                      orchestration.error ??
+                      "This run ended without a result summary."}
+                  </p>
+                </div>
+              </AssistantMessage>
+            </Fragment>
+          ))}
+
           {view && (
             <article className="message message-user orch-user-request">
               <div className="message-meta">
@@ -302,6 +460,28 @@ export function OrchestrationPanel({
             </AssistantMessage>
           )}
 
+          {answers.map((answer, index) => (
+            <Fragment key={`${questions[index]?.id ?? index}:${answer}`}>
+              {questions[index] && (
+                <AssistantMessage agentName={agentName} meta="clarification answered">
+                  <div className="orch-question-card orch-question-card-answered">
+                    <div className="orch-question-heading">
+                      <span className="orch-badge orch-badge-answered">Answered</span>
+                      <p className="orch-question-prompt">{questions[index].prompt}</p>
+                    </div>
+                  </div>
+                </AssistantMessage>
+              )}
+              <article className="message message-user orch-answer">
+                <div className="message-meta">
+                  <strong>You</strong>
+                  <span>confirmation {index + 1}</span>
+                </div>
+                <div className="message-body">{answer}</div>
+              </article>
+            </Fragment>
+          ))}
+
           {view?.orchestration.status === "awaiting-confirmation" && currentQuestion && (
             <AssistantMessage agentName={agentName} meta="needs one detail">
               <ClarificationQuestionCard
@@ -313,15 +493,16 @@ export function OrchestrationPanel({
             </AssistantMessage>
           )}
 
-          {answers.map((answer, index) => (
-            <article className="message message-user orch-answer" key={`${index}:${answer}`}>
-              <div className="message-meta">
-                <strong>You</strong>
-                <span>confirmation {index + 1}</span>
-              </div>
-              <div className="message-body">{answer}</div>
-            </article>
-          ))}
+          {view?.orchestration.status === "awaiting-confirmation" &&
+            pending &&
+            !currentQuestion && (
+              <AssistantMessage agentName={agentName} meta="preparing the next step">
+                <div className="thinking-row" role="status" aria-live="polite">
+                  <span className="spinner" />
+                  Applying your answers and preparing the execution plan…
+                </div>
+              </AssistantMessage>
+            )}
 
           {view?.orchestration.status === "awaiting-confirmation" &&
             questions.length === 0 && (
@@ -344,7 +525,7 @@ export function OrchestrationPanel({
                 <div>
                   <strong>{progress.percent === 100 ? "Complete" : "Executing…"}</strong>
                   <button type="button" onClick={() => setActivePage("orchestration")}>
-                    Open live timeline ↗
+                    Open live log ↗
                   </button>
                 </div>
                 <b>{progress.percent}%</b>
@@ -401,6 +582,47 @@ export function OrchestrationPanel({
             </AssistantMessage>
           )}
 
+          {view?.orchestration.status === "needs-user" && view.pendingAmendment && (
+            <AssistantMessage agentName={agentName} meta="recovery needs your input">
+              <div className="orch-recovery-request">
+                <span className="orch-badge orch-badge-material">Blocked by user-controlled input</span>
+                <h3>
+                  {view.pendingAmendment.proposedIntent.materialQuestions[0] ??
+                    "What should the agent team do to unblock this run?"}
+                </h3>
+                <p>{view.pendingAmendment.reason}</p>
+                <label>
+                  Your response
+                  <textarea
+                    value={recoveryResponse}
+                    onChange={(event) => setRecoveryResponse(event.target.value)}
+                    placeholder="Provide the permission decision, credential-safe instruction, or alternative approach…"
+                    disabled={pending}
+                    rows={3}
+                  />
+                </label>
+                <div className="orch-recovery-actions">
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    disabled={pending || !recoveryResponse.trim()}
+                    onClick={() => void resumeRecovery()}
+                  >
+                    Send response and resume
+                  </button>
+                  <button
+                    type="button"
+                    className="button"
+                    disabled={pending}
+                    onClick={() => void stopRecovery()}
+                  >
+                    Stop this run
+                  </button>
+                </div>
+              </div>
+            </AssistantMessage>
+          )}
+
           {view && isTerminal(view.orchestration.status) && (
             <AssistantMessage agentName={agentName} meta={statusLabel(view.orchestration.status)}>
               <div className={`orch-inline-result state-${view.orchestration.status}`}>
@@ -447,7 +669,7 @@ export function OrchestrationPanel({
           )}
         </div>
 
-        {!followingLatest && (
+        {messagesScrollable && !followingLatest && (
           <button type="button" className="orch-jump-latest" onClick={jumpToLatest}>
             <span aria-hidden="true">↓</span>
             Jump to latest

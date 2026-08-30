@@ -25,6 +25,7 @@ export interface RoleCallInput {
   workspacePath: string;
   prompt: string;
   sandboxMode: "read-only" | "workspace-write";
+  runtimeProfile?: "default" | "verification";
   signal: AbortSignal;
   estimatedInputTokens?: number;
   estimatedOutputTokens?: number;
@@ -171,6 +172,7 @@ export class RoleExecutor {
         modelId: requestedModelId,
         runtimeHomePath,
         sandboxMode: input.sandboxMode,
+        runtimeProfile: input.runtimeProfile ?? "default",
       });
       await this.sink.commitModelUsage(reservation.reservationId, usageOf(result));
     } catch (error) {
@@ -211,6 +213,7 @@ export class RoleExecutor {
         actualModelId,
         modelFallback,
         sandboxMode: input.sandboxMode,
+        runtimeProfile: input.runtimeProfile ?? "default",
       },
     });
     return {

@@ -95,7 +95,10 @@ export const orchestrationApi: OrchestrationApi = {
   }),
   start: (id) => request(`/api/orchestrations/${id}/start`, { method: "POST" }),
   cancel: (id) => request(`/api/orchestrations/${id}/cancel`, { method: "POST" }),
-  confirmAmendment: (id, amendmentId) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/confirm`, { method: "POST" }),
+  confirmAmendment: (id, amendmentId, response) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/confirm`, {
+    method: "POST",
+    body: JSON.stringify(response ? { response } : {}),
+  }),
   rejectAmendment: (id, amendmentId) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/reject`, { method: "POST" }),
   createBenchmark: (agentId, input) => request(`/api/agents/${agentId}/benchmarks`, { method: "POST", body: JSON.stringify(input) }),
   getBenchmark: (id) => request(`/api/benchmarks/${id}`),
