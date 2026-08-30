@@ -5,7 +5,7 @@ export interface OrchestrationApi {
   create(agentId: string, input: { prompt: string; requestedMode: RequestedMode; budget?: Partial<BudgetPolicy> }): Promise<{ orchestration: OrchestrationSummary }>;
   get(id: string): Promise<OrchestrationReadModel>;
   reviseIntent(id: string, revision: string): Promise<unknown>;
-  confirm(id: string, criteria?: ContractCriterion[]): Promise<unknown>;
+  confirm(id: string, criteria?: ContractCriterion[], answers?: string[]): Promise<unknown>;
   start(id: string): Promise<unknown>;
   cancel(id: string): Promise<unknown>;
   confirmAmendment(id: string, amendmentId: string): Promise<unknown>;

@@ -21,16 +21,31 @@ class FakeDriver implements OrchestrationExecutionDriver {
   cancelled = 0;
   outcome: ExecutionOutcome = { kind: "completed", finalOutput: "published" };
   materialQuestions: string[] = [];
+  reconciliationPrompts: string[] = [];
+  initialIntent: Partial<Pick<
+    IntentDraft,
+    "goal" | "requirements" | "assumptions" | "nonGoals" | "architectureDecisions" | "manualExpectations"
+  >> = {};
+  reconciledIntent: Partial<Pick<
+    IntentDraft,
+    "goal" | "requirements" | "assumptions" | "nonGoals" | "architectureDecisions" | "manualExpectations"
+  >> = {};
   blockExecution = false;
 
   async elaborateIntent(input: Parameters<OrchestrationExecutionDriver["elaborateIntent"]>[0]) {
+    const reconciling = input.prompt.includes("Clarification reconciliation pass");
+    if (reconciling) this.reconciliationPrompts.push(input.prompt);
+    const intent = reconciling ? this.reconciledIntent : this.initialIntent;
     const draft: IntentDraft = {
       id: "ignored", orchestrationId: input.orchestrationId, revision: 0,
-      goal: "Implement the confirmed feature", requirements: ["Feature works"],
-      assumptions: ["Baseline remains stable"], nonGoals: ["No unrelated redesign"],
-      architectureDecisions: ["Use the control-plane boundary"],
-      materialQuestions: this.materialQuestions,
-      manualExpectations: ["The result is understandable"], createdAt: "ignored",
+      goal: intent.goal ?? "Implement the confirmed feature",
+      requirements: intent.requirements ?? ["Feature works"],
+      assumptions: intent.assumptions ?? ["Baseline remains stable"],
+      nonGoals: intent.nonGoals ?? ["No unrelated redesign"],
+      architectureDecisions: intent.architectureDecisions ?? ["Use the control-plane boundary"],
+      materialQuestions: reconciling ? [] : this.materialQuestions,
+      manualExpectations: intent.manualExpectations ?? ["The result is understandable"],
+      createdAt: "ignored",
     };
     const estimate: CostEstimate = {
       inputTokenLow: 100, inputTokenHigh: 200, outputTokenLow: 50,
@@ -141,9 +156,29 @@ describe("OrchestrationControlService", () => {
     );
   });
 
-  it("never plans before explicit confirmation and rejects unresolved material questions", async () => {
+  it("never plans before explicit confirmation and reconciles resolved questions across the contract", async () => {
     const driver = new FakeDriver();
-    driver.materialQuestions = ["Must the public API change?"];
+    driver.materialQuestions = [JSON.stringify({
+      prompt: "Should the game include duck controls?",
+      consequenceIfWrong: "The interaction model changes.",
+      options: [
+        { label: "Jump only", resolutionText: "Keep jump-only controls.", delegate: true },
+        { label: "Jump and duck", resolutionText: "Include duck controls and flying obstacles.", delegate: false },
+      ],
+    })];
+    driver.initialIntent = {
+      requirements: ["Feature works"],
+      assumptions: ["The game may use jump-only controls"],
+      nonGoals: ["Duck controls unless requested"],
+    };
+    driver.reconciledIntent = {
+      goal: "Build a dinosaur runner with jump and duck controls",
+      requirements: ["Feature works", "Include duck controls and flying obstacles"],
+      assumptions: ["The game runs in a browser"],
+      nonGoals: ["No multiplayer"],
+      architectureDecisions: ["Use Canvas 2D with keyboard and touch input"],
+      manualExpectations: ["Jumping and ducking are both playable"],
+    };
     const { service } = await fixture(driver);
     const created = await service.createOrchestration(AGENT_ID, {
       prompt: "Ambiguous work", requestedMode: "orchestrated",
@@ -151,6 +186,29 @@ describe("OrchestrationControlService", () => {
     await service.waitForIdle(created.id);
     expect(service.getOrchestration(created.id).plan).toBeNull();
     await expect(service.confirm(created.id)).rejects.toMatchObject({ statusCode: 422 });
+
+    const contract = await service.confirm(
+      created.id,
+      [{ id: "stale", kind: "scope", description: "No duck controls", verification: "static-check" }],
+      ["Include duck controls and flying obstacles."],
+    );
+    expect(contract.intent.materialQuestions).toEqual([]);
+    expect(contract.intent.requirements).toContain("Include duck controls and flying obstacles");
+    expect(contract.intent.assumptions).toEqual(["The game runs in a browser"]);
+    expect(contract.intent.nonGoals).toEqual(["No multiplayer"]);
+    expect(contract.criteria.map((criterion) => criterion.description)).toEqual(
+      expect.arrayContaining([
+        "Include duck controls and flying obstacles",
+        "Preserve non-goals: No multiplayer",
+      ]),
+    );
+    expect(contract.criteria.map((criterion) => criterion.description)).not.toContain("No duck controls");
+    expect(driver.reconciliationPrompts[0]).toContain(
+      '"resolution":"Include duck controls and flying obstacles."',
+    );
+    expect(service.getOrchestration(created.id).activeDraft).toEqual(contract.intent);
+    await service.waitForIdle(created.id);
+    expect(service.getOrchestration(created.id).orchestration.status).toBe("ready");
   });
 
   it("atomically enforces one active orchestration and stopped-Agent denial", async () => {

@@ -2,6 +2,24 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
 
 describe("orchestration model configuration", () => {
+  it("does not impose cumulative token budgets unless explicitly configured", () => {
+    const defaults = loadConfig({ NODE_ENV: "test" });
+    expect(defaults.orchestrationDefaultBudget).toMatchObject({
+      maxInputTokens: null,
+      maxOutputTokens: null,
+    });
+
+    const configured = loadConfig({
+      NODE_ENV: "test",
+      ORCHESTRATION_MAX_INPUT_TOKENS: "2000000",
+      ORCHESTRATION_MAX_OUTPUT_TOKENS: "500000",
+    });
+    expect(configured.orchestrationDefaultBudget).toMatchObject({
+      maxInputTokens: 2_000_000,
+      maxOutputTokens: 500_000,
+    });
+  });
+
   it("shares one big endpoint across trusted roles and one small endpoint across workers", () => {
     const config = loadConfig({
       NODE_ENV: "test",

@@ -1,57 +1,597 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { AgentRun, Message } from "../types";
 import type { OrchestrationApi } from "./api-port";
 import type { OrchestrationReadModel, RequestedMode } from "./contracts";
-import { EvidenceGrid } from "./components/EvidenceGrid";
+import { ClarificationQuestionCard } from "./components/ClarificationQuestionCard";
+import { DetailsPage } from "./components/DetailsPage";
+import { IntegrationResultPage } from "./components/IntegrationResultPage";
+import { OrchestrationPage } from "./components/OrchestrationPage";
+import { PlanBoard } from "./components/PlanBoard";
+import { UsagePanel } from "./components/UsagePanel";
 import { pollOrchestration } from "./polling";
-import { canConfirmIntent, filterEvents, formatDuration, formatEstimatedCost, formatNumber, orchestrationProgress, statusLabel, type TimelineFilter } from "./view-model";
+import {
+  WORKFLOW_STEPS,
+  budgetStopReason,
+  elapsedMsFor,
+  evidenceCounters,
+  isTerminal,
+  orchestrationProgress,
+  statusLabel,
+  toClarificationQuestion,
+  workflowState,
+  type WorkflowStepId,
+} from "./view-model";
 import "./orchestration.css";
 
-interface Props { agentId: string; agentStatus: "ready" | "busy" | "stopped" | "error"; api: OrchestrationApi; onDirectSend(prompt: string): Promise<void>; onTerminal?(): void }
-const modes: Array<{ id: RequestedMode; label: string; help: string }> = [
-  { id: "direct", label: "Direct", help: "Use the existing single-Agent conversation." },
-  { id: "auto", label: "Auto", help: "Let the router choose direct, one worker, or multiple workers." },
-  { id: "orchestrated", label: "Orchestrated", help: "Plan and coordinate isolated workers with verification." },
+interface Props {
+  agentId: string;
+  agentName: string;
+  agentInstructions: string;
+  agentStatus: "ready" | "busy" | "stopped" | "error";
+  api: OrchestrationApi;
+  directMessages: Message[];
+  directRun: AgentRun | null;
+  sessionConnected: boolean;
+  sandboxMode: string;
+  starterPrompts: string[];
+  onDirectSend(prompt: string): Promise<void>;
+  onTerminal?(): void;
+}
+
+const modes: Array<{ id: RequestedMode; label: string }> = [
+  { id: "direct", label: "Direct" },
+  { id: "auto", label: "Auto" },
+  { id: "orchestrated", label: "Orchestrated" },
 ];
 
-export function OrchestrationPanel({ agentId, agentStatus, api, onDirectSend, onTerminal }: Props) {
+function formatTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+export function OrchestrationPanel({
+  agentId,
+  agentName,
+  agentInstructions,
+  agentStatus,
+  api,
+  directMessages,
+  directRun,
+  sessionConnected,
+  sandboxMode,
+  starterPrompts,
+  onDirectSend,
+  onTerminal,
+}: Props) {
   const [mode, setMode] = useState<RequestedMode>("auto");
   const [prompt, setPrompt] = useState("");
   const [view, setView] = useState<OrchestrationReadModel | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [revision, setRevision] = useState("");
+  const [answers, setAnswers] = useState<string[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<TimelineFilter>("all");
-  const [taskFilter, setTaskFilter] = useState("");
+  const [activePage, setActivePage] = useState<WorkflowStepId | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [followingLatest, setFollowingLatest] = useState(true);
+  const autoStarted = useRef(new Set<string>());
+  const messagesContainer = useRef<HTMLDivElement>(null);
+  const followLatest = useRef(true);
 
-  useEffect(() => { setView(null); setActiveId(null); setError(null); void api.list(agentId).then(({ orchestrations }) => { const current = orchestrations.find((item) => !["completed", "failed", "cancelled", "budget-exhausted"].includes(item.status)) ?? orchestrations[0]; if (current) setActiveId(current.id); }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason))); }, [agentId, api]);
-  useEffect(() => { if (!activeId) return; const handle = pollOrchestration(api, activeId, (next) => { setView(next); if (["completed", "failed", "cancelled", "budget-exhausted"].includes(next.orchestration.status)) onTerminal?.(); }, (reason) => setError(`Refresh delayed: ${reason.message}`)); return () => handle.stop(); }, [activeId, api, onTerminal]);
-  useEffect(() => { const timer = window.setInterval(() => setNowMs(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
-  const events = useMemo(() => view ? filterEvents(view.events, filter, taskFilter) : [], [view, filter, taskFilter]);
-  const progress = useMemo(() => view ? orchestrationProgress(view, nowMs) : null, [view, nowMs]);
-  const action = async (work: () => Promise<unknown>) => { setPending(true); setError(null); try { await work(); if (activeId) setView(await api.get(activeId)); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setPending(false); } };
-  const submit = async (event: React.FormEvent) => { event.preventDefault(); const content = prompt.trim(); if (!content) return; setPending(true); setError(null); try { if (mode === "direct") { await onDirectSend(content); setPrompt(""); } else { const result = await api.create(agentId, { prompt: content, requestedMode: mode }); setActiveId(result.orchestration.id); setPrompt(""); } } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); } finally { setPending(false); } };
-  const orchestration = view?.orchestration;
-  return <section className="orchestration-panel" aria-labelledby="orchestration-title">
-    <header className="orch-header"><div><span className="eyebrow">Execution control</span><h2 id="orchestration-title">Direct or coordinated build</h2></div>{orchestration && <span className={`orch-state state-${orchestration.status}`} aria-live="polite">{statusLabel(orchestration.status)}</span>}</header>
-    <form className="orch-composer" onSubmit={submit}>
-      <fieldset className="orch-modes"><legend>Execution mode</legend>{modes.map((item) => <label key={item.id} className={mode === item.id ? "selected" : ""}><input type="radio" name="mode" value={item.id} checked={mode === item.id} onChange={() => setMode(item.id)} /><span><b>{item.label}</b><small>{item.help}</small></span></label>)}</fieldset>
-      <label className="orch-prompt">Task<textarea rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the outcome and constraints…" disabled={pending || agentStatus === "stopped"} /></label>
-      <button className="button button-primary" disabled={pending || !prompt.trim() || agentStatus === "stopped"}>{pending ? "Working…" : mode === "direct" ? "Send direct" : "Review intent"}</button>
-    </form>
-    {error && <div className="orch-error" role="alert">{error}<button onClick={() => setError(null)}>Dismiss</button></div>}
-    {view && <div className="orch-body">
-      {view.activeDraft && <section className="orch-intent orch-card"><div className="orch-title-row"><div><span className="eyebrow">Intent revision {view.activeDraft.revision}</span><h3>{view.activeDraft.goal}</h3></div>{view.activeContract && <small>Contract v{view.activeContract.version} · {new Date(view.activeContract.confirmedAt).toLocaleString()}</small>}</div><div className="orch-intent-grid"><IntentList title="Requirements" values={view.activeDraft.requirements}/><IntentList title="Assumptions" values={view.activeDraft.assumptions}/><IntentList title="Non-goals" values={view.activeDraft.nonGoals}/><IntentList title="Architecture decisions" values={view.activeDraft.architectureDecisions}/><IntentList title="Manual expectations" values={view.activeDraft.manualExpectations}/><IntentList title="Material questions" values={view.activeDraft.materialQuestions} warning/></div>{orchestration?.estimate && <div className="orch-estimate"><span><b>{formatNumber(orchestration.estimate.inputTokenLow)}–{formatNumber(orchestration.estimate.inputTokenHigh)}</b> estimated input</span><span><b>{formatNumber(orchestration.estimate.outputTokenLow)}–{formatNumber(orchestration.estimate.outputTokenHigh)}</b> estimated output</span><span>{orchestration.estimate.estimatedUsdHigh === null ? "Pricing not configured" : formatEstimatedCost(orchestration.estimate.estimatedUsdHigh)}</span></div>}{orchestration?.status === "awaiting-confirmation" && <div className="orch-actions"><label>Revision or answers<textarea rows={2} value={revision} onChange={(event) => setRevision(event.target.value)} /></label><button className="button button-ghost" disabled={pending || !revision.trim()} onClick={() => void action(async () => { await api.reviseIntent(orchestration.id, revision); setRevision(""); })}>Revise</button><button className="button button-primary" disabled={pending || !canConfirmIntent(view)} title={view.activeDraft.materialQuestions.length ? "Answer material questions before confirming" : "Confirm this contract"} onClick={() => void action(() => api.confirm(orchestration.id))}>Confirm contract</button></div>}</section>}
-      {view.pendingAmendment && <section className="orch-card orch-amendment"><h3>Material amendment needs you</h3><p>{view.pendingAmendment.reason}</p><button className="button button-primary" onClick={() => void action(() => api.confirmAmendment(view.orchestration.id, view.pendingAmendment!.id))}>Confirm amendment</button><button className="button button-ghost" onClick={() => void action(() => api.rejectAmendment(view.orchestration.id, view.pendingAmendment!.id))}>Reject</button></section>}
-      {orchestration?.status === "ready" && <section className="orch-start orch-card"><div><h3>Plan ready</h3><p>{view.plan?.routeReason}</p></div><button className="button button-primary" disabled={pending} onClick={() => void action(() => api.start(orchestration.id))}>Start execution</button></section>}
-      {orchestration && !["completed", "failed", "cancelled", "budget-exhausted"].includes(orchestration.status) && <div className="orch-control-row"><button className="button button-danger" disabled={pending} onClick={() => void action(() => api.cancel(orchestration.id))}>Cancel orchestration</button></div>}
-      {progress && <section className="orch-card orch-progress" aria-live="polite"><div className="orch-title-row"><div><span className="eyebrow">Live execution · {progress.stage}</span><h3>{progress.phase}</h3></div><strong>{progress.percent}% of this stage</strong></div><div className="orch-progress-track" role="progressbar" aria-label={`${progress.phase} stage progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><span style={{ width: `${progress.percent}%` }}/></div><p>{progress.detail}</p><div className="orch-progress-facts"><span><b>{progress.activeRole ? `${statusLabel(progress.activeRole)} model call` : "Local processing"}</b><small>Elapsed {formatDuration(progress.elapsedMs)}</small></span><span><b>{progress.activeRole ? progress.heartbeatFresh ? "Active heartbeat" : "No recent heartbeat" : "Processing current stage"}</b><small>Last activity {new Date(progress.lastActivityAt).toLocaleTimeString()}</small></span><span><b>{progress.activeRole && progress.timeoutRemainingMs !== null ? `${formatDuration(progress.timeoutRemainingMs)} before timeout` : "No model call active"}</b><small>The provider does not expose an exact ETA</small></span></div><small className="orch-progress-note">The bar resets for each stage and appears only while the system is working.</small></section>}
-      <EvidenceGrid view={view}/>
-      <section className="orch-card orch-wide"><div className="orch-title-row"><h3>Correlated timeline</h3><div className="orch-filters"><label>Event filter<select value={filter} onChange={(event) => setFilter(event.target.value as TimelineFilter)}><option value="all">All</option><option value="worker">Worker</option><option value="planner">Planner</option><option value="failure">Failures</option><option value="budget">Budget</option><option value="verification">Verification</option><option value="integration">Integration</option></select></label><label>Task<select value={taskFilter} onChange={(event) => setTaskFilter(event.target.value)}><option value="">All tasks</option>{view.tasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select></label></div></div><ol className="orch-timeline">{events.map((event) => <li key={event.id}><time>{new Date(event.createdAt).toLocaleTimeString()}</time><div><strong>{event.actorRole} · {statusLabel(event.type)}</strong><p>{event.summary}</p>{event.modelId && <small>Model {event.modelId}</small>}</div></li>)}</ol></section>
-      {(orchestration?.finalOutput || orchestration?.error) && <section className={`orch-card orch-result ${orchestration.status === "completed" ? "success" : "failure"}`}><h3>{orchestration.status === "completed" ? "Verified result" : statusLabel(orchestration.status)}</h3><p>{orchestration.finalOutput ?? orchestration.error}</p>{orchestration.status === "budget-exhausted" && <strong>Exact budget stop: {orchestration.error}</strong>}{view.cleanup && <small>Cleanup: {view.cleanup.status} — {view.cleanup.summary}</small>}</section>}
-    </div>}
-  </section>;
+  useEffect(() => {
+    setView(null);
+    setActiveId(null);
+    setAnswers([]);
+    setError(null);
+    followLatest.current = true;
+    setFollowingLatest(true);
+    void api
+      .list(agentId)
+      .then(({ orchestrations }) => {
+        const current =
+          orchestrations.find((item) => !isTerminal(item.status)) ?? orchestrations[0];
+        if (current) setActiveId(current.id);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+  }, [agentId, api]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const handle = pollOrchestration(
+      api,
+      activeId,
+      (next) => {
+        setView(next);
+        if (isTerminal(next.orchestration.status)) onTerminal?.();
+      },
+      (reason) => setError(`Refresh delayed: ${reason.message}`),
+    );
+    return () => handle.stop();
+  }, [activeId, api, onTerminal]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!followLatest.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const container = messagesContainer.current;
+      if (container) container.scrollTop = container.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [directMessages.length, directRun?.status, view?.orchestration.status, answers.length]);
+
+  useEffect(() => {
+    if (!view || view.orchestration.status !== "ready") return;
+    const id = view.orchestration.id;
+    if (autoStarted.current.has(id)) return;
+    autoStarted.current.add(id);
+    setPending(true);
+    void api
+      .start(id)
+      .then(() => api.get(id))
+      .then(setView)
+      .catch((reason) => {
+        autoStarted.current.delete(id);
+        setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => setPending(false));
+  }, [api, view]);
+
+  const progress = useMemo(
+    () => (view ? orchestrationProgress(view, nowMs) : null),
+    [view, nowMs],
+  );
+  const steps = view ? workflowState(view) : null;
+  const questions =
+    view?.activeDraft?.materialQuestions.map(toClarificationQuestion) ?? [];
+  const currentQuestion = questions[answers.length] ?? null;
+  const orchestrationBusy = Boolean(view && !isTerminal(view.orchestration.status));
+
+  const refresh = async () => {
+    if (activeId) setView(await api.get(activeId));
+  };
+
+  const runAction = async (work: () => Promise<unknown>): Promise<boolean> => {
+    setPending(true);
+    setError(null);
+    try {
+      await work();
+      await refresh();
+      return true;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const content = prompt.trim();
+    if (!content) return;
+    followLatest.current = true;
+    setFollowingLatest(true);
+    setPending(true);
+    setError(null);
+    try {
+      if (mode === "direct") {
+        await onDirectSend(content);
+      } else {
+        const result = await api.create(agentId, {
+          prompt: content,
+          requestedMode: mode,
+        });
+        setAnswers([]);
+        setActivePage(null);
+        setView(null);
+        setActiveId(result.orchestration.id);
+      }
+      setPrompt("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const answerQuestion = async (answer: string) => {
+    if (!view || !currentQuestion) return;
+    followLatest.current = true;
+    setFollowingLatest(true);
+    const nextAnswers = [...answers, answer];
+    setAnswers(nextAnswers);
+    if (nextAnswers.length < questions.length) return;
+    const confirmed = await runAction(() =>
+      api.confirm(view.orchestration.id, undefined, nextAnswers),
+    );
+    if (!confirmed) setAnswers(answers);
+  };
+
+  const confirmWithoutQuestions = async () => {
+    if (!view) return;
+    await runAction(() => api.confirm(view.orchestration.id));
+  };
+
+  const openStep = (stepId: WorkflowStepId, index: number) => {
+    if (!steps || index > steps.reachedIndex) return;
+    setActivePage(stepId);
+  };
+
+  const handleMessagesScroll = () => {
+    const container = messagesContainer.current;
+    if (!container) return;
+    const next = container.scrollHeight - container.scrollTop - container.clientHeight < 72;
+    followLatest.current = next;
+    setFollowingLatest(next);
+  };
+
+  const jumpToLatest = () => {
+    followLatest.current = true;
+    setFollowingLatest(true);
+    const container = messagesContainer.current;
+    if (container) container.scrollTop = container.scrollHeight;
+  };
+
+  return (
+    <>
+      <section className="playground orchestration-chat" aria-labelledby="orchestration-title">
+        <div className="playground-topbar">
+          <div>
+            <span className="eyebrow">Playground · Execution control</span>
+            <h2 id="orchestration-title">Build something with {agentName}</h2>
+          </div>
+          <div className="session-info">
+            <span className="pulse" />
+            {sessionConnected ? "Session connected" : "New session"}
+          </div>
+        </div>
+
+        <div className="messages" ref={messagesContainer} onScroll={handleMessagesScroll}>
+          {directMessages.length === 0 && !directRun && !view ? (
+            <div className="welcome">
+              <div className="welcome-orbit">
+                <div>⌁</div>
+              </div>
+              <h3>What should {agentName} build?</h3>
+              <p>
+                Use Auto for clarification, planning, accounting, coordinated agents, and
+                verified integration in one conversation.
+              </p>
+              <div className="prompt-grid">
+                {starterPrompts.map((item) => (
+                  <button key={item} onClick={() => setPrompt(item)}>
+                    <span>↗</span>
+                    {item}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            directMessages.map((message) => (
+              <article className={`message message-${message.role}`} key={message.id}>
+                <div className="message-meta">
+                  <strong>{message.role === "user" ? "You" : agentName}</strong>
+                  <span>{formatTime(message.createdAt)}</span>
+                </div>
+                <div className="message-body">{message.content}</div>
+              </article>
+            ))
+          )}
+
+          {view && (
+            <article className="message message-user orch-user-request">
+              <div className="message-meta">
+                <strong>You</strong>
+                <span>{formatTime(view.orchestration.createdAt)}</span>
+              </div>
+              <div className="message-body">{view.orchestration.prompt}</div>
+            </article>
+          )}
+
+          {view?.orchestration.status === "drafting-intent" && (
+            <AssistantMessage agentName={agentName} meta="reviewing the request">
+              <div className="thinking-row">
+                <span className="spinner" />
+                Preparing the run details and checking for material choices…
+              </div>
+            </AssistantMessage>
+          )}
+
+          {view?.orchestration.status === "awaiting-confirmation" && currentQuestion && (
+            <AssistantMessage agentName={agentName} meta="needs one detail">
+              <ClarificationQuestionCard
+                key={currentQuestion.id}
+                question={currentQuestion}
+                disabled={pending}
+                onAnswer={(answer) => void answerQuestion(answer)}
+              />
+            </AssistantMessage>
+          )}
+
+          {answers.map((answer, index) => (
+            <article className="message message-user orch-answer" key={`${index}:${answer}`}>
+              <div className="message-meta">
+                <strong>You</strong>
+                <span>confirmation {index + 1}</span>
+              </div>
+              <div className="message-body">{answer}</div>
+            </article>
+          ))}
+
+          {view?.orchestration.status === "awaiting-confirmation" &&
+            questions.length === 0 && (
+              <AssistantMessage agentName={agentName} meta="ready for confirmation">
+                <p>I have enough detail to plan and execute this run.</p>
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={pending}
+                  onClick={() => void confirmWithoutQuestions()}
+                >
+                  Confirm and execute
+                </button>
+              </AssistantMessage>
+            )}
+
+          {view && progress && !["drafting-intent", "awaiting-confirmation"].includes(view.orchestration.status) && (
+            <AssistantMessage agentName={agentName} meta={statusLabel(view.orchestration.status)}>
+              <div className="orch-executing-head">
+                <div>
+                  <strong>{progress.percent === 100 ? "Complete" : "Executing…"}</strong>
+                  <button type="button" onClick={() => setActivePage("orchestration")}>
+                    Open live timeline ↗
+                  </button>
+                </div>
+                <b>{progress.percent}%</b>
+              </div>
+              <div
+                className="orch-progress-track"
+                role="progressbar"
+                aria-label="Overall orchestration progress"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={progress.percent}
+              >
+                <span style={{ width: `${progress.percent}%` }} />
+              </div>
+              <p className="orch-note">{progress.detail}</p>
+              {view.orchestration.status === "ready" && error && (
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={pending}
+                  onClick={() => {
+                    autoStarted.current.add(view.orchestration.id);
+                    void runAction(() => api.start(view.orchestration.id));
+                  }}
+                >
+                  Retry start
+                </button>
+              )}
+              <nav className="orch-step-nav" aria-label="Execution pages">
+                {WORKFLOW_STEPS.map((step, index) => {
+                  const reached = Boolean(steps && index <= steps.reachedIndex);
+                  return (
+                    <button
+                      type="button"
+                      key={step.id}
+                      disabled={!reached}
+                      data-active={steps?.activeIndex === index}
+                      data-reached={reached}
+                      onClick={() => openStep(step.id, index)}
+                    >
+                      <span>{index + 1}</span>
+                      {step.label}
+                    </button>
+                  );
+                })}
+              </nav>
+              <div className="orch-live-facts">
+                <span>{progress.phase}</span>
+                <span>Elapsed {Math.round(progress.elapsedMs / 1_000)}s</span>
+                <span>
+                  {progress.activeRole ? `${progress.activeRole} model active` : "Local control step"}
+                </span>
+              </div>
+            </AssistantMessage>
+          )}
+
+          {view && isTerminal(view.orchestration.status) && (
+            <AssistantMessage agentName={agentName} meta={statusLabel(view.orchestration.status)}>
+              <div className={`orch-inline-result state-${view.orchestration.status}`}>
+                <strong>
+                  {view.orchestration.status === "completed"
+                    ? "Verified result ready"
+                    : statusLabel(view.orchestration.status)}
+                </strong>
+                <p>
+                  {view.orchestration.finalOutput ??
+                    view.orchestration.error ??
+                    "The run ended without a result summary."}
+                </p>
+                {steps && steps.reachedIndex >= 4 && (
+                  <button type="button" onClick={() => setActivePage("integration")}>
+                    Open Integration (Result) ↗
+                  </button>
+                )}
+              </div>
+            </AssistantMessage>
+          )}
+
+          {directRun && ["queued", "running"].includes(directRun.status) && (
+            <AssistantMessage agentName={agentName} meta="working in the Agent workspace">
+              <div className="thinking-row">
+                <span className="spinner" />
+                Codex is reading, editing, or running commands…
+              </div>
+            </AssistantMessage>
+          )}
+          {directRun?.status === "failed" && (
+            <article className="run-error">
+              <strong>Run failed</strong>
+              <span>{directRun.error}</span>
+            </article>
+          )}
+          {error && (
+            <div className="orch-error" role="alert">
+              <span>{error}</span>
+              <button type="button" onClick={() => setError(null)}>
+                Dismiss
+              </button>
+            </div>
+          )}
+        </div>
+
+        {!followingLatest && (
+          <button type="button" className="orch-jump-latest" onClick={jumpToLatest}>
+            <span aria-hidden="true">↓</span>
+            Jump to latest
+          </button>
+        )}
+
+        <form className="composer orch-chat-composer" onSubmit={submit}>
+          <div className="orch-inline-modes" aria-label="Execution mode">
+            {modes.map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                aria-pressed={mode === item.id}
+                onClick={() => setMode(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <textarea
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+            placeholder={
+              agentStatus === "stopped"
+                ? "Start this Agent to continue…"
+                : mode === "direct"
+                  ? "Send a direct message…"
+                  : "Describe what you want the Agent team to build…"
+            }
+            disabled={
+              pending ||
+              orchestrationBusy ||
+              agentStatus === "stopped" ||
+              agentStatus === "busy" ||
+              Boolean(directRun && ["queued", "running"].includes(directRun.status))
+            }
+            rows={3}
+          />
+          <div className="composer-footer">
+            <span>
+              Enter to send · {mode} mode · {sandboxMode}
+            </span>
+            <button
+              className="send-button"
+              disabled={
+                !prompt.trim() ||
+                pending ||
+                orchestrationBusy ||
+                agentStatus === "stopped" ||
+                agentStatus === "busy" ||
+                Boolean(directRun && ["queued", "running"].includes(directRun.status))
+              }
+              aria-label="Send message"
+            >
+              ↑
+            </button>
+          </div>
+        </form>
+      </section>
+
+      {view && activePage && (
+        <div className="orch-page-backdrop" onMouseDown={() => setActivePage(null)}>
+          <section
+            className="orch-page-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label={WORKFLOW_STEPS.find((step) => step.id === activePage)?.label}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header className="orch-page-header">
+              <nav className="orch-step-nav" aria-label="Execution pages">
+                {WORKFLOW_STEPS.map((step, index) => {
+                  const reached = Boolean(steps && index <= steps.reachedIndex);
+                  return (
+                    <button
+                      type="button"
+                      key={step.id}
+                      disabled={!reached}
+                      data-active={activePage === step.id}
+                      data-reached={reached}
+                      onClick={() => openStep(step.id, index)}
+                    >
+                      <span>{index + 1}</span>
+                      {step.label}
+                    </button>
+                  );
+                })}
+              </nav>
+              <button
+                type="button"
+                className="orch-page-close"
+                aria-label="Close execution page"
+                onClick={() => setActivePage(null)}
+              >
+                ×
+              </button>
+            </header>
+            <div className="orch-page-content">
+              {activePage === "details" && (
+                <DetailsPage view={view} agentInstructions={agentInstructions} />
+              )}
+              {activePage === "planner" && <PlanBoard view={view} />}
+              {activePage === "accounting" && (
+                <UsagePanel
+                  usage={view.usage}
+                  budget={view.orchestration.budget}
+                  estimate={view.orchestration.estimate}
+                  counters={evidenceCounters(view)}
+                  elapsedMs={elapsedMsFor(view, nowMs)}
+                  budgetStopReason={budgetStopReason(view)}
+                />
+              )}
+              {activePage === "orchestration" && <OrchestrationPage view={view} />}
+              {activePage === "integration" && <IntegrationResultPage view={view} />}
+            </div>
+          </section>
+        </div>
+      )}
+    </>
+  );
 }
 
-function IntentList({ title, values, warning = false }: { title: string; values: string[]; warning?: boolean }) { return <div className={warning && values.length ? "warning" : ""}><h4>{title}</h4>{values.length ? <ul>{values.map((value, index) => <li key={`${title}-${index}`}>{value}</li>)}</ul> : <p>None</p>}</div>; }
+function AssistantMessage({
+  agentName,
+  meta,
+  children,
+}: {
+  agentName: string;
+  meta: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <article className="message message-assistant orch-assistant-message">
+      <div className="message-meta">
+        <strong>{agentName}</strong>
+        <span>{meta}</span>
+      </div>
+      <div className="message-body">{children}</div>
+    </article>
+  );
+}

@@ -93,6 +93,8 @@ function fakeRunner(
   calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [],
   badPreflightOnce = false,
   failAcceptance = false,
+  includePostReleaseAcceptance = false,
+  allowNoChangeDirect = false,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   return {
@@ -102,17 +104,29 @@ function fakeRunner(
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
       } else if (request.prompt.includes("Create a bounded coding plan")) {
+        const acceptanceTests = [
+          { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
+          { id: "accept-b", title: "Module B works", criterionIds: ["c2"], category: "functional", scope: "protected", procedure: "Inspect and exercise module B", expectedOutcome: "B exports the expected value" },
+          { id: "regression", title: "Regression checks pass", criterionIds: [], category: "regression", scope: "global", procedure: "Run relevant repository checks", expectedOutcome: "Checks pass" },
+        ];
+        if (includePostReleaseAcceptance) {
+          acceptanceTests.push({
+            id: "final-reply",
+            title: "User receives the final reply",
+            criterionIds: [],
+            category: "functional",
+            scope: "global",
+            procedure: "Review the agent's final response to the user",
+            expectedOutcome: "The final response tells the user what was delivered",
+          });
+        }
         output = JSON.stringify({
           coupling: "LOW", estimatedCalls: "8", estimatedContextTokens: "1000",
           tasks: [
             { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: ["src/a.ts"], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
             { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"] },
           ],
-          acceptanceTests: [
-            { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
-            { id: "accept-b", title: "Module B works", criterionIds: ["c2"], category: "functional", scope: "protected", procedure: "Inspect and exercise module B", expectedOutcome: "B exports the expected value" },
-            { id: "regression", title: "Regression checks pass", criterionIds: [], category: "regression", scope: "global", procedure: "Run relevant repository checks", expectedOutcome: "Checks pass" },
-          ],
+          acceptanceTests,
         });
       } else if (request.prompt.includes("Produce a read-only worker preflight")) {
         const isA = request.prompt.includes("Task: Add A");
@@ -147,10 +161,14 @@ function fakeRunner(
       } else if (request.prompt.includes("Diagnose this compact failure packet")) {
         output = JSON.stringify({ classification: "implementation-bug", outcome: "stop", reason: "Worker failed after bounded retries" });
       } else if (request.prompt.includes("Execute the confirmed direct task")) {
-        await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
-        await writeFile(path.join(request.workspacePath, "src", "a.ts"), "export const a = 1;\n");
-        await writeFile(path.join(request.workspacePath, "src", "b.ts"), "export const b = 2;\n");
-        output = "Direct execution completed";
+        if (!allowNoChangeDirect) {
+          await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
+          await writeFile(path.join(request.workspacePath, "src", "a.ts"), "export const a = 1;\n");
+          await writeFile(path.join(request.workspacePath, "src", "b.ts"), "export const b = 2;\n");
+        }
+        output = allowNoChangeDirect
+          ? "Read-only direct execution completed"
+          : "Direct execution completed";
       } else if (request.prompt.includes("Independently verify the integrated candidate")) {
         output = JSON.stringify({
           results: [
@@ -175,7 +193,14 @@ function fakeRunner(
   };
 }
 
-async function setup(failWorkers = false, failGlobal = false, badPreflightOnce = false, failAcceptance = false) {
+async function setup(
+  failWorkers = false,
+  failGlobal = false,
+  badPreflightOnce = false,
+  failAcceptance = false,
+  includePostReleaseAcceptance = false,
+  allowNoChangeDirect = false,
+) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
   const workspace = path.join(root, "workspace");
@@ -184,19 +209,31 @@ async function setup(failWorkers = false, failGlobal = false, badPreflightOnce =
   const visibleCheck = async (candidate: string) => {
     const hasA = await readFile(path.join(candidate, "src", "a.ts"), "utf8").then(() => true).catch(() => false);
     const hasB = await readFile(path.join(candidate, "src", "b.ts"), "utf8").then(() => true).catch(() => false);
-    return { passed: hasA || hasB, summary: hasA || hasB ? "visible pass" : "expected task file missing" };
+    return {
+      passed: allowNoChangeDirect || hasA || hasB,
+      summary: allowNoChangeDirect || hasA || hasB
+        ? "visible pass"
+        : "expected task file missing",
+    };
   };
   const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [];
   const driver = new ContextAwareExecutionDriver({
-    runner: fakeRunner(failWorkers, calls, badPreflightOnce, failAcceptance),
+    runner: fakeRunner(
+      failWorkers,
+      calls,
+      badPreflightOnce,
+      failAcceptance,
+      includePostReleaseAcceptance,
+      allowNoChangeDirect,
+    ),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
     archiveRoot: path.join(root, "archive"), protectedEvaluatorRoot: path.join(root, "protected"),
     cleanupPolicy: "clean",
     verificationChecks: [
       { id: "visible", description: "visible task check", scope: "worker-visible", run: visibleCheck },
-      { id: "protected", description: "protected acceptance", scope: "protected", run: async (candidate) => ({ passed: await readFile(path.join(candidate, "src", "a.ts"), "utf8").then(() => true).catch(() => false), summary: "protected result" }) },
-      { id: "global", description: "global regression", scope: "global", run: async (candidate) => ({ passed: !failGlobal && await readFile(path.join(candidate, "src", "b.ts"), "utf8").then(() => true).catch(() => false), summary: failGlobal ? "controlled global failure" : "global result" }) },
+      { id: "protected", description: "protected acceptance", scope: "protected", run: async (candidate) => ({ passed: allowNoChangeDirect || await readFile(path.join(candidate, "src", "a.ts"), "utf8").then(() => true).catch(() => false), summary: "protected result" }) },
+      { id: "global", description: "global regression", scope: "global", run: async (candidate) => ({ passed: !failGlobal && (allowNoChangeDirect || await readFile(path.join(candidate, "src", "b.ts"), "utf8").then(() => true).catch(() => false)), summary: failGlobal ? "controlled global failure" : "global result" }) },
     ],
   });
   return { root, workspace, driver, calls };
@@ -221,7 +258,19 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(await readFile(path.join(workspace, "src", "b.ts"), "utf8")).toContain("b = 2");
     expect(sink.maps.map((map) => map.version)).toEqual([1, 2]);
     expect(sink.packets.length).toBeGreaterThanOrEqual(2);
-    expect(sink.artifacts.map((artifact) => artifact.version)).toEqual([1, 2]);
+    const testPlanArtifacts = sink.artifacts.filter((artifact) =>
+      artifact.name.startsWith("Planner acceptance test:"),
+    );
+    expect(testPlanArtifacts).toHaveLength(3);
+    expect(testPlanArtifacts[0]).toMatchObject({
+      kind: "decision",
+      producerTaskId: "planner",
+    });
+    expect(
+      sink.artifacts
+        .filter((artifact) => !artifact.name.startsWith("Planner acceptance test:"))
+        .map((artifact) => artifact.version),
+    ).toEqual([1, 2]);
     expect(sink.events.map((event) => event.type)).toEqual(
       expect.arrayContaining(["route-decision", "preflight-reviewed", "dependency-refreshed", "integration-candidate", "verified-publish"]),
     );
@@ -231,6 +280,12 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(sink.verifications.map((record) => record.commandOrCheck)).toEqual(
       expect.arrayContaining(["Module A works", "Module B works", "Regression checks pass"]),
     );
+    expect(
+      sink.verifications.find((record) => record.commandOrCheck === "Regression checks pass"),
+    ).toMatchObject({
+      status: "skipped",
+      outputSummary: expect.stringContaining("starting workspace had no existing"),
+    });
     expect(sink.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "acceptance-plan-created", actorRole: "planner", modelId: "strong" }),
       expect.objectContaining({ type: "acceptance-verification-completed", actorRole: "verifier", modelId: "verify" }),
@@ -246,6 +301,43 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
         .toBeLessThan(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write"));
     }
+  });
+
+  it("defers post-release effects without sending them to the release verifier", async () => {
+    const { workspace, driver, calls } = await setup(false, false, false, false, true);
+    const sink = new Sink();
+    const signal = new AbortController().signal;
+    const item = orchestration(workspace);
+    const plan = await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, signal);
+
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(
+      calls
+        .filter((call) => call.role === "verifier")
+        .map((call) => call.prompt)
+        .join("\n"),
+    ).not.toContain("final-reply");
+    expect(
+      sink.verifications.find((record) => record.commandOrCheck === "User receives the final reply"),
+    ).toMatchObject({
+      status: "skipped",
+      outputSummary: expect.stringContaining("Deferred until after verified publication"),
+    });
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "acceptance-verification-completed",
+      metadata: expect.objectContaining({ deferredPostRelease: 1 }),
+    }));
   });
 
   it("bounds repeated failure, emits compact escalation, and never publishes", async () => {
@@ -327,5 +419,34 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(outcome.kind).toBe("completed");
     expect(await readFile(path.join(workspace, "src", "a.ts"), "utf8")).toContain("a = 1");
     expect(sink.events.some((event) => event.type === "verified-publish")).toBe(true);
+  });
+
+  it("allows verified direct execution to complete without workspace changes", async () => {
+    const { workspace, driver } = await setup(false, false, false, false, false, true);
+    const sink = new Sink();
+    const signal = new AbortController().signal;
+    const item = orchestration(workspace);
+    item.requestedMode = "direct";
+    const before = await readFile(path.join(workspace, "src", "base.ts"), "utf8");
+    const plan = await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, signal);
+
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(await readFile(path.join(workspace, "src", "base.ts"), "utf8")).toBe(before);
+    await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
+    expect(sink.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "direct-no-workspace-change" }),
+      expect.objectContaining({ type: "verified-publish", metadata: { fileCount: 0, applicationMapVersion: 2 } }),
+    ]));
   });
 });

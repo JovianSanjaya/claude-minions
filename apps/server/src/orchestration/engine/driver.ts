@@ -19,6 +19,7 @@ import { buildApplicationMap, type DetailedApplicationMap } from "./application-
 import {
   comprehensiveAcceptanceTests,
   plannedAcceptanceTestSchema,
+  requiresPostReleaseVerification,
 } from "./acceptance-plan.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker } from "./context-broker.js";
@@ -30,13 +31,28 @@ import { requiredVerificationPassed, type TrustedVerificationCheck, Verification
 import { BoundedWorkerLoop, type WorkerLoopResult, WorkerLoopError } from "./worker-loop.js";
 import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
 
+const clarificationQuestionSchema = z.object({
+  prompt: z.string().min(1).max(600),
+  consequenceIfWrong: z.string().min(1).max(1_000),
+  options: z.array(z.object({
+    label: z.string().min(1).max(160),
+    resolutionText: z.string().min(1).max(1_000),
+    delegate: z.boolean().default(false),
+  }).strict()).min(2).max(6),
+}).strict();
+
 const intentSchema = z.object({
   goal: z.string().min(1).max(8_000),
   requirements: z.array(z.string().min(1).max(4_000)).min(1).max(100),
   assumptions: z.array(z.string().max(4_000)).max(100),
   nonGoals: z.array(z.string().max(4_000)).max(100),
   architectureDecisions: z.array(z.string().max(4_000)).max(100),
-  materialQuestions: z.array(z.string().max(4_000)).max(50),
+  // Strings remain accepted for compatibility with the frozen contract and
+  // older planner responses. Rich question objects are serialized back into
+  // those strings at the boundary for the inline clarification UI.
+  materialQuestions: z.array(
+    z.union([z.string().max(4_000), clarificationQuestionSchema]),
+  ).max(50),
   manualExpectations: z.array(z.string().max(4_000)).max(100),
   estimate: z.object({
     inputTokenLow: z.number().int().nonnegative(),
@@ -83,6 +99,18 @@ const diagnosisSchema = z.object({
   reason: z.string().min(1).max(4_000),
 }).strict();
 
+function serializeMaterialQuestion(
+  question: string | z.infer<typeof clarificationQuestionSchema>,
+): string {
+  return typeof question === "string"
+    ? question
+    : JSON.stringify({
+        prompt: question.prompt,
+        consequenceIfWrong: question.consequenceIfWrong,
+        options: question.options,
+      });
+}
+
 export interface EngineDriverOptions {
   runner: AgentRunner;
   models: RoleModelConfiguration;
@@ -108,6 +136,19 @@ function safeAllowedPath(value: string): string {
     throw new Error(`Planner produced unsafe allowed path: ${value}`);
   }
   return normalized;
+}
+
+function hasExistingRegressionInfrastructure(map: DetailedApplicationMap): boolean {
+  return map.entries.some((entry) => {
+    const file = entry.path.toLowerCase();
+    return (
+      /(^|\/)(?:__tests__|tests?|specs?)(\/|$)/.test(file) ||
+      /\.(?:test|spec)\.[^/]+$/.test(file) ||
+      /(^|\/)(?:package\.json|pyproject\.toml|setup\.cfg|tox\.ini|pytest\.ini|cargo\.toml|go\.mod|pom\.xml|build\.gradle(?:\.kts)?|makefile|justfile|deno\.jsonc?)$/.test(file) ||
+      /(^|\/)(?:vitest|jest|playwright|cypress|karma|ava|mocha)\.config\.[^/]+$/.test(file) ||
+      file.startsWith(".github/workflows/")
+    );
+  });
 }
 
 export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver {
@@ -155,6 +196,11 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Hard budget: ${JSON.stringify(input.budget)}`,
           `User prompt: ${input.prompt}`,
           "Return goal, requirements, assumptions, nonGoals, architectureDecisions, materialQuestions, manualExpectations, and estimate.",
+          "Each materialQuestions item should be an object with prompt, consequenceIfWrong, and 2-6 options.",
+          "Each option needs label, resolutionText, and delegate. Include one delegate=true recommended default.",
+          "Only ask when the choice materially changes scope, architecture, safety, public interfaces, acceptance, or cost.",
+          "Keep every returned section mutually consistent. Requirements, assumptions, non-goals, architecture decisions, and manual expectations must not contradict one another.",
+          "When the user prompt is a clarification reconciliation pass, apply every resolution throughout the entire intent, remove stale conditional statements, and return no material questions.",
         ].join("\n"),
       },
       intentSchema,
@@ -170,7 +216,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         assumptions: result.value.assumptions,
         nonGoals: result.value.nonGoals,
         architectureDecisions: result.value.architectureDecisions,
-        materialQuestions: result.value.materialQuestions,
+        materialQuestions: result.value.materialQuestions.map(serializeMaterialQuestion),
         manualExpectations: result.value.manualExpectations,
         createdAt,
       },
@@ -210,10 +256,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract.",
-          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete, non-destructive, and independently verifiable against the final integrated candidate. Use manual scope only when automation cannot reasonably decide the result.",
+          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
+          "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
+          "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
           "Return this exact JSON shape with no additional task fields:",
-          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
+          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
           "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative and must never begin with /workspace or contain '..'. Use exact criterion IDs from the confirmed contract.",
         ].join("\n").slice(0, 150_000),
       },
@@ -226,6 +274,22 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       generatedBy: "planner",
       tests: acceptanceTests,
     });
+    for (const test of acceptanceTests) {
+      await sink.publishArtifact({
+        id: this.newId(),
+        orchestrationId: input.orchestration.id,
+        producerTaskId: "planner",
+        kind: "decision",
+        name: `Planner acceptance test: ${test.id}`,
+        version: input.contract.version,
+        payload: JSON.stringify({
+          ...test,
+          procedure: test.procedure.slice(0, 2_500),
+          expectedOutcome: test.expectedOutcome.slice(0, 1_500),
+        }),
+        createdAt: this.now().toISOString(),
+      });
+    }
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
@@ -573,11 +637,20 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       prompt: `Execute the confirmed direct task in the workspace. Edit only ${task.allowedPaths.join(", ")}. Contract: ${JSON.stringify(input.contract)}`,
     });
     const changes = await this.workspaces.changes(workspace);
-    if (!changes.changedFiles.length && !changes.deletedFiles.length) {
-      throw new Error("Direct execution reported completion without making any workspace changes");
-    }
     const violations = scopeViolations(changes, task.allowedPaths);
     if (violations.length) throw new Error(`Direct execution scope violation: ${violations.join(", ")}`);
+    if (!changes.changedFiles.length && !changes.deletedFiles.length) {
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: task.id,
+        executionId: call.executionId,
+        type: "direct-no-workspace-change",
+        actorRole: "control-plane",
+        modelId: call.actualModelId,
+        summary: "Direct execution completed without workspace changes",
+        metadata: {},
+      });
+    }
     const visible = await this.verification.run(
       input.orchestration.id,
       task.id,
@@ -624,7 +697,24 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       input.orchestration.id,
       input.contract.version,
     );
-    const automated = plan.tests.filter((test) => test.scope !== "manual");
+    const startingMap = this.maps.get(input.orchestration.id);
+    const skipBaselineRegression = Boolean(
+      startingMap && !hasExistingRegressionInfrastructure(startingMap),
+    );
+    const skippedRegressionIds = new Set(
+      skipBaselineRegression
+        ? plan.tests.filter((test) => test.category === "regression").map((test) => test.id)
+        : [],
+    );
+    const postReleaseIds = new Set(
+      plan.tests.filter(requiresPostReleaseVerification).map((test) => test.id),
+    );
+    const automated = plan.tests.filter(
+      (test) =>
+        test.scope !== "manual" &&
+        !skippedRegressionIds.has(test.id) &&
+        !postReleaseIds.has(test.id),
+    );
     const startedAt = this.now().toISOString();
     const result = automated.length
       ? await roles.structured(
@@ -639,7 +729,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
             prompt: [
               "Independently verify the integrated candidate. Do not edit any files.",
               "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
-              "Return exactly one result for every supplied acceptance test. Passing requires concrete evidence; uncertainty, missing test infrastructure, or an unverified claim must fail.",
+              "Return exactly one result for every supplied acceptance test. Passing requires concrete evidence; uncertainty or an unverified claim must fail. Baseline regression tests are supplied only when the starting workspace has relevant automated-check infrastructure.",
               `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
               `Protected planner-generated acceptance tests: ${JSON.stringify(automated)}`,
             ].join("\n").slice(0, 150_000),
@@ -652,16 +742,24 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     for (const test of plan.tests) {
       const testResult = returned.get(test.id);
       const manual = test.scope === "manual";
+      const skippedRegression = skippedRegressionIds.has(test.id);
+      const postRelease = postReleaseIds.has(test.id);
       const record = {
         id: this.newId(),
         orchestrationId: input.orchestration.id,
         taskId: null,
         scope: manual ? "manual" as const : test.scope,
         commandOrCheck: test.title,
-        status: manual ? "skipped" as const : testResult?.status ?? "failed" as const,
+        status: manual || skippedRegression || postRelease
+          ? "skipped" as const
+          : testResult?.status ?? "failed" as const,
         outputSummary: manual
           ? `Manual review required: ${test.expectedOutcome}`
-          : testResult?.evidence ?? "Verifier omitted this required planner-generated acceptance test",
+          : postRelease
+            ? "Deferred until after verified publication because this outcome cannot exist during release-gate verification."
+            : skippedRegression
+              ? "Skipped as not applicable: the starting workspace had no existing automated regression-check infrastructure."
+              : testResult?.evidence ?? "Verifier omitted this required planner-generated acceptance test",
         startedAt,
         completedAt: this.now().toISOString(),
       };
@@ -680,7 +778,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         testCount: records.length,
         passed: records.filter((record) => record.status === "passed").length,
         failed: records.filter((record) => record.status === "failed").length,
-        manual: records.filter((record) => record.status === "skipped").length,
+        skipped: records.filter((record) => record.status === "skipped").length,
+        manual: records.filter((record) => record.scope === "manual").length,
+        regressionNotApplicable: skippedRegressionIds.size,
+        deferredPostRelease: postReleaseIds.size,
       },
     });
     return records;

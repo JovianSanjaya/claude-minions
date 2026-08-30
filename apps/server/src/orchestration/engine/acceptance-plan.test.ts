@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { ExecutionContract } from "../contracts.js";
-import { comprehensiveAcceptanceTests } from "./acceptance-plan.js";
+import {
+  comprehensiveAcceptanceTests,
+  requiresPostReleaseVerification,
+} from "./acceptance-plan.js";
 
 const contract: ExecutionContract = {
   id: "contract-1",
@@ -48,6 +51,46 @@ describe("planner acceptance plan", () => {
     );
     expect(tests.find((test) => test.criterionIds.includes("visual"))?.scope).toBe("manual");
     expect(tests.some((test) => test.category === "regression")).toBe(true);
+    expect(tests.find((test) => test.category === "regression")?.expectedOutcome)
+      .toContain("explicitly skipped as not applicable");
     expect(tests.flatMap((test) => test.criterionIds)).not.toContain("unknown");
+  });
+
+  it("forces checks of the eventual assistant reply out of the release gate", () => {
+    const [test] = comprehensiveAcceptanceTests([
+      {
+        id: "reply",
+        title: "User receives the location",
+        criterionIds: ["functional"],
+        category: "functional",
+        scope: "global",
+        verificationPhase: "release-gate",
+        procedure: "Review the agent's final response to the user",
+        expectedOutcome: "The final response mentions index.html",
+      },
+    ], contract);
+
+    expect(test.verificationPhase).toBe("post-release");
+    expect(requiresPostReleaseVerification(test)).toBe(true);
+  });
+
+  it("classifies uncovered user-communication criteria as post-release", () => {
+    const responseContract: ExecutionContract = {
+      ...contract,
+      criteria: [
+        {
+          id: "reply",
+          kind: "functional",
+          description: "Tell the user how to open the game",
+          verification: "visible-test",
+        },
+      ],
+    };
+
+    const tests = comprehensiveAcceptanceTests([], responseContract);
+    const reply = tests.find((test) => test.criterionIds.includes("reply"));
+
+    expect(reply).toMatchObject({ verificationPhase: "post-release" });
+    expect(reply?.procedure).toContain("only after verified publication");
   });
 });

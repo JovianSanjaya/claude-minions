@@ -217,6 +217,12 @@ describe("engine primitives", () => {
     ], new Set());
     const records = await service.run("o1", null, root, ["protected", "manual"], sink, new AbortController().signal);
     expect(requiredVerificationPassed(records)).toBe(true);
+    expect(requiredVerificationPassed([{
+      id: "regression-not-applicable", orchestrationId: "o1", taskId: null,
+      scope: "global", commandOrCheck: "Existing regression suite",
+      status: "skipped", outputSummary: "No starting regression suite",
+      startedAt: "now", completedAt: "now",
+    }])).toBe(true);
     expect(JSON.stringify(records)).not.toContain(path.join(root, "protected"));
     const packet = createFailurePacket({ taskId: "t1", contractVersion: 1, attemptCount: 2, error: "token budget exhausted", verifications: [], changes: { changedFiles: [], deletedFiles: [], hashes: {} }, relevantInterfaces: [], diagnosis: "budget", usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 } });
     expect(classifyFailure(packet)).toBe("budget-exhaustion");
@@ -243,7 +249,7 @@ describe("engine primitives", () => {
     await expect(integrator.publish(candidate, main)).rejects.toThrow("workspace changed");
   });
 
-  it("refuses to publish an empty integration candidate", async () => {
+  it("publishes an empty integration candidate as a no-op", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "engine-empty-integrate-"));
     temporary.push(root);
     const main = path.join(root, "main");
@@ -251,7 +257,8 @@ describe("engine primitives", () => {
     await writeFile(path.join(main, "README.md"), "base\n");
     const integrator = new DeterministicIntegrator(path.join(root, "temp"));
     const candidate = await integrator.integrate("empty", main, []);
-    await expect(integrator.publish(candidate, main)).rejects.toThrow("no workspace changes");
+    await expect(integrator.publish(candidate, main)).resolves.toEqual([]);
+    expect(await readFile(path.join(main, "README.md"), "utf8")).toBe("base\n");
   });
 
   it("gives the integrator only focused conflicting file variants", async () => {

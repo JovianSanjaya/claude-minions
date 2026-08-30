@@ -76,6 +76,46 @@ export interface CreateOrchestrationInput {
   budget?: Partial<BudgetPolicy>;
 }
 
+function clarificationPrompt(value: string): string {
+  try {
+    const parsed = JSON.parse(value) as { prompt?: unknown };
+    return typeof parsed.prompt === "string" ? parsed.prompt : value;
+  } catch {
+    return value;
+  }
+}
+
+function clarificationReconciliationPrompt(
+  originalPrompt: string,
+  draft: IntentDraft,
+  answers: readonly string[],
+): string {
+  const resolutions = draft.materialQuestions.map((question, index) => ({
+    question: clarificationPrompt(question),
+    resolution: answers[index] ?? "",
+  }));
+  const currentIntent = {
+    goal: draft.goal,
+    requirements: draft.requirements,
+    assumptions: draft.assumptions,
+    nonGoals: draft.nonGoals,
+    architectureDecisions: draft.architectureDecisions,
+    manualExpectations: draft.manualExpectations,
+  };
+  return [
+    "Clarification reconciliation pass. Every material question has been answered by the user.",
+    "Produce one complete replacement intent; do not merely append the answers to the old draft.",
+    "Treat the original request and the clarification resolutions as authoritative.",
+    "Update the goal, requirements, assumptions, non-goals, architecture decisions, and manual expectations wherever a resolution has consequences.",
+    "Remove stale or conditional statements that the resolutions have decided, including an old non-goal for behavior the user chose to include.",
+    "The returned sections must be mutually consistent: requirements must not conflict with non-goals, assumptions must not conflict with requirements or non-goals, and architecture decisions and manual expectations must describe the same resolved scope.",
+    "Preserve unaffected decisions, but do not retain duplicate or contradictory statements. Return no material questions because all listed questions are resolved.",
+    `Original user request: ${originalPrompt}`,
+    `Current intent draft: ${JSON.stringify(currentIntent)}`,
+    `Authoritative clarification resolutions: ${JSON.stringify(resolutions)}`,
+  ].join("\n");
+}
+
 export class OrchestrationSemanticError extends Error {
   readonly statusCode = 422;
 
@@ -114,8 +154,8 @@ export class BudgetExhaustedError extends Error {
 }
 
 const DEFAULT_BUDGET: BudgetPolicy = {
-  maxInputTokens: 1_000_000,
-  maxOutputTokens: 250_000,
+  maxInputTokens: null,
+  maxOutputTokens: null,
   maxEstimatedUsd: null,
   maxModelCalls: 100,
   maxSteps: 250,
@@ -375,30 +415,73 @@ export class OrchestrationControlService implements OrchestrationSink {
   async confirm(
     orchestrationId: string,
     criteria?: ContractCriterion[],
+    answers: string[] = [],
   ): Promise<ExecutionContract> {
     const model = this.getOrchestration(orchestrationId);
     const agent = await this.requireRunnableAgent(model.orchestration.agentId);
     const draft = model.activeDraft;
     if (!draft) throw new OrchestrationSemanticError("There is no intent draft to confirm");
-    if (draft.materialQuestions.length > 0) {
+    const clarificationAnswers = answers.map((answer) => answer.trim()).filter(Boolean);
+    if (clarificationAnswers.length < draft.materialQuestions.length) {
       throw new OrchestrationSemanticError(
-        "Resolve all material questions through an intent revision before confirmation",
+        `Answer all ${draft.materialQuestions.length} material questions before confirmation`,
       );
     }
-    if (model.orchestration.estimate) {
+    let confirmedDraft = draft;
+    let confirmedEstimate = model.orchestration.estimate;
+    if (draft.materialQuestions.length) {
+      const reconciled = await this.driver.elaborateIntent(
+        {
+          orchestrationId,
+          agentId: model.orchestration.agentId,
+          prompt: redactString(
+            clarificationReconciliationPrompt(
+              model.orchestration.prompt,
+              draft,
+              clarificationAnswers,
+            ),
+            50_000,
+          ),
+          requestedMode: model.orchestration.requestedMode,
+          budget: model.orchestration.budget,
+          workspacePath: agent.workspacePath,
+        },
+        this,
+        new AbortController().signal,
+      );
+      if (reconciled.draft.materialQuestions.length) {
+        throw new OrchestrationSemanticError(
+          "The planner found new unresolved questions while reconciling the clarification answers",
+        );
+      }
+      confirmedDraft = {
+        ...redactClone(reconciled.draft),
+        id: this.newId(),
+        orchestrationId,
+        revision: model.intentHistory.length + 1,
+        materialQuestions: [],
+        createdAt: this.now().toISOString(),
+      };
+      confirmedEstimate = redactClone(reconciled.estimate);
+    }
+    if (confirmedEstimate) {
       const budgetConflict = estimateExceedsBudget(
-        model.orchestration.estimate,
+        confirmedEstimate,
         model.orchestration.budget,
       );
       if (budgetConflict) throw new OrchestrationSemanticError(budgetConflict);
     }
-    const contractCriteria = criteria?.length ? criteria : this.deriveCriteria(draft);
+    // Criteria supplied before a clarification are stale by definition. Derive
+    // every clarified criterion from the same reconciled intent shown in Details.
+    const contractCriteria = criteria?.length && !draft.materialQuestions.length
+      ? criteria
+      : this.deriveCriteria(confirmedDraft);
     this.validateCriteria(contractCriteria);
     const contract: ExecutionContract = {
       id: this.newId(),
       orchestrationId,
       version: model.contractHistory.length + 1,
-      intent: structuredClone(draft),
+      intent: structuredClone(confirmedDraft),
       criteria: redactClone(contractCriteria),
       confirmedBy: "user",
       confirmedAt: this.now().toISOString(),
@@ -409,6 +492,23 @@ export class OrchestrationControlService implements OrchestrationSink {
       assertTransition(orchestration.status, "planning");
       if (database.contracts.some((entry) => entry.id === contract.id)) {
         throw new OrchestrationConflictError("Contract ID already exists");
+      }
+      if (confirmedDraft.id !== draft.id) {
+        database.intentDrafts.push(redactClone(confirmedDraft));
+        orchestration.currentIntentDraftId = confirmedDraft.id;
+        orchestration.estimate = confirmedEstimate;
+        database.events.push(
+          this.makeEvent(
+            orchestrationId,
+            "clarifications-resolved",
+            `Planner reconciled ${draft.materialQuestions.length} user clarification${draft.materialQuestions.length === 1 ? "" : "s"} across the complete intent`,
+            {
+              answerCount: draft.materialQuestions.length,
+              intentRevision: confirmedDraft.revision,
+              criteriaRegenerated: true,
+            },
+          ),
+        );
       }
       database.contracts.push(contract);
       orchestration.activeContractId = contract.id;

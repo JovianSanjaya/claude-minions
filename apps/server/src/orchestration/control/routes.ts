@@ -64,7 +64,10 @@ const criterionSchema = z
   })
   .strict();
 const confirmBody = z
-  .object({ criteria: z.array(criterionSchema).min(1).max(250).optional() })
+  .object({
+    criteria: z.array(criterionSchema).min(1).max(250).optional(),
+    answers: z.array(z.string().trim().min(1).max(4_000)).max(50).optional(),
+  })
   .strict();
 
 export function registerOrchestrationRoutes(
@@ -113,6 +116,7 @@ export function registerOrchestrationRoutes(
     const contract = await service.confirm(
       orchestrationId,
       body.criteria as ContractCriterion[] | undefined,
+      body.answers,
     );
     return reply.code(202).send({ contract });
   });

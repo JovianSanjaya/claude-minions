@@ -104,9 +104,7 @@ export class DeterministicIntegrator {
   async publish(candidate: IntegrationCandidate, mainWorkspace: string): Promise<string[]> {
     const current = await workspaceManifest(mainWorkspace);
     const touched = [...candidate.changes.changedFiles, ...candidate.changes.deletedFiles];
-    if (!touched.length) {
-      throw new Error("Refusing to publish an integration candidate with no workspace changes");
-    }
+    if (!touched.length) return [];
     const drift = touched.filter((file) => current.files[file] !== candidate.base.files[file]);
     if (drift.length) {
       throw new Error(`Agent workspace changed during orchestration: ${drift.join(", ")}`);

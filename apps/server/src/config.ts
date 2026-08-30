@@ -80,7 +80,7 @@ const envSchema = z.object({
   ARK_BASE_URL: z
     .string()
     .url()
-    .default("https://ark.cn-beijing.volces.com/api/v3"),
+    .default("https://ark.ap-southeast.bytepluses.com/api/v3"),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 });
 
@@ -154,8 +154,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       env.ORCHESTRATION_PROTECTED_EVALUATOR_ROOT?.trim() || path.join(dataDirectory, "protected-evaluators"),
     ),
     orchestrationDefaultBudget: {
-      maxInputTokens: env.ORCHESTRATION_MAX_INPUT_TOKENS ?? 1_000_000,
-      maxOutputTokens: env.ORCHESTRATION_MAX_OUTPUT_TOKENS ?? 250_000,
+      maxInputTokens: env.ORCHESTRATION_MAX_INPUT_TOKENS ?? null,
+      maxOutputTokens: env.ORCHESTRATION_MAX_OUTPUT_TOKENS ?? null,
       maxEstimatedUsd: env.ORCHESTRATION_MAX_ESTIMATED_USD ?? null,
       maxModelCalls: env.ORCHESTRATION_MAX_MODEL_CALLS ?? 100,
       maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 250,

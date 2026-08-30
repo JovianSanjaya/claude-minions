@@ -86,7 +86,13 @@ export const orchestrationApi: OrchestrationApi = {
   create: (agentId, input) => request(`/api/agents/${agentId}/orchestrations`, { method: "POST", body: JSON.stringify(input) }),
   get: (id) => request(`/api/orchestrations/${id}`),
   reviseIntent: (id, revision) => request(`/api/orchestrations/${id}/intent`, { method: "PATCH", body: JSON.stringify({ revision }) }),
-  confirm: (id, criteria) => request(`/api/orchestrations/${id}/confirm`, { method: "POST", body: JSON.stringify(criteria ? { criteria } : {}) }),
+  confirm: (id, criteria, answers) => request(`/api/orchestrations/${id}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(criteria ? { criteria } : {}),
+      ...(answers?.length ? { answers } : {}),
+    }),
+  }),
   start: (id) => request(`/api/orchestrations/${id}/start`, { method: "POST" }),
   cancel: (id) => request(`/api/orchestrations/${id}/cancel`, { method: "POST" }),
   confirmAmendment: (id, amendmentId) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/confirm`, { method: "POST" }),

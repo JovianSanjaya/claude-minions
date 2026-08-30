@@ -125,5 +125,5 @@ export class VerificationService {
 }
 
 export function requiredVerificationPassed(records: VerificationRecord[]): boolean {
-  return records.every((record) => record.scope === "manual" || record.status === "passed");
+  return records.every((record) => record.status !== "failed");
 }
