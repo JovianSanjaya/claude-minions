@@ -725,7 +725,11 @@ export class OrchestrationControlService implements OrchestrationSink {
           entry.id !== artifact.id,
       );
       if (conflicting) throw new OrchestrationConflictError("Artifact version already exists");
-      upsertById(database.artifacts, redactClone(artifact));
+      const existing = database.artifacts.findIndex(
+        (entry) => entry.id === artifact.id && entry.version === artifact.version,
+      );
+      if (existing < 0) database.artifacts.push(redactClone(artifact));
+      else database.artifacts[existing] = redactClone(artifact);
     });
   }
 

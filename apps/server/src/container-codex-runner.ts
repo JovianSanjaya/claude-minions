@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
+import { writeCodexConfig } from "./config.js";
 import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
 import { RunCancelledError } from "./errors.js";
 import type {
@@ -29,17 +30,17 @@ interface ParsedEvents {
   errors: string[];
 }
 
-export function containerName(agentId: string, instanceId = "default"): string {
+export function containerName(executionId: string, instanceId = "default"): string {
   const safeInstance = instanceId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 32);
-  const safeAgent = agentId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
-  return "launchpad-" + safeInstance + "-" + safeAgent;
+  const safeExecution = executionId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
+  return "launchpad-" + safeInstance + "-" + safeExecution;
 }
 
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
 ): string[] {
-  const name = containerName(request.agentId, config.runtimeInstanceId);
+  const name = containerName(request.executionId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
   return [
     "run",
@@ -51,6 +52,12 @@ export function buildContainerRunArgs(
     "io.codejam.launchpad=agent-runtime",
     "--label",
     "io.codejam.agent-id=" + request.agentId,
+    "--label",
+    "io.codejam.execution-id=" + request.executionId,
+    ...(request.orchestrationId
+      ? ["--label", "io.codejam.orchestration-id=" + request.orchestrationId]
+      : []),
+    ...(request.taskId ? ["--label", "io.codejam.task-id=" + request.taskId] : []),
     "--label",
     "io.codejam.instance-id=" + config.runtimeInstanceId,
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
@@ -77,14 +84,20 @@ export function buildContainerRunArgs(
     "--env",
     "NO_COLOR=1",
     "--mount",
-    "type=bind,src=" + request.workspacePath + ",dst=/workspace",
+    "type=bind,src=" + request.workspacePath + ",dst=/workspace" +
+      (request.sandboxMode === "read-only" ? ",readonly" : ""),
     "--mount",
-    "type=bind,src=" + config.codexHome + ",dst=/codex-home",
+    "type=bind,src=" + (request.runtimeHomePath ?? config.codexHome) + ",dst=/codex-home",
     "--workdir",
     "/workspace",
     config.containerRuntimeImage,
     "codex",
-    ...buildCodexArgs(request, config.codexSandboxMode, "/workspace"),
+    ...buildCodexArgs(
+      request,
+      request.sandboxMode ?? config.codexSandboxMode,
+      "/workspace",
+      config.codexModelOverrideSupported,
+    ),
   ];
 }
 
@@ -110,8 +123,8 @@ export class ContainerCodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
+  async cancel(executionId: string): Promise<boolean> {
+    const active = this.active.get(executionId);
     if (!active) return false;
 
     active.cancelled = true;
@@ -138,8 +151,12 @@ export class ContainerCodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
-      throw new Error("Agent already has an active Runtime container");
+    if (this.active.has(request.executionId)) {
+      throw new Error("Execution already has an active Runtime container");
+    }
+
+    if (request.runtimeHomePath) {
+      await writeCodexConfig(this.config, request.runtimeHomePath);
     }
 
     const child = spawn(
@@ -157,14 +174,14 @@ export class ContainerCodexRunner implements AgentRunner {
     });
     const active: ActiveContainer = {
       child,
-      containerName: containerName(request.agentId, this.config.runtimeInstanceId),
+      containerName: containerName(request.executionId, this.config.runtimeInstanceId),
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
       settled,
       termination: null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(request.executionId, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -228,10 +245,22 @@ export class ContainerCodexRunner implements AgentRunner {
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) throw new Error("Codex completed without an agent message");
-      return { output, threadId: parsed.threadId, usage: parsed.usage };
+      return {
+        output,
+        threadId: parsed.threadId,
+        usage: parsed.usage,
+        modelId:
+          request.modelId && this.config.codexModelOverrideSupported
+            ? request.modelId
+            : this.config.arkModel,
+        modelFallback:
+          Boolean(request.modelId) &&
+          !this.config.codexModelOverrideSupported &&
+          request.modelId !== this.config.arkModel,
+      };
     } finally {
       clearTimeout(timeout);
-      this.active.delete(request.agentId);
+      this.active.delete(request.executionId);
     }
   }
 

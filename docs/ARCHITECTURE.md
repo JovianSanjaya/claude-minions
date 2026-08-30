@@ -4,15 +4,21 @@ Volc Agent Launchpad is a single-node control plane for hackathon use.
 
 ```mermaid
 flowchart LR
-    UI["React Web UI"] --> API["Fastify API"]
-    API --> Service["AgentService"]
-    Service --> Store["JSON store"]
-    Service --> Workspace["Agent workspace"]
-    Service --> Runner{"AgentRunner"}
-    Runner -->|Local POC| Container["Disposable Runtime container"]
-    Runner -->|ECS| Process["Codex child process"]
-    Container --> Ark["Volcengine Ark"]
-    Process --> Ark
+    UI["React: Direct / Auto / Orchestrated"] --> API["Fastify + auth"]
+    API --> Control["Contract, state, budget, cancel/recovery"]
+    Control <--> Store["Atomic contract/event store"]
+    Control --> Router["Adaptive router"]
+    Router --> Broker["Application map + context broker"]
+    Broker --> Roles["Planner / worker / verifier / integrator"]
+    Roles --> Runner["AgentRunner"] --> Ark["Volcengine ModelArk"]
+    Roles --> Workers["Isolated worker workspaces"]
+    Workers --> Integrate["Deterministic-first integration"]
+    Integrate --> Verify["Protected/global verification"]
+    Verify --> Publish["Verified Agent workspace publish"]
+    Trust["Protected evaluator trust boundary"] -. server-only .-> Verify
+    Control -. enforces .-> Router
+    Control -. enforces .-> Roles
+    Control -. enforces .-> Integrate
 ```
 
 ## Components
@@ -20,7 +26,21 @@ flowchart LR
 ### Web UI
 
 Lists Agents, manages lifecycle actions, submits prompts, and polls asynchronous
-Runs. It never receives the Ark API key.
+Runs and orchestrations. It renders only persisted, redacted read models and never
+receives the Ark key, protected evaluator source, unrestricted environment data,
+or worker reasoning transcripts.
+
+### Orchestration control plane
+
+Persists immutable intent/contract versions, explicit confirmation, task state,
+events, usage reservations, hard budgets, cancellation, and restart reconciliation.
+The execution engine maps the repository, selects a route, gives each worker the
+minimum relevant context, performs a read-only preflight, and uses task-specific
+workspace copies. Shared coordination happens through versioned artifacts.
+
+Protected and global checks run outside worker authority. Integration is
+deterministic for non-overlapping edits; a focused integrator handles remaining
+conflicts. The main Agent workspace is updated only after required verification.
 
 ### Fastify API
 

@@ -5,7 +5,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { JsonStore } from "./store.js";
-import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
+import type {
+  AgentExecutionCoordinator,
+  AgentRunner,
+  RunnerRequest,
+  RunnerResult,
+} from "./types.js";
+import { RunCancelledError } from "./errors.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -35,7 +41,10 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeService(
+  runner: AgentRunner = new FakeRunner(),
+  coordinator?: AgentExecutionCoordinator,
+): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -51,6 +60,7 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     new JsonStore(path.join(root, "data", "db.json")),
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
+    coordinator,
   );
   await service.initialize();
   return service;
@@ -129,5 +139,57 @@ describe("Agent lifecycle", () => {
 
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("uses the Run ID as the exact direct execution and cancellation key", async () => {
+    let rejectRun!: (error: Error) => void;
+    let seenExecutionId = "";
+    let cancelledExecutionId = "";
+    const runner: AgentRunner = {
+      run: (request) => {
+        seenExecutionId = request.executionId;
+        return new Promise<RunnerResult>((_resolve, reject) => {
+          rejectRun = reject;
+        });
+      },
+      cancel: async (executionId) => {
+        cancelledExecutionId = executionId;
+        rejectRun(new RunCancelledError());
+        return true;
+      },
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Exact cancellation" });
+    const { run } = await service.sendMessage(agent.id, "long task");
+    await expect.poll(() => seenExecutionId).toBe(run.id);
+    await service.stopAgent(agent.id);
+    expect(cancelledExecutionId).toBe(run.id);
+    expect(service.getRun(run.id).status).toBe("cancelled");
+  });
+
+  it("coordinates direct admission and Agent stop/delete with orchestration", async () => {
+    const calls: string[] = [];
+    let deny = true;
+    const coordinator: AgentExecutionCoordinator = {
+      assertAgentAvailableForDirect: async (agentId) => {
+        calls.push(`assert:${agentId}`);
+        if (deny) throw Object.assign(new Error("orchestration active"), { statusCode: 409 });
+      },
+      hasActiveOrchestration: () => deny,
+      cancelForAgent: async (agentId) => {
+        calls.push(`cancel:${agentId}`);
+        deny = false;
+        return true;
+      },
+    };
+    const service = await makeService(new FakeRunner(), coordinator);
+    const first = await service.createAgent({ name: "Coordinated" });
+    await expect(service.sendMessage(first.id, "blocked")).rejects.toMatchObject({ statusCode: 409 });
+    await service.stopAgent(first.id);
+    expect(calls).toContain(`cancel:${first.id}`);
+    const second = await service.createAgent({ name: "Delete coordinated" });
+    await service.deleteAgent(second.id);
+    expect(calls).toContain(`cancel:${second.id}`);
   });
 });

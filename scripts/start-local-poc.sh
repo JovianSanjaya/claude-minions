@@ -15,6 +15,15 @@ log() {
   printf '[local-poc] %s\n' "$*" >&2
 }
 
+absolute_repo_path() {
+  local value="$1"
+  if [[ "$value" == /* ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s/%s' "$repo_dir" "$value"
+  fi
+}
+
 engine_works() {
   "$1" info >/dev/null 2>&1
 }
@@ -104,10 +113,16 @@ else
   export AGENT_WORKSPACE_ROOT="${AGENT_WORKSPACE_ROOT:-$local_state_root/workspaces}"
   export CODEX_HOME="${CODEX_HOME:-$local_state_root/codex-home}"
 fi
+
+# Docker/Podman bind sources must be absolute. Environment files commonly use
+# repository-relative paths, so normalize them before any mount validation.
+export APP_DATA_DIR="$(absolute_repo_path "$APP_DATA_DIR")"
+export AGENT_WORKSPACE_ROOT="$(absolute_repo_path "$AGENT_WORKSPACE_ROOT")"
+export CODEX_HOME="$(absolute_repo_path "$CODEX_HOME")"
 export RUNTIME_INSTANCE_ID="${RUNTIME_INSTANCE_ID:-local-$(id -u)-$(printf '%s' "$repo_dir" | cksum | awk '{print $1}')}"
 
 mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME"
-log "Persistent state: $local_state_root"
+log "Persistent state: data=$APP_DATA_DIR workspaces=$AGENT_WORKSPACE_ROOT codex-home=$CODEX_HOME"
 export CONTAINER_USER="${CONTAINER_USER:-$(id -u):$(id -g)}"
 
 log "Building $runtime_image from Dockerfile.runtime (base: $runtime_base_image)."

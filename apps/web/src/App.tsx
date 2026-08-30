@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken } from "./api";
+import { api, ApiError, orchestrationApi, setAuthToken } from "./api";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import { OrchestrationPanel } from "./orchestration/OrchestrationPanel";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -220,14 +221,11 @@ export default function App() {
     }
   };
 
-  const sendMessage = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!selected || !prompt.trim()) return;
-    const content = prompt.trim();
-    setPrompt("");
+  const sendDirectPrompt = async (content: string) => {
+    if (!selected || !content.trim()) return;
     setError(null);
     try {
-      const result = await api.sendMessage(selected.id, content);
+      const result = await api.sendMessage(selected.id, content.trim());
       if (selectedIdRef.current === selected.id) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
@@ -243,6 +241,14 @@ export default function App() {
       setActiveRun(null);
       await refreshAgents();
     }
+  };
+
+  const sendMessage = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!prompt.trim()) return;
+    const content = prompt.trim();
+    setPrompt("");
+    await sendDirectPrompt(content);
   };
 
   const unlock = async (event: React.FormEvent) => {
@@ -476,6 +482,14 @@ export default function App() {
                 </div>
               </form>
             )}
+
+            <OrchestrationPanel
+              agentId={selected.id}
+              agentStatus={selected.status}
+              api={orchestrationApi}
+              onDirectSend={sendDirectPrompt}
+              onTerminal={refreshAgents}
+            />
 
             <section className="playground">
               <div className="playground-topbar">

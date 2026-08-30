@@ -7,6 +7,7 @@ import type {
   Agent,
   AgentRun,
   AgentRunner,
+  AgentExecutionCoordinator,
   CreateAgentInput,
   Message,
   UpdateAgentInput,
@@ -16,7 +17,10 @@ import { WorkspaceManager } from "./workspace.js";
 const now = () => new Date().toISOString();
 
 export class AgentService {
-  private readonly activeExecutions = new Map<string, Promise<void>>();
+  private readonly activeExecutions = new Map<
+    string,
+    { executionId: string; promise: Promise<void> }
+  >();
   private readonly cancellationRequests = new Set<string>();
 
   constructor(
@@ -24,6 +28,11 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly coordinator: AgentExecutionCoordinator = {
+      assertAgentAvailableForDirect: async () => undefined,
+      hasActiveOrchestration: () => false,
+      cancelForAgent: async () => false,
+    },
   ) {}
 
   async initialize(): Promise<void> {
@@ -106,6 +115,7 @@ export class AgentService {
 
   async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
+    await this.coordinator.cancelForAgent(id);
     await this.cancelExecution(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
@@ -122,6 +132,7 @@ export class AgentService {
 
   async stopAgent(id: string): Promise<Agent> {
     this.getAgent(id);
+    await this.coordinator.cancelForAgent(id);
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
   }
@@ -160,6 +171,7 @@ export class AgentService {
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
+    await this.coordinator.assertAgentAvailableForDirect(agentId);
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
@@ -202,10 +214,10 @@ export class AgentService {
       return snapshot;
     });
     const execution = this.executeRun(agentAtStart, run);
-    this.activeExecutions.set(agentId, execution);
+    this.activeExecutions.set(agentId, { executionId: run.id, promise: execution });
     void execution
       .finally(() => {
-        if (this.activeExecutions.get(agentId) === execution) {
+        if (this.activeExecutions.get(agentId)?.promise === execution) {
           this.activeExecutions.delete(agentId);
         }
       })
@@ -245,6 +257,7 @@ export class AgentService {
         throw new RunCancelledError();
       }
       const result = await this.runner.run({
+        executionId: run.id,
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
@@ -314,10 +327,18 @@ export class AgentService {
   private async cancelExecution(agentId: string): Promise<void> {
     this.cancellationRequests.add(agentId);
     try {
-      await this.runner.cancel(agentId);
       const execution = this.activeExecutions.get(agentId);
+      const activeRun = this.store
+        .snapshot()
+        .runs.find(
+          (run) =>
+            run.agentId === agentId &&
+            (run.status === "queued" || run.status === "running"),
+        );
+      const executionId = execution?.executionId ?? activeRun?.id;
+      if (executionId) await this.runner.cancel(executionId);
       if (execution) {
-        await execution;
+        await execution.promise;
       }
     } finally {
       this.cancellationRequests.delete(agentId);

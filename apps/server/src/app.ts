@@ -7,6 +7,15 @@ import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
+import type { OrchestrationControlService } from "./orchestration/control/service.js";
+import { registerOrchestrationRoutes } from "./orchestration/control/routes.js";
+import type { BenchmarkService } from "./orchestration/benchmark/service.js";
+import { registerBenchmarkRoutes } from "./orchestration/benchmark/routes.js";
+
+export interface AppExtensions {
+  orchestration?: OrchestrationControlService;
+  benchmark?: BenchmarkService;
+}
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
@@ -26,6 +35,7 @@ const messageBody = z.object({
 export async function createApp(
   config: AppConfig,
   service: AgentService,
+  extensions: AppExtensions = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -127,6 +137,9 @@ export async function createApp(
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
   });
+
+  if (extensions.orchestration) registerOrchestrationRoutes(app, extensions.orchestration);
+  if (extensions.benchmark) registerBenchmarkRoutes(app, extensions.benchmark);
 
   if (config.nodeEnv === "production") {
     const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));

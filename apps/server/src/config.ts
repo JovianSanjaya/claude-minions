@@ -2,6 +2,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
+const optionalNonNegativeNumber = z.preprocess(
+  (value) => value === "" ? undefined : value,
+  z.coerce.number().finite().nonnegative().optional(),
+);
+
 const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -10,6 +15,10 @@ const envSchema = z.object({
   AGENT_WORKSPACE_ROOT: z.string().default(path.resolve("workspaces")),
   CODEX_HOME: z.string().default(path.resolve("codex-home")),
   CODEX_BIN: z.string().default("codex"),
+  CODEX_MODEL_OVERRIDE_SUPPORTED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   CODEX_SANDBOX_MODE: z
     .enum(["read-only", "workspace-write", "danger-full-access"])
     .default("workspace-write"),
@@ -40,6 +49,26 @@ const envSchema = z.object({
     .optional(),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
+  ORCHESTRATION_PLANNER_MODEL: z.string().optional(),
+  ORCHESTRATION_WORKER_MODEL: z.string().optional(),
+  ORCHESTRATION_VERIFIER_MODEL: z.string().optional(),
+  ORCHESTRATION_INTEGRATOR_MODEL: z.string().optional(),
+  ORCHESTRATION_RUNTIME_HOME_ROOT: z.string().optional(),
+  ORCHESTRATION_TEMP_ROOT: z.string().optional(),
+  ORCHESTRATION_ARCHIVE_ROOT: z.string().optional(),
+  ORCHESTRATION_PROTECTED_EVALUATOR_ROOT: z.string().optional(),
+  ORCHESTRATION_MAX_INPUT_TOKENS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_OUTPUT_TOKENS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_ESTIMATED_USD: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_MODEL_CALLS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_STEPS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_WORKER_ATTEMPTS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_CONTEXT_EXPANSIONS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_WALL_CLOCK_MS: optionalNonNegativeNumber,
+  ARK_INPUT_USD_PER_MILLION: optionalNonNegativeNumber,
+  ARK_CACHED_INPUT_USD_PER_MILLION: optionalNonNegativeNumber,
+  ARK_OUTPUT_USD_PER_MILLION: optionalNonNegativeNumber,
+  ORCHESTRATION_DEMO_FIXTURE: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   ARK_BASE_URL: z
     .string()
     .url()
@@ -60,18 +89,24 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       );
     }
   }
+  if (env.NODE_ENV === "production" && env.ORCHESTRATION_DEMO_FIXTURE) {
+    throw new Error("ORCHESTRATION_DEMO_FIXTURE cannot be enabled in production");
+  }
   const defaultContainerUser =
     typeof process.getuid === "function" && typeof process.getgid === "function"
       ? process.getuid() + ":" + process.getgid()
       : "1000:1000";
+  const dataDirectory = path.resolve(env.APP_DATA_DIR);
+  const arkModel = env.ARK_MODEL?.trim() ?? "";
   return {
     host: env.HOST,
     port: env.PORT,
     logLevel: env.LOG_LEVEL,
-    dataDirectory: path.resolve(env.APP_DATA_DIR),
+    dataDirectory,
     workspaceRoot: path.resolve(env.AGENT_WORKSPACE_ROOT),
     codexHome: path.resolve(env.CODEX_HOME),
     codexBin: env.CODEX_BIN,
+    codexModelOverrideSupported: env.CODEX_MODEL_OVERRIDE_SUPPORTED,
     codexSandboxMode: env.CODEX_SANDBOX_MODE,
     codexTimeoutMs: env.CODEX_TIMEOUT_MS,
     codexMaxOutputBytes: env.CODEX_MAX_OUTPUT_BYTES,
@@ -85,7 +120,39 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
-    arkModel: env.ARK_MODEL?.trim() ?? "",
+    arkModel,
+    orchestrationModels: {
+      planner: env.ORCHESTRATION_PLANNER_MODEL?.trim() || arkModel,
+      worker: env.ORCHESTRATION_WORKER_MODEL?.trim() || arkModel,
+      verifier: env.ORCHESTRATION_VERIFIER_MODEL?.trim() || arkModel,
+      integrator: env.ORCHESTRATION_INTEGRATOR_MODEL?.trim() || arkModel,
+    },
+    orchestrationRuntimeHomeRoot: path.resolve(
+      env.ORCHESTRATION_RUNTIME_HOME_ROOT?.trim() || path.join(dataDirectory, "orchestration-runtime-homes"),
+    ),
+    orchestrationTempRoot: path.resolve(
+      env.ORCHESTRATION_TEMP_ROOT?.trim() || path.join(dataDirectory, "orchestration-work"),
+    ),
+    orchestrationArchiveRoot: path.resolve(
+      env.ORCHESTRATION_ARCHIVE_ROOT?.trim() || path.join(dataDirectory, "orchestration-archive"),
+    ),
+    orchestrationProtectedEvaluatorRoot: path.resolve(
+      env.ORCHESTRATION_PROTECTED_EVALUATOR_ROOT?.trim() || path.join(dataDirectory, "protected-evaluators"),
+    ),
+    orchestrationDefaultBudget: {
+      maxInputTokens: env.ORCHESTRATION_MAX_INPUT_TOKENS ?? 1_000_000,
+      maxOutputTokens: env.ORCHESTRATION_MAX_OUTPUT_TOKENS ?? 250_000,
+      maxEstimatedUsd: env.ORCHESTRATION_MAX_ESTIMATED_USD ?? null,
+      maxModelCalls: env.ORCHESTRATION_MAX_MODEL_CALLS ?? 100,
+      maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 250,
+      maxWorkerAttempts: env.ORCHESTRATION_MAX_WORKER_ATTEMPTS ?? 3,
+      maxContextExpansionsPerTask: env.ORCHESTRATION_MAX_CONTEXT_EXPANSIONS ?? 3,
+      maxWallClockMs: env.ORCHESTRATION_MAX_WALL_CLOCK_MS ?? 1_800_000,
+    },
+    orchestrationPricing: env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined
+      ? (["planner", "worker", "verifier", "integrator"] as const).map((role) => ({ role, modelId: ({ planner: env.ORCHESTRATION_PLANNER_MODEL?.trim() || arkModel, worker: env.ORCHESTRATION_WORKER_MODEL?.trim() || arkModel, verifier: env.ORCHESTRATION_VERIFIER_MODEL?.trim() || arkModel, integrator: env.ORCHESTRATION_INTEGRATOR_MODEL?.trim() || arkModel })[role], inputUsdPerMillion: env.ARK_INPUT_USD_PER_MILLION!, cachedInputUsdPerMillion: env.ARK_CACHED_INPUT_USD_PER_MILLION!, outputUsdPerMillion: env.ARK_OUTPUT_USD_PER_MILLION! }))
+      : [],
+    orchestrationDemoFixture: env.ORCHESTRATION_DEMO_FIXTURE,
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
     nodeEnv: env.NODE_ENV,
   };
@@ -100,8 +167,11 @@ export function isArkConfigured(config: AppConfig): boolean {
   );
 }
 
-export async function writeCodexConfig(config: AppConfig): Promise<void> {
-  await mkdir(config.codexHome, { recursive: true });
+export async function writeCodexConfig(
+  config: AppConfig,
+  targetHome: string = config.codexHome,
+): Promise<void> {
+  await mkdir(targetHome, { recursive: true, mode: 0o700 });
   const toml = [
     "# Generated by Volc Agent Launchpad. Edit environment variables, not this file.",
     "model = " + JSON.stringify(config.arkModel || "ep-not-configured"),
@@ -115,7 +185,7 @@ export async function writeCodexConfig(config: AppConfig): Promise<void> {
     "requires_openai_auth = false",
     "",
   ].join("\n");
-  await writeFile(path.join(config.codexHome, "config.toml"), toml, {
+  await writeFile(path.join(targetHome, "config.toml"), toml, {
     encoding: "utf8",
     mode: 0o600,
   });
