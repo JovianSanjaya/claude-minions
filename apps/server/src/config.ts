@@ -28,7 +28,7 @@ const envSchema = z.object({
   CODEX_SANDBOX_MODE: z
     .enum(["read-only", "workspace-write", "danger-full-access"])
     .default("workspace-write"),
-  CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
+  CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(1_800_000),
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),

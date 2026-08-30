@@ -843,6 +843,22 @@ export class OrchestrationControlService implements OrchestrationSink {
     });
   }
 
+  private priorAttemptsDigest(agentId: string, excludeOrchestrationId: string): string | undefined {
+    const entries = this.listOrchestrations(agentId)
+      .filter((entry) => entry.id !== excludeOrchestrationId && isTerminalStatus(entry.status))
+      .slice(0, 3);
+    if (entries.length === 0) return undefined;
+    return entries
+      .map((entry) => {
+        const outcome =
+          entry.status === "completed"
+            ? redactString(entry.finalOutput ?? "No output recorded", 400)
+            : redactString(entry.error ?? entry.status, 400);
+        return `- [${entry.status}] prompt: ${redactString(entry.prompt, 300)} -> outcome: ${outcome}`;
+      })
+      .join("\n");
+  }
+
   private async elaborate(
     orchestrationId: string,
     workspacePath: string,
@@ -859,6 +875,7 @@ export class OrchestrationControlService implements OrchestrationSink {
         requestedMode: orchestration.requestedMode,
         budget: orchestration.budget,
         workspacePath,
+        priorAttempts: this.priorAttemptsDigest(orchestration.agentId, orchestrationId),
       },
       this,
       signal,

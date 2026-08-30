@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -373,7 +373,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
   });
 
   it("blocks publication when trusted global verification fails", async () => {
-    const { workspace, driver } = await setup(false, true);
+    const { root, workspace, driver } = await setup(false, true);
     const sink = new Sink();
     const signal = new AbortController().signal;
     const item = orchestration(workspace);
@@ -386,6 +386,10 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
     await expect(readFile(path.join(workspace, "src", "b.ts"))).rejects.toThrow();
     expect(sink.verifications.find((record) => record.scope === "global")?.status).toBe("failed");
+
+    const archived = await readdir(path.join(root, "archive"));
+    expect(archived.some((name) => name.includes("integration-candidate"))).toBe(true);
+    expect(sink.events.some((event) => event.type === "candidate-archived")).toBe(true);
   });
 
   it("blocks publication when the big verifier fails a planner-generated acceptance test", async () => {
@@ -448,5 +452,28 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect.objectContaining({ type: "direct-no-workspace-change" }),
       expect.objectContaining({ type: "verified-publish", metadata: { fileCount: 0, applicationMapVersion: 2 } }),
     ]));
+  });
+
+  it("includes prior-attempt history in the elaboration prompt only when supplied", async () => {
+    const { workspace, driver, calls } = await setup();
+    const sink = new Sink();
+    const signal = new AbortController().signal;
+    const item = orchestration(workspace);
+
+    await driver.elaborateIntent({
+      orchestrationId: item.id, agentId: item.agentId, prompt: item.prompt,
+      requestedMode: item.requestedMode, budget: item.budget, workspacePath: workspace,
+    }, sink, signal);
+    const withoutHistory = calls.at(-1);
+    expect(withoutHistory?.prompt).not.toContain("Prior attempts on this agent");
+
+    await driver.elaborateIntent({
+      orchestrationId: item.id, agentId: item.agentId, prompt: item.prompt,
+      requestedMode: item.requestedMode, budget: item.budget, workspacePath: workspace,
+      priorAttempts: "- [failed] prompt: Add A -> outcome: timed out",
+    }, sink, signal);
+    const withHistory = calls.at(-1);
+    expect(withHistory?.prompt).toContain("Prior attempts on this agent");
+    expect(withHistory?.prompt).toContain("Add A -> outcome: timed out");
   });
 });

@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { WorkspaceChanges, WorkspaceManifest } from "./worker-workspaces.js";
 import { copyWorkspaceTree, diffManifest, workspaceManifest } from "./worker-workspaces.js";
@@ -147,5 +147,22 @@ export class DeterministicIntegrator {
       throw new Error("Refusing unsafe integration cleanup target");
     }
     await rm(target, { recursive: true, force: false });
+  }
+
+  async archive(candidate: IntegrationCandidate, archiveRoot: string): Promise<string> {
+    const root = await realpath(this.tempRoot);
+    const target = await realpath(candidate.path);
+    if (target === root || !target.startsWith(`${root}${path.sep}`)) {
+      throw new Error("Refusing unsafe integration archive target");
+    }
+    await mkdir(archiveRoot, { recursive: true, mode: 0o700 });
+    const archive = await realpath(archiveRoot);
+    const orchestrationSegment = path.basename(path.dirname(target));
+    const destination = path.join(archive, `${orchestrationSegment}-integration-candidate-${Date.now()}`);
+    if (destination === archive || !destination.startsWith(`${archive}${path.sep}`)) {
+      throw new Error("Refusing unsafe integration archive target");
+    }
+    await rename(target, destination);
+    return destination;
   }
 }

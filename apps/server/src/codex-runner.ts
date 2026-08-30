@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
 import { writeCodexConfig } from "./config.js";
-import { RunCancelledError } from "./errors.js";
+import { RunCancelledError, RunFailedError } from "./errors.js";
 import type {
   AgentRunner,
   RunUsage,
@@ -230,21 +230,24 @@ export class CodexRunner implements AgentRunner {
         parseCodexEventLine(streams.stdoutBuffer.trim(), parsed);
       }
       if (active.cancelled) {
-        throw new RunCancelledError();
+        throw new RunCancelledError(parsed.threadId);
       }
       if (active.timedOut) {
-        throw new Error("Codex timed out after " + this.config.codexTimeoutMs + " ms");
+        throw new RunFailedError(
+          "Codex timed out after " + this.config.codexTimeoutMs + " ms",
+          parsed.threadId,
+        );
       }
       if (active.outputExceeded) {
-        throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
+        throw new RunFailedError("Codex output exceeded CODEX_MAX_OUTPUT_BYTES", parsed.threadId);
       }
       if (exitCode !== 0) {
         const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
-        throw new Error("Codex exited with code " + exitCode + ": " + detail);
+        throw new RunFailedError("Codex exited with code " + exitCode + ": " + detail, parsed.threadId);
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) {
-        throw new Error("Codex completed without an agent message");
+        throw new RunFailedError("Codex completed without an agent message", parsed.threadId);
       }
       return {
         output,

@@ -64,4 +64,11 @@ describe("orchestration model configuration", () => {
       integrator: "ep-default",
     });
   });
+
+  it("defaults a single Codex turn's timeout to 30 minutes and allows overriding it", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).codexTimeoutMs).toBe(1_800_000);
+    expect(
+      loadConfig({ NODE_ENV: "test", CODEX_TIMEOUT_MS: "60000" }).codexTimeoutMs,
+    ).toBe(60_000);
+  });
 });

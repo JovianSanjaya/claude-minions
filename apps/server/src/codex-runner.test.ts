@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCodexArgs,
   consumeCodexOutputChunk,
   parseCodexEventLine,
+  CodexRunner,
 } from "./codex-runner.js";
+import { loadConfig } from "./config.js";
+import { RunFailedError } from "./errors.js";
 
 describe("Codex runner protocol", () => {
   it("builds a new-session invocation", () => {
@@ -128,5 +134,48 @@ describe("Codex runner protocol", () => {
     expect(consumeCodexOutputChunk(accumulator, event, "stdout", 256, parsed)).toBe(false);
     expect(parsed.messages).toEqual(["Done."]);
     expect(consumeCodexOutputChunk(accumulator, Buffer.alloc(257), "stdout", 256, parsed)).toBe(true);
+  });
+});
+
+describe("CodexRunner.run", () => {
+  const temporaryDirectories: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    );
+  });
+
+  it("surfaces the thread id Codex reported even when the process exits non-zero", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "codex-runner-test-"));
+    temporaryDirectories.push(root);
+    const fakeCodexBin = path.join(root, "fake-codex");
+    await writeFile(
+      fakeCodexBin,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'thread-xyz' }) + '\\n');",
+        "process.exitCode = 1;",
+      ].join("\n"),
+      "utf8",
+    );
+    await chmod(fakeCodexBin, 0o755);
+
+    const config = loadConfig({
+      NODE_ENV: "test",
+      ARK_API_KEY: "test-key",
+      ARK_MODEL: "ep-test",
+      CODEX_BIN: fakeCodexBin,
+    });
+    const runner = new CodexRunner(config);
+    const run = runner.run({
+      executionId: "exec-thread-surface",
+      agentId: "agent-1",
+      workspacePath: root,
+      prompt: "ignored",
+      threadId: null,
+    });
+    await expect(run).rejects.toBeInstanceOf(RunFailedError);
+    await expect(run).rejects.toMatchObject({ threadId: "thread-xyz" });
   });
 });

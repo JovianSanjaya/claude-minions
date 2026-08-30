@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
-import { HttpError, RunCancelledError } from "./errors.js";
+import { HttpError, RunCancelledError, RunFailedError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
@@ -291,6 +291,10 @@ export class AgentService {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = error instanceof Error ? error.message : String(error);
+      const capturedThreadId =
+        error instanceof RunCancelledError || error instanceof RunFailedError
+          ? error.threadId
+          : null;
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -304,6 +308,7 @@ export class AgentService {
             agent.status = cancelled ? "ready" : "error";
           }
           agent.lastError = cancelled ? null : message;
+          if (capturedThreadId) agent.codexThreadId = capturedThreadId;
           agent.updatedAt = completedAt;
         }
       });

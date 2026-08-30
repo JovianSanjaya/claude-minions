@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentRun, Message } from "../types";
 import type { OrchestrationApi } from "./api-port";
-import type { OrchestrationReadModel, RequestedMode } from "./contracts";
+import type { OrchestrationReadModel, OrchestrationSummary, RequestedMode } from "./contracts";
 import { ClarificationQuestionCard } from "./components/ClarificationQuestionCard";
 import { DetailsPage } from "./components/DetailsPage";
 import { IntegrationResultPage } from "./components/IntegrationResultPage";
@@ -12,6 +12,7 @@ import { pollOrchestration } from "./polling";
 import {
   WORKFLOW_STEPS,
   budgetStopReason,
+  buildChatTimeline,
   elapsedMsFor,
   evidenceCounters,
   isTerminal,
@@ -69,6 +70,8 @@ export function OrchestrationPanel({
   const [prompt, setPrompt] = useState("");
   const [view, setView] = useState<OrchestrationReadModel | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [pastOrchestrations, setPastOrchestrations] = useState<OrchestrationSummary[]>([]);
+  const [historyView, setHistoryView] = useState<OrchestrationReadModel | null>(null);
   const [answers, setAnswers] = useState<string[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -79,9 +82,20 @@ export function OrchestrationPanel({
   const messagesContainer = useRef<HTMLDivElement>(null);
   const followLatest = useRef(true);
 
+  const refreshPastOrchestrations = async (excludeId: string | null) => {
+    try {
+      const { orchestrations } = await api.list(agentId);
+      setPastOrchestrations(orchestrations.filter((item) => item.id !== excludeId));
+    } catch {
+      // Best-effort; the scrollback simply stays stale until the next refresh.
+    }
+  };
+
   useEffect(() => {
     setView(null);
     setActiveId(null);
+    setPastOrchestrations([]);
+    setHistoryView(null);
     setAnswers([]);
     setError(null);
     followLatest.current = true;
@@ -92,6 +106,7 @@ export function OrchestrationPanel({
         const current =
           orchestrations.find((item) => !isTerminal(item.status)) ?? orchestrations[0];
         if (current) setActiveId(current.id);
+        setPastOrchestrations(orchestrations.filter((item) => item.id !== current?.id));
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [agentId, api]);
@@ -103,7 +118,10 @@ export function OrchestrationPanel({
       activeId,
       (next) => {
         setView(next);
-        if (isTerminal(next.orchestration.status)) onTerminal?.();
+        if (isTerminal(next.orchestration.status)) {
+          onTerminal?.();
+          void refreshPastOrchestrations(activeId);
+        }
       },
       (reason) => setError(`Refresh delayed: ${reason.message}`),
     );
@@ -146,6 +164,12 @@ export function OrchestrationPanel({
     [view, nowMs],
   );
   const steps = view ? workflowState(view) : null;
+  const dialogView = historyView ?? view;
+  const dialogSteps = dialogView ? workflowState(dialogView) : null;
+  const timeline = useMemo(
+    () => buildChatTimeline(directMessages, pastOrchestrations),
+    [directMessages, pastOrchestrations],
+  );
   const questions =
     view?.activeDraft?.materialQuestions.map(toClarificationQuestion) ?? [];
   const currentQuestion = questions[answers.length] ?? null;
@@ -190,6 +214,7 @@ export function OrchestrationPanel({
         setActivePage(null);
         setView(null);
         setActiveId(result.orchestration.id);
+        void refreshPastOrchestrations(result.orchestration.id);
       }
       setPrompt("");
     } catch (reason) {
@@ -217,9 +242,27 @@ export function OrchestrationPanel({
     await runAction(() => api.confirm(view.orchestration.id));
   };
 
-  const openStep = (stepId: WorkflowStepId, index: number) => {
-    if (!steps || index > steps.reachedIndex) return;
+  const openStep = (
+    stepId: WorkflowStepId,
+    index: number,
+    stepsForGating: { reachedIndex: number } | null,
+  ) => {
+    if (!stepsForGating || index > stepsForGating.reachedIndex) return;
     setActivePage(stepId);
+  };
+
+  const openHistoryOrchestration = async (id: string) => {
+    try {
+      setHistoryView(await api.get(id));
+      setActivePage("integration");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const closeActivePage = () => {
+    setActivePage(null);
+    setHistoryView(null);
   };
 
   const handleMessagesScroll = () => {
@@ -252,7 +295,7 @@ export function OrchestrationPanel({
         </div>
 
         <div className="messages" ref={messagesContainer} onScroll={handleMessagesScroll}>
-          {directMessages.length === 0 && !directRun && !view ? (
+          {timeline.length === 0 && !directRun && !view ? (
             <div className="welcome">
               <div className="welcome-orbit">
                 <div>⌁</div>
@@ -272,15 +315,48 @@ export function OrchestrationPanel({
               </div>
             </div>
           ) : (
-            directMessages.map((message) => (
-              <article className={`message message-${message.role}`} key={message.id}>
-                <div className="message-meta">
-                  <strong>{message.role === "user" ? "You" : agentName}</strong>
-                  <span>{formatTime(message.createdAt)}</span>
-                </div>
-                <div className="message-body">{message.content}</div>
-              </article>
-            ))
+            timeline.map((entry) =>
+              entry.kind === "message" ? (
+                <article
+                  className={`message message-${entry.message.role}`}
+                  key={`message:${entry.message.id}`}
+                >
+                  <div className="message-meta">
+                    <strong>{entry.message.role === "user" ? "You" : agentName}</strong>
+                    <span>{formatTime(entry.message.createdAt)}</span>
+                  </div>
+                  <div className="message-body">{entry.message.content}</div>
+                </article>
+              ) : (
+                <article
+                  className={`message message-assistant orch-inline-result orch-history-card state-${entry.summary.status}`}
+                  key={`orchestration:${entry.summary.id}`}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => void openHistoryOrchestration(entry.summary.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      void openHistoryOrchestration(entry.summary.id);
+                    }
+                  }}
+                >
+                  <div className="message-meta">
+                    <strong>{agentName}</strong>
+                    <span>{statusLabel(entry.summary.status)}</span>
+                  </div>
+                  <div className="message-body">
+                    <p className="orch-history-prompt">{entry.summary.prompt}</p>
+                    <p>
+                      {entry.summary.finalOutput ??
+                        entry.summary.error ??
+                        "The run ended without a result summary."}
+                    </p>
+                    <small>Open evidence ↗</small>
+                  </div>
+                </article>
+              ),
+            )
           )}
 
           {view && (
@@ -338,7 +414,74 @@ export function OrchestrationPanel({
               </AssistantMessage>
             )}
 
-          {view && progress && !["drafting-intent", "awaiting-confirmation"].includes(view.orchestration.status) && (
+          {view?.orchestration.status === "needs-user" && (
+            <AssistantMessage agentName={agentName} meta="needs a decision">
+              {view.pendingAmendment ? (
+                <div className="orch-amendment-card">
+                  <p>{view.pendingAmendment.reason}</p>
+                  <div className="orch-amendment-intent">
+                    <strong>Proposed goal</strong>
+                    <p>{view.pendingAmendment.proposedIntent.goal}</p>
+                    {view.pendingAmendment.proposedIntent.requirements.length > 0 && (
+                      <>
+                        <strong>Requirements</strong>
+                        <ul>
+                          {view.pendingAmendment.proposedIntent.requirements.map((item, index) => (
+                            <li key={index}>{item}</li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                  </div>
+                  <div className="orch-amendment-actions">
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      disabled={pending}
+                      onClick={() =>
+                        void runAction(() =>
+                          api.confirmAmendment(view.orchestration.id, view.pendingAmendment!.id),
+                        )
+                      }
+                    >
+                      Accept and continue
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-ghost"
+                      disabled={pending}
+                      onClick={() =>
+                        void runAction(() =>
+                          api.rejectAmendment(view.orchestration.id, view.pendingAmendment!.id),
+                        )
+                      }
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="orch-amendment-card">
+                  <p>
+                    This run is paused with no pending decision recorded, so it will not resume on
+                    its own.
+                  </p>
+                  <div className="orch-amendment-actions">
+                    <button
+                      type="button"
+                      className="button button-danger"
+                      disabled={pending}
+                      onClick={() => void runAction(() => api.cancel(view.orchestration.id))}
+                    >
+                      Cancel this run
+                    </button>
+                  </div>
+                </div>
+              )}
+            </AssistantMessage>
+          )}
+
+          {view && progress && !["drafting-intent", "awaiting-confirmation", "needs-user"].includes(view.orchestration.status) && (
             <AssistantMessage agentName={agentName} meta={statusLabel(view.orchestration.status)}>
               <div className="orch-executing-head">
                 <div>
@@ -383,7 +526,7 @@ export function OrchestrationPanel({
                       disabled={!reached}
                       data-active={steps?.activeIndex === index}
                       data-reached={reached}
-                      onClick={() => openStep(step.id, index)}
+                      onClick={() => openStep(step.id, index, steps)}
                     >
                       <span>{index + 1}</span>
                       {step.label}
@@ -514,8 +657,8 @@ export function OrchestrationPanel({
         </form>
       </section>
 
-      {view && activePage && (
-        <div className="orch-page-backdrop" onMouseDown={() => setActivePage(null)}>
+      {dialogView && activePage && (
+        <div className="orch-page-backdrop" onMouseDown={closeActivePage}>
           <section
             className="orch-page-dialog"
             role="dialog"
@@ -526,7 +669,7 @@ export function OrchestrationPanel({
             <header className="orch-page-header">
               <nav className="orch-step-nav" aria-label="Execution pages">
                 {WORKFLOW_STEPS.map((step, index) => {
-                  const reached = Boolean(steps && index <= steps.reachedIndex);
+                  const reached = Boolean(dialogSteps && index <= dialogSteps.reachedIndex);
                   return (
                     <button
                       type="button"
@@ -534,7 +677,7 @@ export function OrchestrationPanel({
                       disabled={!reached}
                       data-active={activePage === step.id}
                       data-reached={reached}
-                      onClick={() => openStep(step.id, index)}
+                      onClick={() => openStep(step.id, index, dialogSteps)}
                     >
                       <span>{index + 1}</span>
                       {step.label}
@@ -546,28 +689,28 @@ export function OrchestrationPanel({
                 type="button"
                 className="orch-page-close"
                 aria-label="Close execution page"
-                onClick={() => setActivePage(null)}
+                onClick={closeActivePage}
               >
                 ×
               </button>
             </header>
             <div className="orch-page-content">
               {activePage === "details" && (
-                <DetailsPage view={view} agentInstructions={agentInstructions} />
+                <DetailsPage view={dialogView} agentInstructions={agentInstructions} />
               )}
-              {activePage === "planner" && <PlanBoard view={view} />}
+              {activePage === "planner" && <PlanBoard view={dialogView} />}
               {activePage === "accounting" && (
                 <UsagePanel
-                  usage={view.usage}
-                  budget={view.orchestration.budget}
-                  estimate={view.orchestration.estimate}
-                  counters={evidenceCounters(view)}
-                  elapsedMs={elapsedMsFor(view, nowMs)}
-                  budgetStopReason={budgetStopReason(view)}
+                  usage={dialogView.usage}
+                  budget={dialogView.orchestration.budget}
+                  estimate={dialogView.orchestration.estimate}
+                  counters={evidenceCounters(dialogView)}
+                  elapsedMs={elapsedMsFor(dialogView, nowMs)}
+                  budgetStopReason={budgetStopReason(dialogView)}
                 />
               )}
-              {activePage === "orchestration" && <OrchestrationPage view={view} />}
-              {activePage === "integration" && <IntegrationResultPage view={view} />}
+              {activePage === "orchestration" && <OrchestrationPage view={dialogView} />}
+              {activePage === "integration" && <IntegrationResultPage view={dialogView} />}
             </div>
           </section>
         </div>

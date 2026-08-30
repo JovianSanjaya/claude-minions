@@ -7,7 +7,7 @@ import {
   consumeCodexOutputChunk,
   parseCodexEventLine,
 } from "./codex-runner.js";
-import { RunCancelledError } from "./errors.js";
+import { RunCancelledError, RunFailedError } from "./errors.js";
 import type {
   AgentRunner,
   RunUsage,
@@ -221,25 +221,29 @@ export class ContainerCodexRunner implements AgentRunner {
         child.once("close", (code) => resolve(code ?? 1));
       });
       if (streams.stdoutBuffer.trim()) parseCodexEventLine(streams.stdoutBuffer.trim(), parsed);
-      if (active.cancelled) throw new RunCancelledError();
+      if (active.cancelled) throw new RunCancelledError(parsed.threadId);
       if (active.timedOut) {
-        throw new Error("Runtime timed out after " + this.config.codexTimeoutMs + " ms");
+        throw new RunFailedError(
+          "Runtime timed out after " + this.config.codexTimeoutMs + " ms",
+          parsed.threadId,
+        );
       }
       if (active.outputExceeded) {
-        throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
+        throw new RunFailedError("Codex output exceeded CODEX_MAX_OUTPUT_BYTES", parsed.threadId);
       }
       if (exitCode !== 0) {
         const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
-        throw new Error(
+        throw new RunFailedError(
           this.config.containerEngine +
             " Runtime exited with code " +
             exitCode +
             ": " +
             detail,
+          parsed.threadId,
         );
       }
       const output = parsed.messages.at(-1)?.trim();
-      if (!output) throw new Error("Codex completed without an agent message");
+      if (!output) throw new RunFailedError("Codex completed without an agent message", parsed.threadId);
       return {
         output,
         threadId: parsed.threadId,

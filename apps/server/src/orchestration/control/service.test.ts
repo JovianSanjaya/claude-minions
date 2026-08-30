@@ -31,8 +31,10 @@ class FakeDriver implements OrchestrationExecutionDriver {
     "goal" | "requirements" | "assumptions" | "nonGoals" | "architectureDecisions" | "manualExpectations"
   >> = {};
   blockExecution = false;
+  elaborateCalls: Array<Parameters<OrchestrationExecutionDriver["elaborateIntent"]>[0]> = [];
 
   async elaborateIntent(input: Parameters<OrchestrationExecutionDriver["elaborateIntent"]>[0]) {
+    this.elaborateCalls.push(input);
     const reconciling = input.prompt.includes("Clarification reconciliation pass");
     if (reconciling) this.reconciliationPrompts.push(input.prompt);
     const intent = reconciling ? this.reconciledIntent : this.initialIntent;
@@ -317,5 +319,56 @@ describe("OrchestrationControlService", () => {
     expect(reconciled.orchestration.status).toBe("cancelled");
     expect(reconciled.events.at(-1)?.type).toBe("restart-reconciled");
     expect(reconciled.usage).toEqual(first.service.getOrchestration(id).usage);
+  });
+
+  it("feeds prior terminal orchestrations for the same Agent into intent elaboration", async () => {
+    const driver = new FakeDriver();
+    const { service } = await fixture(driver);
+    const firstId = await createReady(service);
+    await service.start(firstId);
+    await service.waitForIdle(firstId);
+    expect(service.getOrchestration(firstId).orchestration.status).toBe("completed");
+
+    driver.elaborateCalls = [];
+    const second = await service.createOrchestration(AGENT_ID, {
+      prompt: "Build the second feature", requestedMode: "auto",
+    });
+    await service.waitForIdle(second.id);
+    const call = driver.elaborateCalls.at(-1);
+    expect(call?.priorAttempts).toContain("Build the feature");
+    expect(call?.priorAttempts).toContain("completed");
+  });
+
+  it("never leaks another Agent's orchestration history into the digest", async () => {
+    const driver = new FakeDriver();
+    const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+    const directory = await mkdtemp(path.join(os.tmpdir(), "launchpad-control-service-isolation-"));
+    const store = new OrchestrationStore(path.join(directory, "orchestrations.json"));
+    const service = new OrchestrationControlService({
+      store,
+      driver,
+      agentAccess: {
+        getAgent: (id) =>
+          id === AGENT_ID
+            ? { id, status: "ready", workspacePath: path.join(directory, "workspace-a") }
+            : id === OTHER_AGENT_ID
+              ? { id, status: "ready", workspacePath: path.join(directory, "workspace-b") }
+              : null,
+      },
+    });
+    await service.initialize();
+
+    const firstId = await createReady(service);
+    await service.start(firstId);
+    await service.waitForIdle(firstId);
+    expect(service.getOrchestration(firstId).orchestration.status).toBe("completed");
+
+    driver.elaborateCalls = [];
+    const other = await service.createOrchestration(OTHER_AGENT_ID, {
+      prompt: "Unrelated work for another Agent", requestedMode: "auto",
+    });
+    await service.waitForIdle(other.id);
+    const call = driver.elaborateCalls.at(-1);
+    expect(call?.priorAttempts).toBeUndefined();
   });
 });

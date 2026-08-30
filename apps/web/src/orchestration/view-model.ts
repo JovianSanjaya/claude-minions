@@ -7,9 +7,11 @@ import type {
   OrchestrationEvent,
   OrchestrationReadModel,
   OrchestrationStatus,
+  OrchestrationSummary,
   OrchestrationTaskStatus,
   UsageLedger,
 } from "./contracts";
+import type { Message } from "../types";
 
 export const terminalStatuses = new Set<OrchestrationStatus>([
   "budget-exhausted",
@@ -534,6 +536,25 @@ export function budgetStopReason(view: OrchestrationReadModel): string | null {
   if (view.orchestration.status !== "budget-exhausted") return null;
   const event = view.events.find((item) => /budget/i.test(item.type));
   return event?.summary ?? view.orchestration.error ?? "The hard budget was reached.";
+}
+
+export type ChatTimelineEntry =
+  | { kind: "message"; message: Message; at: string }
+  | { kind: "orchestration-summary"; summary: OrchestrationSummary; at: string };
+
+export function buildChatTimeline(
+  messages: Message[],
+  pastOrchestrations: OrchestrationSummary[],
+): ChatTimelineEntry[] {
+  const entries: ChatTimelineEntry[] = [
+    ...messages.map((message) => ({ kind: "message" as const, message, at: message.createdAt })),
+    ...pastOrchestrations.map((summary) => ({
+      kind: "orchestration-summary" as const,
+      summary,
+      at: summary.createdAt,
+    })),
+  ];
+  return entries.sort((a, b) => a.at.localeCompare(b.at));
 }
 
 export function safeReadModel(value: OrchestrationReadModel): OrchestrationReadModel {

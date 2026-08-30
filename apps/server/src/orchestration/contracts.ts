@@ -283,6 +283,7 @@ export interface ElaborateIntentInput {
   requestedMode: RequestedExecutionMode;
   budget: BudgetPolicy;
   workspacePath: string;
+  priorAttempts?: string | undefined;
 }
 
 export interface PlanInput {

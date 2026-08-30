@@ -11,7 +11,7 @@ import type {
   RunnerRequest,
   RunnerResult,
 } from "./types.js";
-import { RunCancelledError } from "./errors.js";
+import { RunCancelledError, RunFailedError } from "./errors.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -166,6 +166,43 @@ describe("Agent lifecycle", () => {
     await service.stopAgent(agent.id);
     expect(cancelledExecutionId).toBe(run.id);
     expect(service.getRun(run.id).status).toBe("cancelled");
+  });
+
+  it("keeps the Codex thread a timed-out or failed run reported so continuing preserves context", async () => {
+    const runner: AgentRunner = {
+      run: async () => {
+        throw new RunFailedError("Codex timed out after 1800000 ms", "thread-from-failed-turn");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Times out" });
+    const { run } = await service.sendMessage(agent.id, "first");
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("thread-from-failed-turn");
+  });
+
+  it("leaves the prior Codex thread untouched when a failure reports no thread id", async () => {
+    let attempt = 0;
+    const runner: AgentRunner = {
+      run: async (request) => {
+        attempt += 1;
+        if (attempt === 1) return { output: "seeded", threadId: "established-thread", usage: null };
+        throw new RunFailedError("Codex exited with code 1: boom", null);
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Second turn fails" });
+    const { run: firstRun } = await service.sendMessage(agent.id, "first");
+    await expect.poll(() => service.getRun(firstRun.id).status).toBe("completed");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("established-thread");
+
+    const { run: secondRun } = await service.sendMessage(agent.id, "second");
+    await expect.poll(() => service.getRun(secondRun.id).status).toBe("failed");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("established-thread");
   });
 
   it("coordinates direct admission and Agent stop/delete with orchestration", async () => {
