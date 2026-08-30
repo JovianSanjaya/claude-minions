@@ -324,7 +324,7 @@ button {
 }
 
 .runtime-card strong,
-.runtime-card > span:last-child {
+.runtime-endpoint {
   display: block;
 }
 
@@ -333,11 +333,40 @@ button {
   margin: 6px 0 4px;
 }
 
-.runtime-card > span:last-child {
+.runtime-endpoint {
   color: #85857e;
   font-size: 9px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.runtime-models {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #3d3d38;
+}
+
+.runtime-models span,
+.runtime-models b {
+  display: block;
+}
+
+.runtime-models span {
+  min-width: 0;
+  color: #aaa9a1;
+  font-size: 8px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.runtime-models b {
+  margin-bottom: 2px;
+  color: #77776f;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .eyebrow {

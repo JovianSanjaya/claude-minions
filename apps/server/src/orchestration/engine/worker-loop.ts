@@ -13,7 +13,11 @@ import type { DetailedApplicationMap } from "./application-map.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker, type ContextPacket } from "./context-broker.js";
 import { createFailurePacket } from "./failure-packet.js";
-import { reviewPreflight, workerPreflightSchema } from "./preflight.js";
+import {
+  reviewPreflight,
+  workerPreflightSchema,
+  type PreflightDecision,
+} from "./preflight.js";
 import { RoleExecutor } from "./role-executor.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
 import {
@@ -65,6 +69,34 @@ function contextText(packet: ContextPacket): string {
   ].join("\n").slice(0, 120_000);
 }
 
+function relevantCriteriaText(
+  task: OrchestrationTask,
+  contract: ExecutionContract,
+): string {
+  const selected = new Set(task.acceptanceCriterionIds);
+  return JSON.stringify(
+    contract.criteria
+      .filter((criterion) => selected.has(criterion.id))
+      .map(({ id, kind, description, verification }) => ({ id, kind, description, verification })),
+  );
+}
+
+async function waitForRetry(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw new Error("Worker cancelled");
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Worker cancelled"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer.unref();
+  });
+}
+
 export class BoundedWorkerLoop {
   constructor(
     private readonly roles: RoleExecutor,
@@ -84,6 +116,7 @@ export class BoundedWorkerLoop {
     map: DetailedApplicationMap;
     mainWorkspacePath: string;
     signal: AbortSignal;
+    deterministicPreflight?: boolean;
   }): Promise<WorkerLoopResult> {
     const { orchestration, contract, task, tasks, map, signal } = input;
     const workspace = await this.workspaces.create(
@@ -111,57 +144,40 @@ export class BoundedWorkerLoop {
       this.artifacts.versionsFor(task),
     );
     await this.sink.recordContextPacket(packet.summary);
-    const preflightPrompt = [
-      "Produce a read-only worker preflight as JSON. Do not edit files.",
-      contextText(packet),
-      `Allowed edit paths (expectedFiles must contain only these exact paths or descendants): ${JSON.stringify(task.allowedPaths)}`,
-      `Available additional context files: ${JSON.stringify(map.entries.slice(0, 500).map((entry) => entry.path))}`,
-      "missingContext may request only a specific repository-relative file from that list. Never request /workspace, a directory root, an absolute path, or a placeholder. Use [] when no listed file is required.",
-      "Never invent placeholder paths such as mapped-file or package-boundary.",
-      "Required fields: understanding, expectedFiles, consumedArtifacts, publishedArtifacts, approach, missingContext, plannedChecks.",
-    ].join("\n");
-    let preflightCall = await this.roles.structured(
-      {
-        orchestrationId: orchestration.id,
-        agentId: orchestration.agentId,
-        taskId: task.id,
-        role: "worker",
-        workspacePath: workspace.path,
-        sandboxMode: "read-only",
-        signal,
-        prompt: preflightPrompt,
-      },
-      workerPreflightSchema,
-    );
-    let preflightUsage = preflightCall.usage;
-    const availableContextPaths = map.entries.map((entry) => entry.path);
-    let decision = reviewPreflight(preflightCall.value, task, contract, availableContextPaths);
-    await this.sink.recordEvent({
-      orchestrationId: orchestration.id,
-      taskId: task.id,
-      executionId: preflightCall.executionId,
-      type: "preflight-reviewed",
-      actorRole: "planner",
-      modelId: null,
-      summary: decision.reason,
-      metadata: { approved: decision.approved, requestedExpansionCount: decision.expansionPaths.length },
-    });
-    if (
-      !decision.approved &&
-      (decision.reason.startsWith("Preflight would edit paths outside task scope") ||
-        decision.reason.startsWith("Preflight requested invalid or unavailable context paths"))
-    ) {
+    let preflightUsage: TokenUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+    let decision: PreflightDecision;
+    const isExactSingleFileScope =
+      input.deterministicPreflight === true &&
+      task.allowedPaths.length === 1 &&
+      /\.[^/]+$/.test(task.allowedPaths[0]!) &&
+      task.requiredArtifactIds.length === 0;
+    if (isExactSingleFileScope) {
+      decision = {
+        approved: true,
+        reason: "Deterministic preflight approved the exact single-file scope",
+        expansionPaths: [],
+      };
       await this.sink.recordEvent({
         orchestrationId: orchestration.id,
         taskId: task.id,
-        executionId: preflightCall.executionId,
-        type: "preflight-correction-requested",
+        executionId: null,
+        type: "preflight-reviewed",
         actorRole: "control-plane",
         modelId: null,
-        summary: "Requested one bounded read-only correction using the authoritative task scope",
-        metadata: { allowedPathCount: task.allowedPaths.length },
+        summary: decision.reason,
+        metadata: { approved: true, requestedExpansionCount: 0, deterministic: true },
       });
-      preflightCall = await this.roles.structured(
+    } else {
+      const preflightPrompt = [
+        "Produce a read-only worker preflight as concise JSON. Do not edit files.",
+        contextText(packet),
+        `Relevant confirmed acceptance criteria: ${relevantCriteriaText(task, contract)}`,
+        `Allowed edit paths: ${JSON.stringify(task.allowedPaths)}`,
+        `Available additional context files: ${JSON.stringify(map.entries.slice(0, 200).map((entry) => entry.path))}`,
+        "missingContext may request only a specific repository-relative file from that list. Use [] when no listed file is required.",
+        "Never request /workspace, a directory root, an absolute path, a placeholder, or an unlisted path.",
+      ].join("\n");
+      let preflightCall = await this.roles.structured(
         {
           orchestrationId: orchestration.id,
           agentId: orchestration.agentId,
@@ -170,17 +186,12 @@ export class BoundedWorkerLoop {
           workspacePath: workspace.path,
           sandboxMode: "read-only",
           signal,
-          prompt: [
-            preflightPrompt,
-            `The previous preflight was rejected: ${decision.reason}`,
-            `Return a corrected preflight. expectedFiles must be a subset of: ${JSON.stringify(task.allowedPaths)}.`,
-            `missingContext must be [] unless it names a specific file from: ${JSON.stringify(availableContextPaths.slice(0, 500))}.`,
-            "Do not rename the planned files and do not use placeholders.",
-          ].join("\n"),
+          prompt: preflightPrompt,
         },
         workerPreflightSchema,
       );
-      preflightUsage = addUsage(preflightUsage, preflightCall.usage);
+      preflightUsage = preflightCall.usage;
+      const availableContextPaths = map.entries.map((entry) => entry.path);
       decision = reviewPreflight(preflightCall.value, task, contract, availableContextPaths);
       await this.sink.recordEvent({
         orchestrationId: orchestration.id,
@@ -190,8 +201,54 @@ export class BoundedWorkerLoop {
         actorRole: "planner",
         modelId: null,
         summary: decision.reason,
-        metadata: { approved: decision.approved, requestedExpansionCount: decision.expansionPaths.length, correction: true },
+        metadata: { approved: decision.approved, requestedExpansionCount: decision.expansionPaths.length },
       });
+      if (
+        !decision.approved &&
+        (decision.reason.startsWith("Preflight would edit paths outside task scope") ||
+          decision.reason.startsWith("Preflight requested invalid or unavailable context paths"))
+      ) {
+        await this.sink.recordEvent({
+          orchestrationId: orchestration.id,
+          taskId: task.id,
+          executionId: preflightCall.executionId,
+          type: "preflight-correction-requested",
+          actorRole: "control-plane",
+          modelId: null,
+          summary: "Requested one bounded read-only correction using the authoritative task scope",
+          metadata: { allowedPathCount: task.allowedPaths.length },
+        });
+        preflightCall = await this.roles.structured(
+          {
+            orchestrationId: orchestration.id,
+            agentId: orchestration.agentId,
+            taskId: task.id,
+            role: "worker",
+            workspacePath: workspace.path,
+            sandboxMode: "read-only",
+            signal,
+            prompt: [
+              preflightPrompt,
+              `The previous preflight was rejected: ${decision.reason}`,
+              `expectedFiles must be a subset of: ${JSON.stringify(task.allowedPaths)}.`,
+              `missingContext must be [] unless it names a file from: ${JSON.stringify(availableContextPaths.slice(0, 200))}.`,
+            ].join("\n"),
+          },
+          workerPreflightSchema,
+        );
+        preflightUsage = addUsage(preflightUsage, preflightCall.usage);
+        decision = reviewPreflight(preflightCall.value, task, contract, availableContextPaths);
+        await this.sink.recordEvent({
+          orchestrationId: orchestration.id,
+          taskId: task.id,
+          executionId: preflightCall.executionId,
+          type: "preflight-reviewed",
+          actorRole: "planner",
+          modelId: null,
+          summary: decision.reason,
+          metadata: { approved: decision.approved, requestedExpansionCount: decision.expansionPaths.length, correction: true },
+        });
+      }
     }
     if (!decision.approved) {
       await this.workspaces.cleanup(workspace, "archive");
@@ -274,6 +331,7 @@ export class BoundedWorkerLoop {
               "Create or modify only those exact repository-relative paths or their descendants. Do not rename planned files, use /workspace-prefixed paths, create package-boundary placeholders, or edit anything else.",
               "Do not weaken criteria or edit outside allowed paths.",
               contextText(packet),
+              `Relevant confirmed acceptance criteria: ${relevantCriteriaText(task, contract)}.`,
               `Attempt: ${number}`,
               "After edits return JSON with summary, diagnosis, and artifacts.",
             ].join("\n"),
@@ -283,6 +341,9 @@ export class BoundedWorkerLoop {
         totalUsage = addUsage(totalUsage, call.usage);
         lastDiagnosis = call.value.diagnosis;
         lastChanges = await this.workspaces.changes(workspace);
+        if (!lastChanges.changedFiles.length && !lastChanges.deletedFiles.length) {
+          throw new Error("Worker reported completion without making any workspace changes");
+        }
         const violations = scopeViolations(lastChanges, task.allowedPaths);
         if (violations.length) throw new Error(`Worker scope violation: ${violations.join(", ")}`);
         lastVerifications = await this.verification.run(
@@ -336,6 +397,23 @@ export class BoundedWorkerLoop {
           errorSummary: lastError.slice(0, 2_000),
           completedAt: new Date().toISOString(),
         });
+        if (
+          number < orchestration.budget.maxWorkerAttempts &&
+          /429|too many requests|timed out/i.test(lastError)
+        ) {
+          const retryDelayMs = 15_000;
+          await this.sink.recordEvent({
+            orchestrationId: orchestration.id,
+            taskId: task.id,
+            executionId: null,
+            type: "worker-retry-wait",
+            actorRole: "control-plane",
+            modelId: null,
+            summary: "Waiting before retrying a slow or rate-limited model call",
+            metadata: { retryDelayMs, nextAttempt: number + 1 },
+          });
+          await waitForRetry(retryDelayMs, signal);
+        }
       }
     }
     task.status = "failed";

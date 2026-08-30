@@ -1,6 +1,5 @@
 const REDACTED = "[REDACTED]";
 const MAX_STRING_LENGTH = 8_000;
-const MAX_ARRAY_LENGTH = 250;
 const MAX_OBJECT_KEYS = 250;
 
 function isSecretKey(key: string): boolean {
@@ -35,9 +34,9 @@ export function redactValue(value: unknown, seen = new WeakSet<object>()): unkno
   seen.add(value);
 
   if (Array.isArray(value)) {
-    const result = value
-      .slice(0, MAX_ARRAY_LENGTH)
-      .map((item) => redactValue(item, seen));
+    // Collection retention is owned by the store, not the redactor. Truncating
+    // here silently discarded every event after the first 250 records.
+    const result = value.map((item) => redactValue(item, seen));
     seen.delete(value);
     return result;
   }

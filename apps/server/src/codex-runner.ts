@@ -20,6 +20,42 @@ export interface ParsedEvents {
   errors: string[];
 }
 
+export interface CodexOutputAccumulator {
+  stdoutBuffer: string;
+  stderrTail: string;
+  stdoutBytes: number;
+}
+
+const STDERR_TAIL_CHARACTERS = 16_384;
+
+/**
+ * Consume Codex's machine-readable stdout without allowing noisy diagnostic
+ * stderr to exhaust the agent-message output budget. Stderr is continuously
+ * drained and tail-capped so a chatty provider cannot grow server memory.
+ */
+export function consumeCodexOutputChunk(
+  accumulator: CodexOutputAccumulator,
+  chunk: Buffer,
+  target: "stdout" | "stderr",
+  maxStdoutBytes: number,
+  parsed: ParsedEvents,
+): boolean {
+  if (target === "stderr") {
+    accumulator.stderrTail = (accumulator.stderrTail + chunk.toString("utf8"))
+      .slice(-STDERR_TAIL_CHARACTERS);
+    return false;
+  }
+
+  accumulator.stdoutBytes += chunk.byteLength;
+  if (accumulator.stdoutBytes > maxStdoutBytes) return true;
+
+  accumulator.stdoutBuffer += chunk.toString("utf8");
+  const lines = accumulator.stdoutBuffer.split(/\r?\n/);
+  accumulator.stdoutBuffer = lines.pop() ?? "";
+  for (const line of lines) parseCodexEventLine(line, parsed);
+  return false;
+}
+
 export function buildCodexArgs(
   request: RunnerRequest,
   sandboxMode: AppConfig["codexSandboxMode"],
@@ -167,29 +203,12 @@ export class CodexRunner implements AgentRunner {
       usage: null,
       errors: [],
     };
-    let stdout = "";
-    let stderr = "";
-    let totalBytes = 0;
+    const streams = { stdoutBuffer: "", stderrTail: "", stdoutBytes: 0 };
 
     const consume = (chunk: Buffer, target: "stdout" | "stderr") => {
-      totalBytes += chunk.byteLength;
-      if (totalBytes > this.config.codexMaxOutputBytes) {
+      if (consumeCodexOutputChunk(streams, chunk, target, this.config.codexMaxOutputBytes, parsed)) {
         active.outputExceeded = true;
         this.terminate(active);
-        return;
-      }
-      if (target === "stdout") {
-        stdout += chunk.toString("utf8");
-        const lines = stdout.split(/\r?\n/);
-        stdout = lines.pop() ?? "";
-        for (const line of lines) {
-          parseCodexEventLine(line, parsed);
-        }
-      } else {
-        stderr += chunk.toString("utf8");
-        if (stderr.length > 16_384) {
-          stderr = stderr.slice(-16_384);
-        }
       }
     };
 
@@ -207,8 +226,8 @@ export class CodexRunner implements AgentRunner {
         child.once("error", reject);
         child.once("close", (code) => resolve(code ?? 1));
       });
-      if (stdout.trim()) {
-        parseCodexEventLine(stdout.trim(), parsed);
+      if (streams.stdoutBuffer.trim()) {
+        parseCodexEventLine(streams.stdoutBuffer.trim(), parsed);
       }
       if (active.cancelled) {
         throw new RunCancelledError();
@@ -220,7 +239,7 @@ export class CodexRunner implements AgentRunner {
         throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
       }
       if (exitCode !== 0) {
-        const detail = parsed.errors.at(-1) ?? stderr.trim() ?? "No error detail";
+        const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
         throw new Error("Codex exited with code " + exitCode + ": " + detail);
       }
       const output = parsed.messages.at(-1)?.trim();

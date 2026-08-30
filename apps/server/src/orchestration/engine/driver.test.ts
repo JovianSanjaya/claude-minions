@@ -90,13 +90,14 @@ function contract(): ExecutionContract {
 
 function fakeRunner(
   failWorkers = false,
-  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined }> = [],
+  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [],
   badPreflightOnce = false,
+  failAcceptance = false,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, role: request.role });
+      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, role: request.role, prompt: request.prompt });
       let output: string;
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
@@ -106,6 +107,11 @@ function fakeRunner(
           tasks: [
             { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: ["src/a.ts"], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
             { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"] },
+          ],
+          acceptanceTests: [
+            { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
+            { id: "accept-b", title: "Module B works", criterionIds: ["c2"], category: "functional", scope: "protected", procedure: "Inspect and exercise module B", expectedOutcome: "B exports the expected value" },
+            { id: "regression", title: "Regression checks pass", criterionIds: [], category: "regression", scope: "global", procedure: "Run relevant repository checks", expectedOutcome: "Checks pass" },
           ],
         });
       } else if (request.prompt.includes("Produce a read-only worker preflight")) {
@@ -145,6 +151,14 @@ function fakeRunner(
         await writeFile(path.join(request.workspacePath, "src", "a.ts"), "export const a = 1;\n");
         await writeFile(path.join(request.workspacePath, "src", "b.ts"), "export const b = 2;\n");
         output = "Direct execution completed";
+      } else if (request.prompt.includes("Independently verify the integrated candidate")) {
+        output = JSON.stringify({
+          results: [
+            { testId: "accept-a", status: failAcceptance ? "failed" : "passed", evidence: failAcceptance ? "Module A did not satisfy its protected behavior check" : "Inspected src/a.ts and confirmed its export" },
+            { testId: "accept-b", status: "passed", evidence: "Inspected src/b.ts and confirmed its export" },
+            { testId: "regression", status: "passed", evidence: "Relevant regression inspection passed" },
+          ],
+        });
       } else {
         output = "done";
       }
@@ -161,7 +175,7 @@ function fakeRunner(
   };
 }
 
-async function setup(failWorkers = false, failGlobal = false, badPreflightOnce = false) {
+async function setup(failWorkers = false, failGlobal = false, badPreflightOnce = false, failAcceptance = false) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
   const workspace = path.join(root, "workspace");
@@ -172,9 +186,9 @@ async function setup(failWorkers = false, failGlobal = false, badPreflightOnce =
     const hasB = await readFile(path.join(candidate, "src", "b.ts"), "utf8").then(() => true).catch(() => false);
     return { passed: hasA || hasB, summary: hasA || hasB ? "visible pass" : "expected task file missing" };
   };
-  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined }> = [];
+  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [];
   const driver = new ContextAwareExecutionDriver({
-    runner: fakeRunner(failWorkers, calls, badPreflightOnce),
+    runner: fakeRunner(failWorkers, calls, badPreflightOnce, failAcceptance),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
     archiveRoot: path.join(root, "archive"), protectedEvaluatorRoot: path.join(root, "protected"),
@@ -214,6 +228,19 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(sink.verifications.map((record) => record.scope)).toEqual(
       expect.arrayContaining(["worker-visible", "protected", "global"]),
     );
+    expect(sink.verifications.map((record) => record.commandOrCheck)).toEqual(
+      expect.arrayContaining(["Module A works", "Module B works", "Regression checks pass"]),
+    );
+    expect(sink.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "acceptance-plan-created", actorRole: "planner", modelId: "strong" }),
+      expect.objectContaining({ type: "acceptance-verification-completed", actorRole: "verifier", modelId: "verify" }),
+    ]));
+    expect(calls.filter((call) => call.role === "worker" && call.sandboxMode === "workspace-write"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ prompt: expect.stringContaining("Relevant confirmed acceptance criteria") }),
+      ]));
+    expect(calls.filter((call) => call.role === "worker").map((call) => call.prompt).join("\n"))
+      .not.toContain("Inspect and exercise module A");
     for (const task of plan.tasks) {
       const taskCalls = calls.filter((call) => call.taskId === task.id);
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
@@ -267,6 +294,24 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
     await expect(readFile(path.join(workspace, "src", "b.ts"))).rejects.toThrow();
     expect(sink.verifications.find((record) => record.scope === "global")?.status).toBe("failed");
+  });
+
+  it("blocks publication when the big verifier fails a planner-generated acceptance test", async () => {
+    const { workspace, driver } = await setup(false, false, false, true);
+    const sink = new Sink();
+    const signal = new AbortController().signal;
+    const item = orchestration(workspace);
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "Protected or global verification failed; main workspace was not changed",
+    });
+    expect(sink.verifications.find((record) => record.commandOrCheck === "Module A works")?.status)
+      .toBe("failed");
+    await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
+    expect(sink.events.some((event) => event.type === "verified-publish")).toBe(false);
   });
 
   it("keeps direct execution real, budgeted, verified, and published", async () => {

@@ -8,6 +8,7 @@ export interface RoutingFacts {
   requestedMode: RequestedExecutionMode;
   taskCount: number;
   changedAreaCount: number;
+  hasOverlappingWriteScopes: boolean;
   coupling: "low" | "medium" | "high";
   estimatedCalls: number;
   estimatedContextTokens: number;
@@ -17,6 +18,29 @@ export interface RoutingFacts {
 export interface RouteDecision {
   selectedMode: SelectedExecutionMode;
   reason: string;
+}
+
+function normalizedScope(scope: string): string {
+  return scope.replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+export function tasksHaveOverlappingWriteScopes(
+  tasks: Array<{ allowedPaths: string[] }>,
+): boolean {
+  for (let leftIndex = 0; leftIndex < tasks.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < tasks.length; rightIndex += 1) {
+      for (const leftValue of tasks[leftIndex]!.allowedPaths) {
+        const left = normalizedScope(leftValue);
+        for (const rightValue of tasks[rightIndex]!.allowedPaths) {
+          const right = normalizedScope(rightValue);
+          if (left === right || left.startsWith(right + "/") || right.startsWith(left + "/")) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
 }
 
 export function selectRoute(facts: RoutingFacts): RouteDecision {
@@ -31,6 +55,12 @@ export function selectRoute(facts: RoutingFacts): RouteDecision {
   }
   if (facts.requestedMode === "direct") {
     return { selectedMode: "direct", reason: "The user explicitly selected direct execution" };
+  }
+  if (facts.hasOverlappingWriteScopes) {
+    return {
+      selectedMode: "one-worker",
+      reason: "Planned tasks share writable paths, so one coordinated worker avoids conflicting edits",
+    };
   }
   if (facts.taskCount <= 1 || facts.coupling === "high") {
     return {

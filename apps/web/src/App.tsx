@@ -367,10 +367,14 @@ export default function App() {
         <div className="runtime-card">
           <span className="eyebrow">Runtime</span>
           <strong>{system?.runtime ?? "Checking…"}</strong>
-          <span>
+          <span className="runtime-endpoint">
             {system?.arkModel ?? "Ark model not configured"}
             {system?.containerEngine ? " · " + system.containerEngine : ""}
           </span>
+          <div className="runtime-models" aria-label="Orchestration model assignments">
+            <span><b>Big model</b>{system?.orchestrationBigModel ?? "Not configured"}</span>
+            <span><b>Small workers</b>{system?.orchestrationSmallModel ?? "Not configured"}</span>
+          </div>
         </div>
       </aside>
 
