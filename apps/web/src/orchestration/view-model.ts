@@ -1,5 +1,6 @@
 import type {
   BenchmarkRecord,
+  BudgetPolicy,
   IntentClaim,
   IntentDraft,
   IntentProvenance,
@@ -7,8 +8,11 @@ import type {
   OrchestrationEvent,
   OrchestrationReadModel,
   OrchestrationStatus,
+  OrchestrationTask,
+  OrchestrationTaskStatus,
   RequestedExecutionMode,
   UsageLedger,
+  WorkerAttempt,
 } from "./contracts";
 
 export type PlaygroundMode = "direct" | "auto" | "orchestrated";
@@ -53,6 +57,178 @@ const STATUS_DESCRIPTIONS: Record<OrchestrationStatus, StatusDescription> = {
 
 export function describeStatus(status: OrchestrationStatus): StatusDescription {
   return STATUS_DESCRIPTIONS[status] ?? { label: status, tone: "neutral" };
+}
+
+const TASK_STATUS_DESCRIPTIONS: Record<OrchestrationTaskStatus, StatusDescription> = {
+  blocked: { label: "Blocked", tone: "neutral" },
+  ready: { label: "Queued", tone: "neutral" },
+  preflight: { label: "Preflight", tone: "info" },
+  running: { label: "Running", tone: "info" },
+  verifying: { label: "Verifying", tone: "info" },
+  stale: { label: "Stale — replanning", tone: "warning" },
+  passed: { label: "Passed", tone: "success" },
+  failed: { label: "Failed", tone: "danger" },
+  cancelled: { label: "Cancelled", tone: "neutral" },
+};
+
+export function describeTaskStatus(status: OrchestrationTaskStatus): StatusDescription {
+  return TASK_STATUS_DESCRIPTIONS[status] ?? { label: status, tone: "neutral" };
+}
+
+/** Statuses reached only after `/start` — the point at which a per-task progress view becomes meaningful. */
+const POST_START_STATUSES: ReadonlySet<OrchestrationStatus> = new Set([
+  "running",
+  "integrating",
+  "verifying",
+  "needs-user",
+  "budget-exhausted",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+export function showsRunProgress(status: OrchestrationStatus, taskCount: number): boolean {
+  return taskCount > 0 && POST_START_STATUSES.has(status);
+}
+
+export interface TaskProgress {
+  total: number;
+  passed: number;
+  failed: number;
+  cancelled: number;
+  active: number;
+  queued: number;
+  /** 0-100; the share of tasks that have reached a terminal state (passed/failed/cancelled). */
+  percentDone: number;
+}
+
+/** Buckets tasks by lifecycle stage for a progress bar — never trusts the server to have already summarized this. */
+export function computeTaskProgress(tasks: OrchestrationTask[]): TaskProgress {
+  let passed = 0;
+  let failed = 0;
+  let cancelled = 0;
+  let active = 0;
+  let queued = 0;
+  for (const task of tasks) {
+    switch (task.status) {
+      case "passed":
+        passed += 1;
+        break;
+      case "failed":
+        failed += 1;
+        break;
+      case "cancelled":
+        cancelled += 1;
+        break;
+      case "preflight":
+      case "running":
+      case "verifying":
+      case "stale":
+        active += 1;
+        break;
+      case "blocked":
+      case "ready":
+        queued += 1;
+        break;
+    }
+  }
+  const total = tasks.length;
+  const done = passed + failed + cancelled;
+  return { total, passed, failed, cancelled, active, queued, percentDone: total === 0 ? 0 : Math.round((done / total) * 100) };
+}
+
+export function formatElapsedMs(ms: number): string {
+  const clamped = Math.max(0, ms);
+  const totalSeconds = Math.floor(clamped / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes === 0 ? `${seconds}s` : `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+/**
+ * A live "Xs" while a task's current attempt is still running, or a fixed
+ * "took Xs" once its most recent attempt has completed — `null` when no
+ * attempt has started yet (still queued/blocked).
+ */
+export function taskElapsedLabel(attempts: WorkerAttempt[], taskId: string, nowMs: number): string | null {
+  const taskAttempts = attempts.filter((attempt) => attempt.taskId === taskId);
+  const running = taskAttempts.find((attempt) => attempt.status === "running");
+  if (running) {
+    return formatElapsedMs(nowMs - new Date(running.createdAt).getTime());
+  }
+  const last = taskAttempts.at(-1);
+  if (last?.completedAt) {
+    return formatElapsedMs(new Date(last.completedAt).getTime() - new Date(last.createdAt).getTime());
+  }
+  return null;
+}
+
+/** Newest-first — the order a history picker should list past orchestrations in. */
+export function sortOrchestrationsByRecency(orchestrations: Orchestration[]): Orchestration[] {
+  return [...orchestrations].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+}
+
+function truncatePrompt(prompt: string, maxChars = 48): string {
+  const singleLine = prompt.replace(/\s+/g, " ").trim();
+  return singleLine.length > maxChars ? `${singleLine.slice(0, maxChars - 1)}…` : singleLine;
+}
+
+/**
+ * A plain-text label for one entry in a history picker (a native <select>'s
+ * <option> can't hold rich markup, so status/date/prompt are folded into one
+ * string rather than rendered as separate styled elements).
+ */
+export function formatOrchestrationHistoryLabel(orchestration: Orchestration): string {
+  const status = describeStatus(orchestration.status).label;
+  const when = new Date(orchestration.createdAt).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const promptPreview = truncatePrompt(orchestration.prompt) || "(no prompt)";
+  return `${when} · ${status} · ${promptPreview}`;
+}
+
+export interface BudgetMeter {
+  label: string;
+  used: number;
+  max: number | null;
+  /** 0-100, capped; `null` when no cap is configured (never fabricates a percentage against an unset limit). */
+  percent: number | null;
+}
+
+function toBudgetMeter(label: string, used: number, max: number | null): BudgetMeter {
+  const percent = max !== null && max > 0 ? Math.min(100, Math.round((used / max) * 100)) : null;
+  return { label, used, max, percent };
+}
+
+export interface BudgetUsage {
+  modelCalls: BudgetMeter;
+  inputTokens: BudgetMeter;
+  outputTokens: BudgetMeter;
+  estimatedUsd: BudgetMeter;
+}
+
+/** Sums per-role call counts (the ledger only carries a per-role breakdown) and pairs every meter with its configured cap, if any. */
+export function computeBudgetUsage(usage: UsageLedger, budget: BudgetPolicy): BudgetUsage {
+  const totalModelCalls = Object.values(usage.byRole).reduce((sum, role) => sum + (role?.modelCalls ?? 0), 0);
+  return {
+    modelCalls: toBudgetMeter("Model calls", totalModelCalls, budget.maxModelCalls > 0 ? budget.maxModelCalls : null),
+    inputTokens: toBudgetMeter("Input tokens", usage.totalInputTokens, budget.maxInputTokens),
+    outputTokens: toBudgetMeter("Output tokens", usage.totalOutputTokens, budget.maxOutputTokens),
+    estimatedUsd: toBudgetMeter("Estimated cost", usage.totalEstimatedUsd ?? 0, budget.maxEstimatedUsd),
+  };
+}
+
+export type BudgetTone = "info" | "warning" | "danger";
+
+/** Escalates color only as a meter approaches its own configured cap — never compares across different meters. */
+export function budgetTone(percent: number | null): BudgetTone {
+  if (percent === null) return "info";
+  if (percent >= 90) return "danger";
+  if (percent >= 70) return "warning";
+  return "info";
 }
 
 export interface ConfirmationGate {

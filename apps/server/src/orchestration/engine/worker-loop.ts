@@ -13,7 +13,7 @@ import { buildFailurePacket } from "./failure-packet.js";
 import { runPreflight } from "./preflight.js";
 import { BudgetDeniedError, callRole, describeError, type RoleExecutorDeps } from "./role-executor.js";
 import type { CheckDefinition, CheckRunner } from "./verification.js";
-import { allPassed, runChecks } from "./verification.js";
+import { runChecks } from "./verification.js";
 import { createTaskWorkspace, diffWorkspace, isPathWithinAllowed, type TaskWorkspace } from "./worker-workspaces.js";
 
 export interface WorkerLoopDeps {
@@ -92,6 +92,13 @@ export async function runWorkerLoop(
     }
     attemptNumber += 1;
     const executionId = randomUUID();
+    // Live progress signal for the UI: the task's own status/attemptCount would
+    // otherwise only ever be written once, after the whole loop finishes (see
+    // driver.ts) — a poller would see "ready" the entire time a task is
+    // actually being worked, then a sudden jump straight to passed/failed.
+    // These intermediate upserts are advisory; the driver's post-loop upsert
+    // remains the single authoritative final status.
+    await deps.roleDeps.sink.upsertTask({ ...task, status: "preflight", attemptCount: attemptNumber });
     const attemptRecord: WorkerAttempt = {
       id: randomUUID(),
       orchestrationId,
@@ -164,6 +171,8 @@ export async function runWorkerLoop(
       });
     }
 
+    await deps.roleDeps.sink.upsertTask({ ...task, status: "running", attemptCount: attemptNumber });
+
     try {
       await callRole(deps.roleDeps, {
         agentId,
@@ -197,11 +206,19 @@ export async function runWorkerLoop(
       continue;
     }
 
-    const checks: CheckDefinition[] = [{ name: `${task.id}-visible`, scope: "worker-visible" }];
-    const records = await runChecks(orchestrationId, task.id, checks, workspace.path, deps.checkRunner, deps.roleDeps.sink);
-    lastFailingChecks = records.filter((record) => record.status !== "passed");
+    await deps.roleDeps.sink.upsertTask({ ...task, status: "verifying", attemptCount: attemptNumber });
 
-    if (allPassed(records)) {
+    // "worker-visible" is a stable name (not task-scoped — the task is already
+    // identified by the `taskId` argument to runChecks/VerificationRecord) so
+    // it can actually be registered in a trusted-command allowlist. If no such
+    // command is configured, the runner reports "skipped": per this scope's
+    // contract (see verification.ts) an unconfigured worker-visible check must
+    // never block a task — only a check that actually ran and failed does.
+    const checks: CheckDefinition[] = [{ name: "worker-visible", scope: "worker-visible" }];
+    const records = await runChecks(orchestrationId, task.id, checks, workspace.path, deps.checkRunner, deps.roleDeps.sink);
+    lastFailingChecks = records.filter((record) => record.status === "failed");
+
+    if (lastFailingChecks.length === 0) {
       await finishAttempt("passed", changedFiles, null);
       return { status: "passed", changedFiles, attempts: attemptNumber, failurePacket: null, workspace };
     }

@@ -93,6 +93,20 @@
   resize: vertical;
 }
 
+.orch-history-picker {
+  display: grid;
+  gap: 4px;
+}
+
+.orch-history-picker select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  background: #fff;
+  max-width: 100%;
+}
+
 .orch-system-summary {
   margin: 0;
   color: var(--muted);
@@ -480,8 +494,162 @@
   margin-top: 10px;
 }
 
+/* --- Run progress (live, "as the agent works" view) --- */
+
+.orch-run-progress {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  background: #fff;
+}
+
+.orch-run-progress-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.orch-run-progress-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.orch-task-progress-track {
+  display: flex;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #f2f1ed;
+  margin-bottom: 14px;
+}
+
+.orch-task-progress-segment {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.orch-run-task-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.orch-run-task-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.orch-run-task-item:last-child {
+  border-bottom: none;
+}
+
+.orch-run-task-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.orch-run-task-meta {
+  font-size: 12px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* --- Budget meters (usage vs. configured caps) --- */
+
+.orch-budget-meters {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.orch-budget-meter-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.orch-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: #f2f1ed;
+  overflow: hidden;
+}
+
+.orch-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  transition: width 0.3s ease;
+}
+
+/* Fill/segment tone colors, distinct from the (differently-named) status-pill tone scale above. */
+.orch-tone-success.orch-progress-fill,
+.orch-tone-success.orch-task-progress-segment {
+  background: var(--green);
+}
+.orch-tone-info.orch-progress-fill,
+.orch-tone-info.orch-task-progress-segment {
+  background: var(--purple);
+}
+.orch-tone-warning.orch-progress-fill,
+.orch-tone-warning.orch-task-progress-segment {
+  background: #d98c00;
+}
+.orch-tone-danger.orch-progress-fill,
+.orch-tone-danger.orch-task-progress-segment {
+  background: var(--red);
+}
+.orch-tone-neutral.orch-task-progress-segment {
+  background: var(--muted);
+}
+.orch-tone-neutral-soft.orch-task-progress-segment {
+  background: #ded9cd;
+}
+
+@keyframes orch-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.orch-pulse {
+  animation: orch-pulse 1.4s ease-in-out infinite;
+}
+
+.orch-elaborating {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.orch-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--purple);
+  flex-shrink: 0;
+}
+
 @media (max-width: 640px) {
   .orch-timeline-item {
     grid-template-columns: 1fr;
+  }
+
+  .orch-run-task-meta {
+    margin-left: 0;
   }
 }

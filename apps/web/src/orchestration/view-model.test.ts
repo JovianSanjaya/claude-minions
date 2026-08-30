@@ -6,19 +6,30 @@ import type {
   Orchestration,
   OrchestrationEvent,
   OrchestrationReadModel,
+  OrchestrationTask,
   UsageLedger,
+  WorkerAttempt,
 } from "./contracts";
 import {
+  budgetTone,
+  computeBudgetUsage,
+  computeTaskProgress,
   describeStatus,
+  describeTaskStatus,
   evaluateConfirmationGate,
   filterEvents,
+  formatElapsedMs,
   formatEstimateRange,
+  formatOrchestrationHistoryLabel,
   formatUsage,
   groupClaimsByProvenance,
   interpretBenchmarkResult,
   isTerminalStatus,
   modeToRequestedMode,
   safeOrchestration,
+  showsRunProgress,
+  sortOrchestrationsByRecency,
+  taskElapsedLabel,
   toSafeEventView,
 } from "./view-model";
 
@@ -364,5 +375,192 @@ describe("interpretBenchmarkResult: quality is presented before cost", () => {
   it("reports incomplete rather than guessing when an arm hasn't finished", () => {
     const result = interpretBenchmarkResult(benchmark({ orchestrated: null, status: "running" }));
     expect(result.safeToCompareCost).toBe(false);
+  });
+});
+
+function task(overrides: Partial<OrchestrationTask> = {}): OrchestrationTask {
+  return {
+    id: "task-1",
+    orchestrationId: "orch-1",
+    title: "Task 1",
+    objective: "Do the thing",
+    status: "ready",
+    dependsOn: [],
+    allowedPaths: [],
+    acceptanceCriterionIds: [],
+    requiredArtifactIds: [],
+    observedArtifactVersions: {},
+    applicationMapVersion: 1,
+    attemptCount: 0,
+    ...overrides,
+  };
+}
+
+function attempt(overrides: Partial<WorkerAttempt> = {}): WorkerAttempt {
+  return {
+    id: "attempt-1",
+    orchestrationId: "orch-1",
+    taskId: "task-1",
+    number: 1,
+    executionId: "exec-1",
+    modelId: "ep-worker",
+    contextFileHashes: [],
+    changedFiles: [],
+    status: "running",
+    usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    errorSummary: null,
+    createdAt: "2026-08-30T00:00:00.000Z",
+    completedAt: null,
+    ...overrides,
+  };
+}
+
+describe("showsRunProgress", () => {
+  it("only shows once execution has started and there is at least one task", () => {
+    expect(showsRunProgress("running", 2)).toBe(true);
+    expect(showsRunProgress("completed", 2)).toBe(true);
+    expect(showsRunProgress("running", 0)).toBe(false);
+    expect(showsRunProgress("planning", 2)).toBe(false);
+    expect(showsRunProgress("ready", 2)).toBe(false);
+    expect(showsRunProgress("awaiting-confirmation", 2)).toBe(false);
+  });
+});
+
+describe("computeTaskProgress", () => {
+  it("buckets every task status and computes percent-done from terminal states only", () => {
+    const progress = computeTaskProgress([
+      task({ id: "a", status: "passed" }),
+      task({ id: "b", status: "failed" }),
+      task({ id: "c", status: "running" }),
+      task({ id: "d", status: "ready" }),
+    ]);
+    expect(progress).toEqual({ total: 4, passed: 1, failed: 1, cancelled: 0, active: 1, queued: 1, percentDone: 50 });
+  });
+
+  it("reports zero percent done, not NaN, for an empty task list", () => {
+    expect(computeTaskProgress([]).percentDone).toBe(0);
+  });
+});
+
+describe("describeTaskStatus", () => {
+  it("gives every task status a label and a tone", () => {
+    expect(describeTaskStatus("passed").tone).toBe("success");
+    expect(describeTaskStatus("failed").tone).toBe("danger");
+    expect(describeTaskStatus("running").tone).toBe("info");
+  });
+});
+
+describe("formatElapsedMs", () => {
+  it("formats sub-minute durations as seconds and longer ones as minutes+seconds", () => {
+    expect(formatElapsedMs(0)).toBe("0s");
+    expect(formatElapsedMs(45_000)).toBe("45s");
+    expect(formatElapsedMs(125_000)).toBe("2m 05s");
+  });
+
+  it("never returns a negative duration for a clock skew", () => {
+    expect(formatElapsedMs(-500)).toBe("0s");
+  });
+});
+
+describe("taskElapsedLabel", () => {
+  const now = new Date("2026-08-30T00:00:30.000Z").getTime();
+
+  it("ticks live off a still-running attempt", () => {
+    const label = taskElapsedLabel([attempt({ status: "running", createdAt: "2026-08-30T00:00:00.000Z" })], "task-1", now);
+    expect(label).toBe("30s");
+  });
+
+  it("reports a fixed duration once the last attempt has completed", () => {
+    const label = taskElapsedLabel(
+      [attempt({ status: "passed", createdAt: "2026-08-30T00:00:00.000Z", completedAt: "2026-08-30T00:00:10.000Z" })],
+      "task-1",
+      now,
+    );
+    expect(label).toBe("10s");
+  });
+
+  it("returns null when the task has no attempts yet", () => {
+    expect(taskElapsedLabel([], "task-1", now)).toBeNull();
+  });
+});
+
+describe("computeBudgetUsage / budgetTone", () => {
+  const budget: Orchestration["budget"] = {
+    maxInputTokens: 10_000,
+    maxOutputTokens: null,
+    maxEstimatedUsd: null,
+    maxModelCalls: 40,
+    maxSteps: 40,
+    maxWorkerAttempts: 3,
+    maxContextExpansionsPerTask: 3,
+    maxWallClockMs: 1_200_000,
+  };
+
+  it("sums per-role model calls and pairs each meter with its configured cap, leaving uncapped meters at null percent", () => {
+    const usage: UsageLedger = {
+      byRole: {
+        planner: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 50, modelId: "ep-planner", estimatedUsd: null, modelCalls: 1 },
+        worker: { inputTokens: 8_900, cachedInputTokens: 0, outputTokens: 500, modelId: "ep-worker", estimatedUsd: null, modelCalls: 35 },
+      },
+      totalInputTokens: 9_000,
+      totalCachedInputTokens: 0,
+      totalOutputTokens: 550,
+      totalEstimatedUsd: null,
+      pricingStatus: "unknown",
+    };
+    const result = computeBudgetUsage(usage, budget);
+    expect(result.modelCalls).toEqual({ label: "Model calls", used: 36, max: 40, percent: 90 });
+    expect(result.inputTokens).toEqual({ label: "Input tokens", used: 9_000, max: 10_000, percent: 90 });
+    expect(result.outputTokens.max).toBeNull();
+    expect(result.outputTokens.percent).toBeNull();
+  });
+
+  it("caps a meter's percent at 100 even if usage overshoots the configured limit", () => {
+    const usage: UsageLedger = {
+      byRole: {},
+      totalInputTokens: 15_000,
+      totalCachedInputTokens: 0,
+      totalOutputTokens: 0,
+      totalEstimatedUsd: null,
+      pricingStatus: "unknown",
+    };
+    expect(computeBudgetUsage(usage, budget).inputTokens.percent).toBe(100);
+  });
+
+  it("escalates tone only near a meter's own cap, and treats an uncapped meter as informational", () => {
+    expect(budgetTone(null)).toBe("info");
+    expect(budgetTone(50)).toBe("info");
+    expect(budgetTone(75)).toBe("warning");
+    expect(budgetTone(95)).toBe("danger");
+  });
+});
+
+describe("sortOrchestrationsByRecency", () => {
+  it("orders newest first regardless of input order", () => {
+    const older = orchestration({ id: "older", createdAt: "2026-08-30T08:00:00.000Z" });
+    const newer = orchestration({ id: "newer", createdAt: "2026-08-30T10:00:00.000Z" });
+    const middle = orchestration({ id: "middle", createdAt: "2026-08-30T09:00:00.000Z" });
+    expect(sortOrchestrationsByRecency([older, newer, middle]).map((o) => o.id)).toEqual(["newer", "middle", "older"]);
+  });
+});
+
+describe("formatOrchestrationHistoryLabel", () => {
+  it("includes the status and a truncated single-line prompt preview", () => {
+    const label = formatOrchestrationHistoryLabel(
+      orchestration({ status: "completed", prompt: "Add   password\nreset   flow", createdAt: "2026-08-30T10:04:00.000Z" }),
+    );
+    expect(label).toContain("Completed");
+    expect(label).toContain("Add password reset flow");
+    expect(label).not.toMatch(/\n/);
+  });
+
+  it("truncates a long prompt rather than rendering the whole thing", () => {
+    const label = formatOrchestrationHistoryLabel(orchestration({ prompt: "x".repeat(200) }));
+    expect(label.length).toBeLessThan(120);
+    expect(label).toContain("…");
+  });
+
+  it("falls back to a placeholder rather than an empty label for a blank prompt", () => {
+    expect(formatOrchestrationHistoryLabel(orchestration({ prompt: "   " }))).toContain("(no prompt)");
   });
 });

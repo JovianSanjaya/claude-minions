@@ -111,6 +111,79 @@ describe("runWorkerLoop", () => {
     expect(sink.contextPackets).toHaveLength(1);
   });
 
+  it("passes on the first attempt when the worker-visible check is unconfigured (skipped), not just when it explicitly passes", async () => {
+    const source = await tempDir("worker-loop-source-");
+    const scratchRoot = await tempDir("worker-loop-scratch-");
+    const sink = createInMemorySink();
+    const runner = createFakeAgentRunner(async (request) => {
+      if (request.sandboxMode === "read-only") {
+        return { output: preflightPlanJson, threadId: null, usage: null };
+      }
+      await mkdir(path.join(request.workspacePath, "src", "auth"), { recursive: true });
+      await writeFile(path.join(request.workspacePath, "src", "auth", "reset.ts"), "export function reset() {}\n");
+      return { output: "Added reset handler", threadId: null, usage: null };
+    });
+    const packet = buildContextPacket("task-1", emptyMap, 1, ["src/auth"], {});
+
+    const result = await runWorkerLoop(
+      {
+        roleDeps: { runner, sink, modelIds: {}, defaultModelId: "ep-default" },
+        scratchRoot,
+        checkRunner: async (check) => ({
+          status: "skipped",
+          outputSummary: `No trusted command configured for check "${check.name}"`,
+        }),
+      },
+      "orch-1",
+      "agent-1",
+      contract,
+      buildTask(),
+      packet,
+      source,
+      budgetPolicySchema.parse({}),
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe("passed");
+    expect(result.attempts).toBe(1);
+  });
+
+  it("upserts the task's live status through preflight/running/verifying as the attempt progresses, not just once at the end", async () => {
+    const source = await tempDir("worker-loop-source-");
+    const scratchRoot = await tempDir("worker-loop-scratch-");
+    const sink = createInMemorySink();
+    const statusHistory: string[] = [];
+    const originalUpsertTask = sink.upsertTask.bind(sink);
+    sink.upsertTask = async (task) => {
+      statusHistory.push(task.status);
+      await originalUpsertTask(task);
+    };
+    const runner = createFakeAgentRunner(async (request) => {
+      if (request.sandboxMode === "read-only") {
+        return { output: preflightPlanJson, threadId: null, usage: null };
+      }
+      await mkdir(path.join(request.workspacePath, "src", "auth"), { recursive: true });
+      await writeFile(path.join(request.workspacePath, "src", "auth", "reset.ts"), "export function reset() {}\n");
+      return { output: "Added reset handler", threadId: null, usage: null };
+    });
+    const packet = buildContextPacket("task-1", emptyMap, 1, ["src/auth"], {});
+
+    const result = await runWorkerLoop(
+      { roleDeps: { runner, sink, modelIds: {}, defaultModelId: "ep-default" }, scratchRoot, checkRunner: async () => ({ status: "passed", outputSummary: "ok" }) },
+      "orch-1",
+      "agent-1",
+      contract,
+      buildTask(),
+      packet,
+      source,
+      budgetPolicySchema.parse({}),
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe("passed");
+    expect(statusHistory).toEqual(["preflight", "running", "verifying"]);
+  });
+
   it("retries after a failing visible check and then passes on the second attempt", async () => {
     const source = await tempDir("worker-loop-source-");
     const scratchRoot = await tempDir("worker-loop-scratch-");

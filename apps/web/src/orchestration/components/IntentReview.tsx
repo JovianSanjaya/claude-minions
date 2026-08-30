@@ -3,6 +3,7 @@ import type { IntentDraft, Orchestration } from "../contracts";
 import {
   PROVENANCE_LABEL,
   evaluateConfirmationGate,
+  formatElapsedMs,
   formatEstimateRange,
   groupClaimsByProvenance,
 } from "../view-model";
@@ -33,13 +34,21 @@ export interface IntentReviewProps {
   onRevise: (note: string) => void;
   onConfirm: () => void;
   busy: boolean;
+  /** Current wall-clock time (ms) for the live "still working" elapsed display — a real model round-trip can take well over ten seconds, and with no visible motion this looks indistinguishable from stuck. */
+  nowMs: number;
 }
 
-export function IntentReview({ readModel, orchestration, onAnswer, onRevise, onConfirm, busy }: IntentReviewProps) {
+export function IntentReview({ readModel, orchestration, onAnswer, onRevise, onConfirm, busy, nowMs }: IntentReviewProps) {
   const [reviseNote, setReviseNote] = useState("");
   const draft = readModel.currentDraft;
   if (!draft) {
-    return <p className="orch-muted">Elaborating intent…</p>;
+    const elapsed = formatElapsedMs(nowMs - new Date(orchestration.createdAt).getTime());
+    return (
+      <p className="orch-muted orch-elaborating">
+        <span className="orch-pulse-dot orch-pulse" aria-hidden="true" />
+        Elaborating intent — a real model call, this can take a while ({elapsed} so far)…
+      </p>
+    );
   }
 
   const groups = groupClaimsByProvenance(draft);

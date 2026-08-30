@@ -1,14 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { OrchestrationApi } from "./api-port";
-import type { OrchestrationReadModel } from "./contracts";
+import type { Orchestration, OrchestrationReadModel } from "./contracts";
 import { AmendmentBanner } from "./components/AmendmentBanner";
 import { ContractView } from "./components/ContractView";
 import { ExecutionTimeline } from "./components/ExecutionTimeline";
+import { HistoryPicker } from "./components/HistoryPicker";
 import { IntentReview } from "./components/IntentReview";
 import { ModeSelector } from "./components/ModeSelector";
+import { RunProgress } from "./components/RunProgress";
 import { UsageSummary } from "./components/UsageSummary";
 import { createPoller, type Poller } from "./polling";
-import { describeStatus, isTerminalStatus, modeToRequestedMode, type PlaygroundMode } from "./view-model";
+import { describeStatus, isTerminalStatus, modeToRequestedMode, showsRunProgress, type PlaygroundMode } from "./view-model";
+
+/** Re-renders once a second while `active`, purely to keep live elapsed-time displays (e.g. "running 12s") ticking between polls — never itself a source of orchestration data. */
+function useNowTick(active: boolean, intervalMs = 1000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [active, intervalMs]);
+  return now;
+}
 
 export interface OrchestrationPanelProps {
   agentId: string;
@@ -32,6 +45,7 @@ export function OrchestrationPanel({
   const [prompt, setPrompt] = useState("");
   const [orchestrationId, setOrchestrationId] = useState<string | null>(initialOrchestrationId ?? null);
   const [readModel, setReadModel] = useState<OrchestrationReadModel | null>(null);
+  const [history, setHistory] = useState<Orchestration[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pollerRef = useRef<Poller | null>(null);
@@ -71,6 +85,16 @@ export function OrchestrationPanel({
     [api, stopPolling],
   );
 
+  const refreshHistory = useCallback(async () => {
+    try {
+      const { orchestrations } = await api.list(agentId);
+      setHistory(orchestrations);
+      return orchestrations;
+    } catch {
+      return [];
+    }
+  }, [api, agentId]);
+
   // Reset all orchestration state when switching Agents; never carry stale
   // evidence across Agents. If no explicit orchestration was requested,
   // resume the Agent's own most recent non-terminal one (if any) so a
@@ -78,11 +102,16 @@ export function OrchestrationPanel({
   // elaboration never reaching a terminal status — stays reachable and
   // cancellable after a reload, instead of being silently orphaned from the
   // UI while still blocking new orchestrations for that Agent server-side.
+  // The same fetch also seeds the persistent history picker below, so
+  // every past run (not just a still-active one) stays reachable across an
+  // Agent switch or a page reload, instead of only ever surfacing whichever
+  // orchestration happened to be created most recently.
   useEffect(() => {
     stopPolling();
     setReadModel(null);
     setError(null);
     setPrompt("");
+    setHistory([]);
     if (initialOrchestrationId) {
       setOrchestrationId(initialOrchestrationId);
       return;
@@ -93,6 +122,7 @@ export function OrchestrationPanel({
       .list(agentId)
       .then(({ orchestrations }) => {
         if (cancelled) return;
+        setHistory(orchestrations);
         const active = orchestrations.find((item) => !isTerminalStatus(item.status));
         if (active) setOrchestrationId(active.id);
       })
@@ -124,12 +154,19 @@ export function OrchestrationPanel({
       const { orchestration } = await api.create(agentId, { prompt: prompt.trim(), requestedMode: modeToRequestedMode(mode) });
       setPrompt("");
       setOrchestrationId(orchestration.id);
+      void refreshHistory();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setBusy(false);
     }
-  }, [agentId, api, mode, onDirectSend, prompt]);
+  }, [agentId, api, mode, onDirectSend, prompt, refreshHistory]);
+
+  const handleHistorySelect = useCallback((id: string | null) => {
+    setReadModel(null);
+    setError(null);
+    setOrchestrationId(id);
+  }, []);
 
   const withBusyGuard = useCallback(
     (action: () => Promise<unknown>) => async () => {
@@ -139,13 +176,14 @@ export function OrchestrationPanel({
       try {
         await action();
         await refreshOnce(orchestrationId);
+        void refreshHistory();
       } catch (reason) {
         setError(reason instanceof Error ? reason.message : String(reason));
       } finally {
         setBusy(false);
       }
     },
-    [orchestrationId, refreshOnce],
+    [orchestrationId, refreshOnce, refreshHistory],
   );
 
   const handleAnswer = useCallback(
@@ -171,6 +209,7 @@ export function OrchestrationPanel({
 
   const orchestration = readModel?.orchestration ?? null;
   const status = orchestration ? describeStatus(orchestration.status) : null;
+  const nowMs = useNowTick(orchestration ? !isTerminalStatus(orchestration.status) : false);
 
   return (
     <div className="orch-panel">
@@ -183,6 +222,8 @@ export function OrchestrationPanel({
         disabled={agentStatus !== "ready" || busy}
         busy={busy}
       />
+
+      <HistoryPicker orchestrations={history} selectedId={orchestrationId} onSelect={handleHistorySelect} disabled={busy} />
 
       {systemSummary && <p className="orch-system-summary">{systemSummary}</p>}
       {error && (
@@ -220,6 +261,7 @@ export function OrchestrationPanel({
               onRevise={handleRevise}
               onConfirm={handleConfirm}
               busy={busy}
+              nowMs={nowMs}
             />
           )}
 
@@ -234,6 +276,16 @@ export function OrchestrationPanel({
                 busy={busy}
               />
             )}
+
+          {showsRunProgress(orchestration.status, readModel.tasks.length) && (
+            <RunProgress
+              status={orchestration.status}
+              tasks={readModel.tasks}
+              attempts={readModel.attempts}
+              budget={orchestration.budget}
+              nowMs={nowMs}
+            />
+          )}
 
           {orchestration.finalOutput && <p className="orch-final-output">{orchestration.finalOutput}</p>}
           {orchestration.error && <p className="orch-error-summary">{orchestration.error}</p>}

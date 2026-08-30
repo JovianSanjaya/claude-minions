@@ -94,7 +94,10 @@ if [[ -n "${LOCAL_POC_DATA_ROOT:-}" ]]; then
   export AGENT_WORKSPACE_ROOT="$local_state_root/workspaces"
   export CODEX_HOME="$local_state_root/codex-home"
 elif [[ "$(uname -s)" == "Darwin" ]]; then
-  local_state_root="${HOME}/.volc-agent-launchpad"
+  # Not a dot-folder: Finder hides dot-folders by default, and the whole
+  # point of AGENT_WORKSPACE_ROOT living under here is that a judge/user can
+  # browse an Agent's real generated files without extra steps.
+  local_state_root="${HOME}/VolcAgentLaunchpad"
   export APP_DATA_DIR="${APP_DATA_DIR:-$local_state_root/data}"
   export AGENT_WORKSPACE_ROOT="${AGENT_WORKSPACE_ROOT:-$local_state_root/workspaces}"
   export CODEX_HOME="${CODEX_HOME:-$local_state_root/codex-home}"
