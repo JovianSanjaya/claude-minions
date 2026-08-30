@@ -2,7 +2,7 @@
 .orch-header,.orch-title-row,.orch-start,.orch-control-row{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .orch-header{padding:18px 22px;border-bottom:1px solid #e5e3dc}
 .orch-header h2,.orch-card h3{margin:3px 0 0}
-.orch-composer{display:grid;grid-template-columns:minmax(0,1fr) 2fr auto;align-items:end;gap:14px;padding:16px 22px;background:#f5f3ef}
+.orch-composer{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,.7fr) minmax(210px,.9fr) minmax(280px,2fr) auto;align-items:end;gap:14px;padding:16px 22px;background:#f5f3ef}
 .orch-modes{display:flex;border:0;padding:0;margin:0;gap:6px}
 .orch-modes legend{position:absolute;clip:rect(0 0 0 0)}
 .orch-modes label{cursor:pointer;border:1px solid #dad7cf;border-radius:10px;padding:9px 10px;background:#fff}
@@ -11,6 +11,8 @@
 .orch-modes b,.orch-modes small{display:block}
 .orch-modes small{display:none}
 .orch-prompt textarea{margin-top:5px}
+.orch-model-strategy select,.orch-select select{display:block;width:100%;margin-top:5px;border:1px solid #dad7cf;border-radius:9px;padding:9px;background:#fff;color:#292a27}
+.orch-model-strategy small,.orch-select small{display:block;margin-top:4px;color:#77786f;overflow-wrap:anywhere}
 .orch-error{margin:12px 22px;padding:10px;border:1px solid #edc4c0;border-radius:9px;color:#a13f3f;background:#fae8e6;display:flex;justify-content:space-between}
 .orch-error button{border:0;background:none;text-decoration:underline}
 .orch-body{padding:18px 22px;background:#f7f6f2}

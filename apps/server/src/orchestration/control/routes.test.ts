@@ -72,6 +72,43 @@ async function makeApp(auth = false) {
 }
 
 describe("orchestration routes", () => {
+  it("accepts and persists the selected model strategy", async () => {
+    const { app } = await makeApp();
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${AGENT_ID}/orchestrations`,
+      payload: {
+        prompt: "Do work with the big endpoint",
+        requestedMode: "orchestrated",
+        modelStrategy: "big-only",
+        workerRouting: "one-worker",
+      },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(response.json().orchestration.modelStrategy).toBe("big-only");
+    expect(response.json().orchestration.workerRouting).toBe("one-worker");
+
+    await app.close();
+  });
+
+  it("accepts and persists the small-only model strategy", async () => {
+    const { app } = await makeApp();
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/agents/${AGENT_ID}/orchestrations`,
+      payload: {
+        prompt: "Do work with the small endpoint",
+        requestedMode: "orchestrated",
+        modelStrategy: "small-only",
+        workerRouting: "multi-worker",
+      },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(response.json().orchestration.modelStrategy).toBe("small-only");
+    expect(response.json().orchestration.workerRouting).toBe("multi-worker");
+    await app.close();
+  });
+
   it("validates input and maps create/list/read/transition status codes", async () => {
     const { app, service } = await makeApp();
     const malformed = await app.inject({
@@ -87,6 +124,8 @@ describe("orchestration routes", () => {
     expect(accepted.statusCode).toBe(202);
     const id = accepted.json().orchestration.id as string;
     expect(accepted.json().orchestration.requestedMode).toBe("auto");
+    expect(accepted.json().orchestration.modelStrategy).toBe("mixed");
+    expect(accepted.json().orchestration.workerRouting).toBe("adaptive");
     await service.waitForIdle(id);
 
     const revised = await app.inject({

@@ -30,6 +30,7 @@ await service.initialize();
 const executionDriver = new ContextAwareExecutionDriver({
   runner,
   models: config.orchestrationModels,
+  bigModel: config.bigOrchestrationModel,
   runtimeHomeRoot: config.orchestrationRuntimeHomeRoot,
   tempRoot: config.orchestrationTempRoot,
   archiveRoot: config.orchestrationArchiveRoot,

@@ -7,6 +7,7 @@ import type {
   ExecuteInput,
   ExecutionOutcome,
   IntentDraft,
+  ModelStrategy,
   OrchestrationExecutionDriver,
   OrchestrationSink,
   OrchestrationTask,
@@ -86,6 +87,7 @@ const diagnosisSchema = z.object({
 export interface EngineDriverOptions {
   runner: AgentRunner;
   models: RoleModelConfiguration;
+  bigModel?: string;
   runtimeHomeRoot: string;
   tempRoot: string;
   archiveRoot: string;
@@ -139,7 +141,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     sink: OrchestrationSink,
     signal: AbortSignal,
   ): Promise<{ draft: IntentDraft; estimate: CostEstimate }> {
-    const roles = this.roles(input.orchestrationId, sink);
+    const roles = this.roles(input.orchestrationId, sink, input.modelStrategy);
     const result = await roles.structured(
       {
         orchestrationId: input.orchestrationId,
@@ -152,8 +154,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         prompt: [
           "Elaborate the user's intent without editing files. Return only JSON.",
           `Requested mode: ${input.requestedMode}`,
+          `Worker routing preference: ${input.workerRouting}`,
           `Hard budget: ${JSON.stringify(input.budget)}`,
           `User prompt: ${input.prompt}`,
+          "Requirements and acceptance criteria must describe the observable final deliverable. Treat instructions about orchestration mode, model choice, worker count/routing, task decomposition, final reporting, or the platform verifier as execution controls, not product requirements or manual expectations.",
           "Return goal, requirements, assumptions, nonGoals, architectureDecisions, materialQuestions, manualExpectations, and estimate.",
         ].join("\n"),
       },
@@ -182,7 +186,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     const map = await buildApplicationMap(input.workspacePath, input.orchestration.id, 1, this.now());
     this.maps.set(input.orchestration.id, map);
     await sink.recordApplicationMap(map.summary);
-    const roles = this.roles(input.orchestration.id, sink);
+    const roles = this.roles(input.orchestration.id, sink, input.orchestration.modelStrategy);
     const compactContract = {
       version: input.contract.version,
       goal: input.contract.intent.goal,
@@ -210,7 +214,14 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract.",
-          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete, non-destructive, and independently verifiable against the final integrated candidate. Use manual scope only when automation cannot reasonably decide the result.",
+          `Worker routing preference: ${input.orchestration.workerRouting}.`,
+          input.orchestration.workerRouting === "one-worker"
+            ? "Return exactly one implementation task covering the complete confirmed change."
+            : input.orchestration.workerRouting === "multi-worker"
+              ? "Return at least two independent implementation tasks with disjoint allowedPaths and no artificial verification-only task; protected verification is represented in acceptanceTests, not as a worker task."
+              : "Choose a task decomposition appropriate to the contract.",
+          "Also create a comprehensive product acceptance-test plan. Cover confirmed deliverable behavior, important edge/failure cases, file/content constraints, accessibility where requested, persistence where requested, and observable runtime behavior. Every test must cite at least one exact confirmed deliverable criterion ID and be independently verifiable against the final integrated candidate.",
+          "Never create tests for orchestration mode, model choice, worker count/routing, task decomposition, reporting, verifier availability, or whether the verifier itself passes. Do not invent a regression-suite test when the application map shows no existing runnable suite. Missing test infrastructure is not a product failure; use a concrete static or functional procedure instead, or manual scope only when automation genuinely cannot observe the requested behavior.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
           "Return this exact JSON shape with no additional task fields:",
           '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
@@ -242,6 +253,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     });
     const route = selectRoute({
       requestedMode: input.orchestration.requestedMode,
+      workerRouting: input.orchestration.workerRouting,
       taskCount: result.value.tasks.length,
       changedAreaCount: new Set(result.value.tasks.flatMap((task) => task.allowedPaths.map((entry) => entry.split("/")[0]))).size,
       hasOverlappingWriteScopes: tasksHaveOverlappingWriteScopes(result.value.tasks),
@@ -309,7 +321,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
   }
 
   async execute(input: ExecuteInput, sink: OrchestrationSink, signal: AbortSignal): Promise<ExecutionOutcome> {
-    const roles = this.roles(input.orchestration.id, sink);
+    const roles = this.roles(input.orchestration.id, sink, input.orchestration.modelStrategy);
     const map = this.maps.get(input.orchestration.id) ??
       (await buildApplicationMap(input.workspacePath, input.orchestration.id, input.plan.applicationMap.version, this.now()));
     this.maps.set(input.orchestration.id, map);
@@ -522,13 +534,24 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     return (await this.activeRoles.get(orchestrationId)?.cancelOrchestration(orchestrationId)) ?? false;
   }
 
-  private roles(orchestrationId: string, sink: OrchestrationSink): RoleExecutor {
+  private roles(
+    orchestrationId: string,
+    sink: OrchestrationSink,
+    modelStrategy: ModelStrategy,
+  ): RoleExecutor {
     const existing = this.activeRoles.get(orchestrationId);
     if (existing) return existing;
+    const bigModel = this.options.bigModel ?? this.options.models.planner;
+    const smallModel = this.options.models.worker;
+    const models = modelStrategy === "big-only"
+      ? { planner: bigModel, worker: bigModel, verifier: bigModel, integrator: bigModel }
+      : modelStrategy === "small-only"
+        ? { planner: smallModel, worker: smallModel, verifier: smallModel, integrator: smallModel }
+        : this.options.models;
     const roles = new RoleExecutor(
       this.options.runner,
       sink,
-      this.options.models,
+      models,
       this.options.runtimeHomeRoot,
       this.newId,
       this.options.modelCallTimeoutMs,
@@ -639,6 +662,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
             prompt: [
               "Independently verify the integrated candidate. Do not edit any files.",
               "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
+              "Evaluate only observable final-deliverable behavior and constraints in the supplied tests. Do not fail a product because orchestration metadata, worker routing, model choice, final reporting, verifier availability, or nonexistent repository test infrastructure cannot be observed from the candidate workspace.",
               "Return exactly one result for every supplied acceptance test. Passing requires concrete evidence; uncertainty, missing test infrastructure, or an unverified claim must fail.",
               `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
               `Protected planner-generated acceptance tests: ${JSON.stringify(automated)}`,

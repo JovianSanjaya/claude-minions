@@ -12,6 +12,18 @@ export function formatDuration(milliseconds: number): string {
   return minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
+export function executionElapsedMs(
+  view: OrchestrationReadModel,
+  nowMs: number = Date.now(),
+): number | null {
+  const executionStarted = view.events.find((event) => event.type === "execution-started");
+  if (!executionStarted) return null;
+  const finishedAt = view.orchestration.completedAt
+    ? Date.parse(view.orchestration.completedAt)
+    : nowMs;
+  return Math.max(0, finishedAt - Date.parse(executionStarted.createdAt));
+}
+
 export interface OrchestrationProgress {
   percent: number;
   stage: string;

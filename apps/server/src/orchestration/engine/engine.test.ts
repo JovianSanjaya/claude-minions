@@ -96,6 +96,18 @@ describe("engine primitives", () => {
     ])).toBe(false);
   });
 
+  it("honors explicit one-worker and multi-worker routing without bypassing scope safety", () => {
+    expect(selectRoute({ requestedMode: "orchestrated", workerRouting: "one-worker", taskCount: 3, changedAreaCount: 3, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget })).toEqual({
+      selectedMode: "one-worker",
+      reason: "The user explicitly selected one coordinated worker",
+    });
+    expect(selectRoute({ requestedMode: "orchestrated", workerRouting: "multi-worker", taskCount: 3, changedAreaCount: 3, hasOverlappingWriteScopes: false, coupling: "high", estimatedCalls: 8, estimatedContextTokens: 100, budget })).toEqual({
+      selectedMode: "multi-worker",
+      reason: "The user explicitly selected concurrent workers with disjoint writable paths",
+    });
+    expect(selectRoute({ requestedMode: "orchestrated", workerRouting: "multi-worker", taskCount: 3, changedAreaCount: 2, hasOverlappingWriteScopes: true, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("one-worker");
+  });
+
   it("builds a deterministic map, minimizes context, and denies traversal/symlinks", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "engine-map-"));
     temporary.push(root);

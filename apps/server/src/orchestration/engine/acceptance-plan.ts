@@ -26,23 +26,44 @@ function safeTestId(value: string): string {
   return safe.slice(0, 200) || "acceptance-test";
 }
 
+const orchestrationProcessPatterns = [
+  /platform(?:'s)? built-in (?:final )?verifier/i,
+  /worker[- ]routing selection configured in the dashboard/i,
+  /report the generated files and verification results/i,
+  /separate testing or verification (?:implementation )?(?:task|worker)/i,
+  /^required automated checks pass in the trusted verification environment$/i,
+];
+
+function concernsOrchestrationProcess(value: string): boolean {
+  return orchestrationProcessPatterns.some((pattern) => pattern.test(value));
+}
+
 export function comprehensiveAcceptanceTests(
   proposed: readonly PlannedAcceptanceTest[],
   contract: ExecutionContract,
 ): PlannedAcceptanceTest[] {
-  const criteria = new Map(contract.criteria.map((criterion) => [criterion.id, criterion]));
+  const criteria = new Map(
+    contract.criteria
+      .filter((criterion) => !concernsOrchestrationProcess(criterion.description))
+      .map((criterion) => [criterion.id, criterion]),
+  );
   const usedIds = new Set<string>();
   const normalized: PlannedAcceptanceTest[] = [];
   for (const proposedTest of proposed) {
+    const testText = `${proposedTest.title}\n${proposedTest.procedure}\n${proposedTest.expectedOutcome}`;
+    if (concernsOrchestrationProcess(testText)) continue;
+    const criterionIds = [...new Set(proposedTest.criterionIds.filter((criterionId) => criteria.has(criterionId)))];
+    // Every blocking planner-generated check must be traceable to a confirmed
+    // deliverable criterion. Platform-wide checks are owned by VerificationService.
+    if (!criterionIds.length) continue;
     let id = safeTestId(proposedTest.id);
     for (let suffix = 2; usedIds.has(id); suffix += 1) id = `${safeTestId(proposedTest.id)}-${suffix}`;
     usedIds.add(id);
-    const criterionIds = [...new Set(proposedTest.criterionIds.filter((criterionId) => criteria.has(criterionId)))];
     normalized.push({ ...proposedTest, id, criterionIds });
   }
 
   const covered = new Set(normalized.flatMap((test) => test.criterionIds));
-  for (const criterion of contract.criteria) {
+  for (const criterion of criteria.values()) {
     if (covered.has(criterion.id)) continue;
     const manual = criterion.verification === "manual" || criterion.kind === "manual";
     let id = safeTestId(`criterion-${criterion.id}`);
@@ -61,16 +82,5 @@ export function comprehensiveAcceptanceTests(
     });
   }
 
-  if (!normalized.some((test) => test.category === "regression")) {
-    normalized.push({
-      id: "existing-regression-suite",
-      title: "Existing regression suite remains healthy",
-      criterionIds: [],
-      category: "regression",
-      scope: "global",
-      procedure: "Discover and run the repository's existing automated checks that are relevant and safe in the candidate workspace. If none exist, inspect for obvious regressions and report that limitation.",
-      expectedOutcome: "Existing relevant tests, type checks, builds, and static checks pass, or the absence of such checks is explicitly reported as a failed verification gap.",
-    });
-  }
   return normalized.slice(0, 200);
 }

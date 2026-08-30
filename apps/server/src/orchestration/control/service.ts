@@ -9,6 +9,7 @@ import type {
   ExecutionContract,
   IntentDraft,
   ModelCallReservation,
+  ModelStrategy,
   Orchestration,
   OrchestrationEvent,
   OrchestrationExecutionDriver,
@@ -20,6 +21,7 @@ import type {
   TokenUsage,
   VerificationRecord,
   WorkerAttempt,
+  WorkerRoutingPreference,
 } from "../contracts.js";
 import {
   commitUsageToDatabase,
@@ -73,6 +75,8 @@ export interface OrchestrationServiceOptions {
 export interface CreateOrchestrationInput {
   prompt: string;
   requestedMode: RequestedExecutionMode;
+  modelStrategy?: ModelStrategy;
+  workerRouting?: WorkerRoutingPreference;
   budget?: Partial<BudgetPolicy>;
 }
 
@@ -114,8 +118,8 @@ export class BudgetExhaustedError extends Error {
 }
 
 const DEFAULT_BUDGET: BudgetPolicy = {
-  maxInputTokens: 1_000_000,
-  maxOutputTokens: 250_000,
+  maxInputTokens: 5_000_000,
+  maxOutputTokens: 1_000_000,
   maxEstimatedUsd: null,
   maxModelCalls: 100,
   maxSteps: 250,
@@ -293,6 +297,19 @@ export class OrchestrationControlService implements OrchestrationSink {
     if (!["auto", "direct", "orchestrated"].includes(input.requestedMode)) {
       throw new OrchestrationInputError("Unknown requested execution mode");
     }
+    const modelStrategy = input.modelStrategy ?? "mixed";
+    if (!["mixed", "big-only", "small-only"].includes(modelStrategy)) {
+      throw new OrchestrationInputError("Unknown model strategy");
+    }
+    const workerRouting = input.workerRouting ?? "adaptive";
+    if (!["adaptive", "one-worker", "multi-worker"].includes(workerRouting)) {
+      throw new OrchestrationInputError("Unknown worker-routing preference");
+    }
+    if (input.requestedMode !== "orchestrated" && workerRouting !== "adaptive") {
+      throw new OrchestrationSemanticError(
+        "Explicit worker routing requires Orchestrated execution mode",
+      );
+    }
     const agent = await this.requireRunnableAgent(agentId);
     const prompt = input.prompt.trim();
     if (!prompt || prompt.length > 50_000) {
@@ -306,6 +323,8 @@ export class OrchestrationControlService implements OrchestrationSink {
       agentId,
       prompt: redactString(prompt, 50_000),
       requestedMode: input.requestedMode,
+      modelStrategy,
+      workerRouting,
       selectedMode: null,
       status: "drafting-intent",
       currentIntentDraftId: null,
@@ -333,6 +352,8 @@ export class OrchestrationControlService implements OrchestrationSink {
       database.events.push(
         this.makeEvent(id, "orchestration-created", "Orchestration created and intent elaboration queued", {
           requestedMode: input.requestedMode,
+          modelStrategy,
+          workerRouting,
         }),
       );
       this.setCleanup(database, id, "pending", "No worker temporary state has been created yet");
@@ -607,7 +628,7 @@ export class OrchestrationControlService implements OrchestrationSink {
       const orchestration = findOrchestration(database, reservation.orchestrationId);
       const budgetReason =
         orchestration.budget.maxInputTokens !== null &&
-        orchestration.usage.totalInputTokens + orchestration.usage.totalCachedInputTokens > orchestration.budget.maxInputTokens
+        orchestration.usage.totalInputTokens > orchestration.budget.maxInputTokens
           ? "Actual input-token usage exceeded the hard budget"
           : orchestration.budget.maxOutputTokens !== null && orchestration.usage.totalOutputTokens > orchestration.budget.maxOutputTokens
             ? "Actual output-token usage exceeded the hard budget"
@@ -757,6 +778,8 @@ export class OrchestrationControlService implements OrchestrationSink {
         agentId: orchestration.agentId,
         prompt: redactString(promptOverride ?? orchestration.prompt, 50_000),
         requestedMode: orchestration.requestedMode,
+        modelStrategy: orchestration.modelStrategy,
+        workerRouting: orchestration.workerRouting,
         budget: orchestration.budget,
         workspacePath,
       },

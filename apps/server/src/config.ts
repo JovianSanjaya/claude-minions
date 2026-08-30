@@ -115,6 +115,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     verifier: env.ORCHESTRATION_VERIFIER_MODEL?.trim() || bigOrchestrationModel,
     integrator: env.ORCHESTRATION_INTEGRATOR_MODEL?.trim() || bigOrchestrationModel,
   };
+  const orchestrationRoles = ["planner", "worker", "verifier", "integrator"] as const;
+  const orchestrationPricing = env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined
+    ? orchestrationRoles.flatMap((role) =>
+        [...new Set([orchestrationModels[role], bigOrchestrationModel])].map((modelId) => ({
+          role,
+          modelId,
+          inputUsdPerMillion: env.ARK_INPUT_USD_PER_MILLION!,
+          cachedInputUsdPerMillion: env.ARK_CACHED_INPUT_USD_PER_MILLION!,
+          outputUsdPerMillion: env.ARK_OUTPUT_USD_PER_MILLION!,
+        })),
+      )
+    : [];
   return {
     host: env.HOST,
     port: env.PORT,
@@ -140,6 +152,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     authToken,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel,
+    bigOrchestrationModel,
+    smallOrchestrationModel,
     orchestrationModels,
     orchestrationRuntimeHomeRoot: path.resolve(
       env.ORCHESTRATION_RUNTIME_HOME_ROOT?.trim() || path.join(dataDirectory, "orchestration-runtime-homes"),
@@ -154,8 +168,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       env.ORCHESTRATION_PROTECTED_EVALUATOR_ROOT?.trim() || path.join(dataDirectory, "protected-evaluators"),
     ),
     orchestrationDefaultBudget: {
-      maxInputTokens: env.ORCHESTRATION_MAX_INPUT_TOKENS ?? 1_000_000,
-      maxOutputTokens: env.ORCHESTRATION_MAX_OUTPUT_TOKENS ?? 250_000,
+      maxInputTokens: env.ORCHESTRATION_MAX_INPUT_TOKENS ?? 5_000_000,
+      maxOutputTokens: env.ORCHESTRATION_MAX_OUTPUT_TOKENS ?? 1_000_000,
       maxEstimatedUsd: env.ORCHESTRATION_MAX_ESTIMATED_USD ?? null,
       maxModelCalls: env.ORCHESTRATION_MAX_MODEL_CALLS ?? 100,
       maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 250,
@@ -163,9 +177,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       maxContextExpansionsPerTask: env.ORCHESTRATION_MAX_CONTEXT_EXPANSIONS ?? 3,
       maxWallClockMs: env.ORCHESTRATION_MAX_WALL_CLOCK_MS ?? 1_800_000,
     },
-    orchestrationPricing: env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined
-      ? (["planner", "worker", "verifier", "integrator"] as const).map((role) => ({ role, modelId: orchestrationModels[role], inputUsdPerMillion: env.ARK_INPUT_USD_PER_MILLION!, cachedInputUsdPerMillion: env.ARK_CACHED_INPUT_USD_PER_MILLION!, outputUsdPerMillion: env.ARK_OUTPUT_USD_PER_MILLION! }))
-      : [],
+    orchestrationPricing,
     orchestrationDemoFixture: env.ORCHESTRATION_DEMO_FIXTURE,
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
     nodeEnv: env.NODE_ENV,

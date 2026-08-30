@@ -18,7 +18,7 @@ const pricing: ModelPricing[] = [{
 }];
 
 const orchestration = (): Orchestration => ({
-  id: "o1", agentId: "a1", prompt: "work", requestedMode: "auto",
+  id: "o1", agentId: "a1", prompt: "work", requestedMode: "auto", modelStrategy: "mixed", workerRouting: "adaptive",
   selectedMode: null, status: "running", currentIntentDraftId: null,
   activeContractId: null, estimate: null,
   budget: {
@@ -64,6 +64,14 @@ describe("budget ledger", () => {
       allowed: false, reason: "Input-token budget exhausted",
     });
     item.budget.maxInputTokens = 1_000;
+    item.usage.totalInputTokens = 800;
+    item.usage.totalCachedInputTokens = 700;
+    expect(decideReservation(item, [], { ...reservation, estimatedInputTokens: 200 }, pricing, 5_000).decision.allowed)
+      .toBe(true);
+    expect(decideReservation(item, [], { ...reservation, estimatedInputTokens: 201 }, pricing, 5_000).decision)
+      .toMatchObject({ allowed: false, reason: "Input-token budget exhausted" });
+    item.usage.totalInputTokens = 0;
+    item.usage.totalCachedInputTokens = 0;
     expect(decideReservation(item, [], reservation, pricing, 10_000).decision).toMatchObject({
       allowed: false, reason: "Wall-clock budget exhausted",
     });
@@ -81,9 +89,20 @@ describe("budget ledger", () => {
     expect(database.orchestrations[0]!.usage).toMatchObject({
       totalInputTokens: 400, totalCachedInputTokens: 100, totalOutputTokens: 50,
       pricingStatus: "configured",
-      byRole: { worker: { modelCalls: 1, estimatedUsd: 0.00051 } },
+      byRole: { worker: { modelCalls: 1, estimatedUsd: 0.00041 } },
     });
     expect(actualUsageCost({ inputTokens: 1, cachedInputTokens: 1, outputTokens: 1 }, "worker", "unknown", pricing)).toBeNull();
+  });
+
+  it("rejects impossible cached-token usage", () => {
+    const database = emptyOrchestrationDatabase();
+    database.orchestrations.push(orchestration());
+    database.reservations.push({
+      ...reservation, id: "r1", estimatedUsd: 0, createdAt: new Date(0).toISOString(),
+    });
+    expect(() => commitUsageToDatabase(database, "r1", {
+      inputTokens: 10, cachedInputTokens: 11, outputTokens: 0,
+    }, pricing)).toThrow("cachedInputTokens may not exceed inputTokens");
   });
 
   it("preserves unknown pricing instead of fabricating dollars", () => {

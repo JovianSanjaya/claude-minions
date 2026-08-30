@@ -16,6 +16,8 @@ describe("orchestration model configuration", () => {
       verifier: "ep-big",
       integrator: "ep-big",
     });
+    expect(config.bigOrchestrationModel).toBe("ep-big");
+    expect(config.smallOrchestrationModel).toBe("ep-small");
   });
 
   it("keeps advanced per-role overrides and falls back safely", () => {
@@ -45,5 +47,25 @@ describe("orchestration model configuration", () => {
       verifier: "ep-default",
       integrator: "ep-default",
     });
+    expect(config.orchestrationDefaultBudget).toMatchObject({
+      maxInputTokens: 5_000_000,
+      maxOutputTokens: 1_000_000,
+    });
+  });
+
+  it("configures pricing for mixed and big-only role assignments", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      ARK_MODEL: "ep-default",
+      ORCHESTRATION_BIG_MODEL: "ep-big",
+      ORCHESTRATION_SMALL_MODEL: "ep-small",
+      ARK_INPUT_USD_PER_MILLION: "1",
+      ARK_CACHED_INPUT_USD_PER_MILLION: "0.5",
+      ARK_OUTPUT_USD_PER_MILLION: "2",
+    });
+    expect(config.orchestrationPricing).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "worker", modelId: "ep-small" }),
+      expect.objectContaining({ role: "worker", modelId: "ep-big" }),
+    ]));
   });
 });

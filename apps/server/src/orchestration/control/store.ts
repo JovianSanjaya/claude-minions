@@ -85,6 +85,8 @@ const orchestrationSchema = z.object({
   agentId: z.string().min(1),
   prompt: z.string(),
   requestedMode: z.enum(["auto", "direct", "orchestrated"]),
+  modelStrategy: z.enum(["mixed", "big-only", "small-only"]).default("mixed"),
+  workerRouting: z.enum(["adaptive", "one-worker", "multi-worker"]).default("adaptive"),
   selectedMode: z.enum(["direct", "one-worker", "multi-worker"]).nullable(),
   status: z.enum([
     "drafting-intent",

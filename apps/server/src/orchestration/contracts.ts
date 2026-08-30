@@ -1,6 +1,8 @@
 export type RequestedExecutionMode = "auto" | "direct" | "orchestrated";
 export type SelectedExecutionMode = "direct" | "one-worker" | "multi-worker";
 export type ModelRole = "planner" | "worker" | "verifier" | "integrator";
+export type ModelStrategy = "mixed" | "big-only" | "small-only";
+export type WorkerRoutingPreference = "adaptive" | "one-worker" | "multi-worker";
 
 export type OrchestrationStatus =
   | "drafting-intent"
@@ -120,6 +122,8 @@ export interface Orchestration {
   agentId: string;
   prompt: string;
   requestedMode: RequestedExecutionMode;
+  modelStrategy: ModelStrategy;
+  workerRouting: WorkerRoutingPreference;
   selectedMode: SelectedExecutionMode | null;
   status: OrchestrationStatus;
   currentIntentDraftId: string | null;
@@ -281,6 +285,8 @@ export interface ElaborateIntentInput {
   agentId: string;
   prompt: string;
   requestedMode: RequestedExecutionMode;
+  modelStrategy: ModelStrategy;
+  workerRouting: WorkerRoutingPreference;
   budget: BudgetPolicy;
   workspacePath: string;
 }

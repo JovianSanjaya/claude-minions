@@ -43,6 +43,8 @@ const createBody = z
   .object({
     prompt: z.string().trim().min(1).max(50_000),
     requestedMode: z.enum(["auto", "direct", "orchestrated"]).optional(),
+    modelStrategy: z.enum(["mixed", "big-only", "small-only"]).optional(),
+    workerRouting: z.enum(["adaptive", "one-worker", "multi-worker"]).optional(),
     budget: budgetSchema.optional(),
   })
   .strict();
@@ -82,6 +84,8 @@ export function registerOrchestrationRoutes(
     const orchestration = await service.createOrchestration(agentId, {
       prompt: body.prompt,
       requestedMode: body.requestedMode ?? "auto",
+      modelStrategy: body.modelStrategy ?? "mixed",
+      workerRouting: body.workerRouting ?? "adaptive",
       ...(budget ? { budget } : {}),
     });
     return reply.code(202).send({ orchestration });

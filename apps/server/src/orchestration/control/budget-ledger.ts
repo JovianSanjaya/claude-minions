@@ -60,9 +60,11 @@ export function actualUsageCost(
 ): number | null {
   const rate = findPricing(pricing, role, modelId);
   if (!rate) return null;
+  const cachedInputTokens = Math.min(usage.inputTokens, usage.cachedInputTokens);
+  const uncachedInputTokens = usage.inputTokens - cachedInputTokens;
   return (
-    (usage.inputTokens * rate.inputUsdPerMillion +
-      usage.cachedInputTokens * rate.cachedInputUsdPerMillion +
+    (uncachedInputTokens * rate.inputUsdPerMillion +
+      cachedInputTokens * rate.cachedInputUsdPerMillion +
       usage.outputTokens * rate.outputUsdPerMillion) /
     1_000_000
   );
@@ -150,7 +152,6 @@ export function decideReservation(
   if (
     orchestration.budget.maxInputTokens !== null &&
     orchestration.usage.totalInputTokens +
-      orchestration.usage.totalCachedInputTokens +
       reservedInput +
       input.estimatedInputTokens >
       orchestration.budget.maxInputTokens
@@ -191,6 +192,9 @@ export function commitUsageToDatabase(
   assertCount(actual.inputTokens, "inputTokens");
   assertCount(actual.cachedInputTokens, "cachedInputTokens");
   assertCount(actual.outputTokens, "outputTokens");
+  if (actual.cachedInputTokens > actual.inputTokens) {
+    throw new InvalidBudgetValueError("cachedInputTokens may not exceed inputTokens");
+  }
   const reservationIndex = database.reservations.findIndex(
     (entry) => entry.id === reservationId,
   );

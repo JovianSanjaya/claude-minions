@@ -62,7 +62,7 @@ const intent = {
 function orchestration(workspace: string): Orchestration {
   return {
     id: "orchestration-1", agentId: "agent-1", prompt: "Add A and B",
-    requestedMode: "orchestrated", selectedMode: null, status: "planning",
+    requestedMode: "orchestrated", modelStrategy: "mixed", workerRouting: "adaptive", selectedMode: null, status: "planning",
     currentIntentDraftId: "intent-1", activeContractId: "contract-1",
     estimate: intent.estimate,
     budget: {
@@ -90,14 +90,14 @@ function contract(): ExecutionContract {
 
 function fakeRunner(
   failWorkers = false,
-  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [],
+  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; modelId: string | undefined; prompt: string }> = [],
   badPreflightOnce = false,
   failAcceptance = false,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, role: request.role, prompt: request.prompt });
+      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, role: request.role, modelId: request.modelId, prompt: request.prompt });
       let output: string;
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
@@ -186,7 +186,7 @@ async function setup(failWorkers = false, failGlobal = false, badPreflightOnce =
     const hasB = await readFile(path.join(candidate, "src", "b.ts"), "utf8").then(() => true).catch(() => false);
     return { passed: hasA || hasB, summary: hasA || hasB ? "visible pass" : "expected task file missing" };
   };
-  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; prompt: string }> = [];
+  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; role: string | undefined; modelId: string | undefined; prompt: string }> = [];
   const driver = new ContextAwareExecutionDriver({
     runner: fakeRunner(failWorkers, calls, badPreflightOnce, failAcceptance),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
@@ -210,7 +210,9 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const item = orchestration(workspace);
     const elaborated = await driver.elaborateIntent({
       orchestrationId: item.id, agentId: item.agentId, prompt: item.prompt,
-      requestedMode: item.requestedMode, budget: item.budget, workspacePath: workspace,
+      requestedMode: item.requestedMode, modelStrategy: item.modelStrategy,
+      workerRouting: item.workerRouting,
+      budget: item.budget, workspacePath: workspace,
     }, sink, signal);
     expect(elaborated.draft.goal).toBe("Add two modules");
     const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
@@ -229,8 +231,9 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect.arrayContaining(["worker-visible", "protected", "global"]),
     );
     expect(sink.verifications.map((record) => record.commandOrCheck)).toEqual(
-      expect.arrayContaining(["Module A works", "Module B works", "Regression checks pass"]),
+      expect.arrayContaining(["Module A works", "Module B works"]),
     );
+    expect(sink.verifications.map((record) => record.commandOrCheck)).not.toContain("Regression checks pass");
     expect(sink.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "acceptance-plan-created", actorRole: "planner", modelId: "strong" }),
       expect.objectContaining({ type: "acceptance-verification-completed", actorRole: "verifier", modelId: "verify" }),
@@ -246,6 +249,48 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
         .toBeLessThan(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write"));
     }
+  });
+
+  it("routes every logical role through the big endpoint for big-only runs", async () => {
+    const { workspace, driver, calls } = await setup();
+    const sink = new Sink();
+    const signal = new AbortController().signal;
+    const item = orchestration(workspace);
+    item.modelStrategy = "big-only";
+    await driver.elaborateIntent({
+      orchestrationId: item.id, agentId: item.agentId, prompt: item.prompt,
+      requestedMode: item.requestedMode, modelStrategy: item.modelStrategy,
+      workerRouting: item.workerRouting,
+      budget: item.budget, workspacePath: workspace,
+    }, sink, signal);
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+    expect(outcome.kind).toBe("completed");
+    expect(new Set(calls.map((call) => call.modelId))).toEqual(new Set(["strong"]));
+    expect(new Set(calls.map((call) => call.role))).toEqual(
+      new Set(["planner", "worker", "verifier"]),
+    );
+  });
+
+  it("routes every logical role through the small endpoint for small-only runs", async () => {
+    const { workspace, driver, calls } = await setup();
+    const sink = new Sink();
+    const signal = new AbortController().signal;
+    const item = orchestration(workspace);
+    item.modelStrategy = "small-only";
+    await driver.elaborateIntent({
+      orchestrationId: item.id, agentId: item.agentId, prompt: item.prompt,
+      requestedMode: item.requestedMode, modelStrategy: item.modelStrategy,
+      workerRouting: item.workerRouting,
+      budget: item.budget, workspacePath: workspace,
+    }, sink, signal);
+    const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
+    const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
+    expect(outcome.kind).toBe("completed");
+    expect(new Set(calls.map((call) => call.modelId))).toEqual(new Set(["cheap"]));
+    expect(new Set(calls.map((call) => call.role))).toEqual(
+      new Set(["planner", "worker", "verifier"]),
+    );
   });
 
   it("bounds repeated failure, emits compact escalation, and never publishes", async () => {

@@ -488,10 +488,13 @@ export default function App() {
             )}
 
             <OrchestrationPanel
+              key={selected.id}
               agentId={selected.id}
               agentStatus={selected.status}
               api={orchestrationApi}
               onDirectSend={sendDirectPrompt}
+              bigModelId={system?.orchestrationBigModel}
+              smallModelId={system?.orchestrationSmallModel}
               onTerminal={refreshAgents}
             />
 

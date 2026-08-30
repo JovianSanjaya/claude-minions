@@ -2,10 +2,12 @@ import type {
   BudgetPolicy,
   RequestedExecutionMode,
   SelectedExecutionMode,
+  WorkerRoutingPreference,
 } from "../contracts.js";
 
 export interface RoutingFacts {
   requestedMode: RequestedExecutionMode;
+  workerRouting?: WorkerRoutingPreference;
   taskCount: number;
   changedAreaCount: number;
   hasOverlappingWriteScopes: boolean;
@@ -56,11 +58,31 @@ export function selectRoute(facts: RoutingFacts): RouteDecision {
   if (facts.requestedMode === "direct") {
     return { selectedMode: "direct", reason: "The user explicitly selected direct execution" };
   }
+  const workerRouting = facts.requestedMode === "orchestrated"
+    ? facts.workerRouting ?? "adaptive"
+    : "adaptive";
   if (facts.hasOverlappingWriteScopes) {
     return {
       selectedMode: "one-worker",
       reason: "Planned tasks share writable paths, so one coordinated worker avoids conflicting edits",
     };
+  }
+  if (workerRouting === "one-worker") {
+    return {
+      selectedMode: "one-worker",
+      reason: "The user explicitly selected one coordinated worker",
+    };
+  }
+  if (workerRouting === "multi-worker") {
+    return facts.taskCount >= 2
+      ? {
+          selectedMode: "multi-worker",
+          reason: "The user explicitly selected concurrent workers with disjoint writable paths",
+        }
+      : {
+          selectedMode: "one-worker",
+          reason: "Multi-worker was requested, but the planner produced fewer than two safe tasks",
+        };
   }
   if (facts.taskCount <= 1 || facts.coupling === "high") {
     return {
