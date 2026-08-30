@@ -1,6 +1,85 @@
+/**
+ * DEVIATIONS FROM THE ORIGINAL APPENDIX A TEXT (documented per the spec's
+ * "smallest coherent change" rule — see docs/handoffs/task-1-control-plane.md
+ * and docs/handoffs/task-2-engine.md for full rationale):
+ *
+ * 1. `IntentDraft`'s five claim arrays (`requirements`, `assumptions`,
+ *    `nonGoals`, `architectureDecisions`, `manualExpectations`) changed
+ *    element type from `string` to `IntentClaim`, and `materialQuestions:
+ *    string[]` was renamed/retyped to `openQuestions: ClarificationQuestion[]`.
+ *    This is the core of the common-ground redesign: provenance
+ *    (user-explicit / planner-inferred / repository-derived / user-delegated)
+ *    must be inspectable per claim, not collapsed into an opaque string.
+ * 2. `ContractCriterion` gained `provenance` and `sourceClaimId` so a
+ *    confirmed contract can answer "why does the system believe this is
+ *    part of the contract" by tracing a criterion back to its source claim.
+ * 3. `ElaborateIntentInput` gained `priorDraft: IntentDraft | null` so a
+ *    revision/re-elaboration call can ground itself in what was already
+ *    established instead of starting over from the raw prompt each time.
+ *
+ * Nothing else in this file changed. All other types, and all four
+ * `OrchestrationExecutionDriver` method signatures, are unchanged.
+ */
+
 export type RequestedExecutionMode = "auto" | "direct" | "orchestrated";
 export type SelectedExecutionMode = "direct" | "one-worker" | "multi-worker";
 export type ModelRole = "planner" | "worker" | "verifier" | "integrator";
+
+/** Where a piece of intent came from — the core of the common-ground design. */
+export type IntentProvenance =
+  | "user-explicit"
+  | "planner-inferred"
+  | "repository-derived"
+  | "user-delegated";
+
+/**
+ * Two levels only, deliberately: this is a control input, not a cosmetic
+ * confidence score. "material" means unresolved ambiguity here can block
+ * confirmation; "trivial" means the control plane may resolve it
+ * autonomously without interrupting the user.
+ */
+export type IntentMateriality = "trivial" | "material";
+
+/** Which claim array on an IntentDraft a clarification question resolves into. */
+export type IntentCategory =
+  | "requirements"
+  | "assumptions"
+  | "nonGoals"
+  | "architectureDecisions"
+  | "manualExpectations";
+
+export interface IntentClaim {
+  id: string;
+  text: string;
+  provenance: IntentProvenance;
+  materiality: IntentMateriality;
+  /** Why the planner believes this; null when provenance is user-supplied. */
+  rationale: string | null;
+  /** id of a prior claim (from an earlier draft revision) this one replaces, if any. */
+  supersedes: string | null;
+}
+
+export interface ClarificationOption {
+  id: string;
+  label: string;
+  /** The concrete claim text this option asserts if chosen. */
+  resolutionText: string;
+  /** True for the "let the AI decide" option. */
+  delegate: boolean;
+}
+
+export interface ClarificationQuestion {
+  id: string;
+  prompt: string;
+  /** The planner's own materiality judgment; the control plane re-checks it (see clarification-policy.ts). */
+  materiality: IntentMateriality;
+  /** What could go wrong if this is misunderstood — shown to the user, and used by the safety-net policy check. */
+  consequenceIfWrong: string;
+  options: ClarificationOption[];
+  /** Which IntentDraft array the resolution claim is appended to. */
+  category: IntentCategory;
+  relatedClaimIds: string[];
+}
 
 export type OrchestrationStatus =
   | "drafting-intent"
@@ -75,6 +154,9 @@ export interface ContractCriterion {
   kind: "functional" | "architectural" | "scope" | "runtime" | "manual";
   description: string;
   verification: "visible-test" | "protected-test" | "static-check" | "manual";
+  provenance: IntentProvenance;
+  /** id of the IntentClaim this criterion was derived from; null for control-plane-imposed baseline criteria. */
+  sourceClaimId: string | null;
 }
 
 export interface IntentDraft {
@@ -82,12 +164,12 @@ export interface IntentDraft {
   orchestrationId: string;
   revision: number;
   goal: string;
-  requirements: string[];
-  assumptions: string[];
-  nonGoals: string[];
-  architectureDecisions: string[];
-  materialQuestions: string[];
-  manualExpectations: string[];
+  requirements: IntentClaim[];
+  assumptions: IntentClaim[];
+  nonGoals: IntentClaim[];
+  architectureDecisions: IntentClaim[];
+  manualExpectations: IntentClaim[];
+  openQuestions: ClarificationQuestion[];
   createdAt: string;
 }
 
@@ -283,6 +365,8 @@ export interface ElaborateIntentInput {
   requestedMode: RequestedExecutionMode;
   budget: BudgetPolicy;
   workspacePath: string;
+  /** The current draft, when this call is a revision/re-elaboration rather than the first pass. */
+  priorDraft: IntentDraft | null;
 }
 
 export interface PlanInput {

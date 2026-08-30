@@ -13,6 +13,7 @@ import type {
 const execFileAsync = promisify(execFile);
 
 interface ActiveContainer {
+  agentId: string;
   child: ChildProcess;
   containerName: string;
   cancelled: boolean;
@@ -29,17 +30,24 @@ interface ParsedEvents {
   errors: string[];
 }
 
-export function containerName(agentId: string, instanceId = "default"): string {
+export function containerName(
+  agentId: string,
+  instanceId = "default",
+  executionId?: string,
+): string {
   const safeInstance = instanceId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 32);
   const safeAgent = agentId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 48);
-  return "launchpad-" + safeInstance + "-" + safeAgent;
+  const base = "launchpad-" + safeInstance + "-" + safeAgent;
+  if (!executionId) return base;
+  const safeExecution = executionId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 24);
+  return base + "-" + safeExecution;
 }
 
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
 ): string[] {
-  const name = containerName(request.agentId, config.runtimeInstanceId);
+  const name = containerName(request.agentId, config.runtimeInstanceId, request.executionId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
   return [
     "run",
@@ -53,6 +61,7 @@ export function buildContainerRunArgs(
     "io.codejam.agent-id=" + request.agentId,
     "--label",
     "io.codejam.instance-id=" + config.runtimeInstanceId,
+    ...(request.executionId ? ["--label", "io.codejam.execution-id=" + request.executionId] : []),
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
     "--network",
     "bridge",
@@ -110,13 +119,17 @@ export class ContainerCodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
-    if (!active) return false;
+  async cancel(agentId: string, executionId?: string): Promise<boolean> {
+    const targets = executionId
+      ? [this.active.get(executionId)].filter((item): item is ActiveContainer => Boolean(item))
+      : [...this.active.values()].filter((item) => item.agentId === agentId);
+    if (targets.length === 0) return false;
 
-    active.cancelled = true;
-    await this.removeContainer(active);
-    await active.settled;
+    for (const active of targets) {
+      active.cancelled = true;
+    }
+    await Promise.all(targets.map((active) => this.removeContainer(active)));
+    await Promise.all(targets.map((active) => active.settled));
     return true;
   }
 
@@ -138,7 +151,8 @@ export class ContainerCodexRunner implements AgentRunner {
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
+    const key = request.executionId ?? request.agentId;
+    if (this.active.has(key)) {
       throw new Error("Agent already has an active Runtime container");
     }
 
@@ -156,15 +170,16 @@ export class ContainerCodexRunner implements AgentRunner {
       child.once("error", () => resolve());
     });
     const active: ActiveContainer = {
+      agentId: request.agentId,
       child,
-      containerName: containerName(request.agentId, this.config.runtimeInstanceId),
+      containerName: containerName(request.agentId, this.config.runtimeInstanceId, request.executionId),
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
       settled,
       termination: null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(key, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -231,7 +246,7 @@ export class ContainerCodexRunner implements AgentRunner {
       return { output, threadId: parsed.threadId, usage: parsed.usage };
     } finally {
       clearTimeout(timeout);
-      this.active.delete(request.agentId);
+      this.active.delete(key);
     }
   }
 

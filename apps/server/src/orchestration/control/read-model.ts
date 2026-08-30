@@ -10,14 +10,19 @@ export interface OrchestrationReadModel {
   contractHistory: OrchestrationDb["contracts"];
   amendments: OrchestrationDb["amendments"];
   pendingAmendment: OrchestrationDb["amendments"][number] | null;
+  applicationMap: OrchestrationDb["applicationMaps"][number] | null;
+  tasks: OrchestrationDb["tasks"];
+  artifacts: OrchestrationDb["artifacts"];
+  verifications: OrchestrationDb["verifications"];
+  attempts: OrchestrationDb["attempts"];
+  events: OrchestrationDb["events"];
 }
 
 /**
- * Builds the safe, browser-facing view of an orchestration: current state,
- * intent draft history, confirmed contract history, and amendments. Never
- * includes protected evaluator source, secrets, or hidden reasoning — those
- * simply do not exist in this restricted build's persisted collections, and
- * `redactDeep` is applied defensively regardless.
+ * Builds the safe, browser-facing view of an orchestration. Never includes
+ * protected evaluator source, secrets, or hidden reasoning — `redactDeep` is
+ * applied defensively to every collection regardless of whether redaction
+ * already happened at write time.
  */
 export function buildOrchestrationReadModel(
   db: OrchestrationDb,
@@ -41,6 +46,23 @@ export function buildOrchestrationReadModel(
     .filter((amendment) => amendment.orchestrationId === orchestrationId)
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   const pendingAmendment = amendments.find((amendment) => amendment.status === "pending") ?? null;
+  const applicationMaps = db.applicationMaps
+    .filter((map) => map.orchestrationId === orchestrationId)
+    .sort((left, right) => right.version - left.version);
+  const applicationMap = applicationMaps[0] ?? null;
+  const tasks = db.tasks.filter((task) => task.orchestrationId === orchestrationId);
+  const artifacts = db.artifacts
+    .filter((artifact) => artifact.orchestrationId === orchestrationId)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const verifications = db.verifications
+    .filter((record) => record.orchestrationId === orchestrationId)
+    .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  const attempts = db.attempts
+    .filter((attempt) => attempt.orchestrationId === orchestrationId)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const events = db.events
+    .filter((event) => event.orchestrationId === orchestrationId)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 
   return redactDeep({
     orchestration,
@@ -50,5 +72,11 @@ export function buildOrchestrationReadModel(
     contractHistory,
     amendments,
     pendingAmendment,
+    applicationMap,
+    tasks,
+    artifacts,
+    verifications,
+    attempts,
+    events,
   });
 }

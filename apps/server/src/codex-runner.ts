@@ -19,6 +19,27 @@ export interface ParsedEvents {
   errors: string[];
 }
 
+const SANDBOX_MODE_RANK: Record<AppConfig["codexSandboxMode"], number> = {
+  "read-only": 0,
+  "workspace-write": 1,
+  "danger-full-access": 2,
+};
+
+/**
+ * A per-call `request.sandboxMode` may only make the sandbox *more*
+ * restrictive than the server's configured default (e.g. a read-only
+ * worker preflight) — it can never escalate past `CODEX_SANDBOX_MODE`.
+ */
+export function effectiveSandboxMode(
+  request: RunnerRequest,
+  configuredDefault: AppConfig["codexSandboxMode"],
+): AppConfig["codexSandboxMode"] {
+  if (!request.sandboxMode) return configuredDefault;
+  return SANDBOX_MODE_RANK[request.sandboxMode] < SANDBOX_MODE_RANK[configuredDefault]
+    ? request.sandboxMode
+    : configuredDefault;
+}
+
 export function buildCodexArgs(
   request: RunnerRequest,
   sandboxMode: AppConfig["codexSandboxMode"],
@@ -28,7 +49,7 @@ export function buildCodexArgs(
     "exec",
     "--json",
     "--sandbox",
-    sandboxMode,
+    effectiveSandboxMode(request, sandboxMode),
     "--skip-git-repo-check",
     "-C",
     workspacePath,
@@ -86,18 +107,18 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
   }
 }
 
+interface ActiveCodexProcess {
+  agentId: string;
+  child: ChildProcess;
+  cancelled: boolean;
+  timedOut: boolean;
+  outputExceeded: boolean;
+  settled: Promise<void>;
+  forceKillTimer: NodeJS.Timeout | null;
+}
+
 export class CodexRunner implements AgentRunner {
-  private readonly active = new Map<
-    string,
-    {
-      child: ChildProcess;
-      cancelled: boolean;
-      timedOut: boolean;
-      outputExceeded: boolean;
-      settled: Promise<void>;
-      forceKillTimer: NodeJS.Timeout | null;
-    }
-  >();
+  private readonly active = new Map<string, ActiveCodexProcess>();
 
   constructor(private readonly config: AppConfig) {}
 
@@ -113,19 +134,24 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  async cancel(agentId: string): Promise<boolean> {
-    const active = this.active.get(agentId);
-    if (!active) {
+  async cancel(agentId: string, executionId?: string): Promise<boolean> {
+    const targets = executionId
+      ? [this.active.get(executionId)].filter((item): item is ActiveCodexProcess => Boolean(item))
+      : [...this.active.values()].filter((item) => item.agentId === agentId);
+    if (targets.length === 0) {
       return false;
     }
-    active.cancelled = true;
-    this.terminate(active);
-    await active.settled;
+    for (const active of targets) {
+      active.cancelled = true;
+      this.terminate(active);
+    }
+    await Promise.all(targets.map((active) => active.settled));
     return true;
   }
 
   async run(request: RunnerRequest): Promise<RunnerResult> {
-    if (this.active.has(request.agentId)) {
+    const key = request.executionId ?? request.agentId;
+    if (this.active.has(key)) {
       throw new Error("Agent already has an active Codex process");
     }
 
@@ -139,15 +165,16 @@ export class CodexRunner implements AgentRunner {
       child.once("close", () => resolve());
       child.once("error", () => resolve());
     });
-    const active = {
+    const active: ActiveCodexProcess = {
+      agentId: request.agentId,
       child,
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
       settled,
-      forceKillTimer: null as NodeJS.Timeout | null,
+      forceKillTimer: null,
     };
-    this.active.set(request.agentId, active);
+    this.active.set(key, active);
 
     const parsed: ParsedEvents = {
       messages: [],
@@ -223,7 +250,7 @@ export class CodexRunner implements AgentRunner {
     } finally {
       clearTimeout(timeout);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
-      this.active.delete(request.agentId);
+      this.active.delete(key);
     }
   }
 

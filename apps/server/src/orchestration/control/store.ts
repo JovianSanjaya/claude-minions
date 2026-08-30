@@ -1,10 +1,17 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
+  ApplicationMapSummary,
+  ContextPacketSummary,
   ContractAmendment,
   ExecutionContract,
   IntentDraft,
   Orchestration,
+  OrchestrationEvent,
+  OrchestrationTask,
+  SharedArtifact,
+  VerificationRecord,
+  WorkerAttempt,
 } from "../contracts.js";
 
 export const ORCHESTRATION_DB_VERSION = 1;
@@ -15,6 +22,13 @@ export interface OrchestrationDb {
   intentDrafts: IntentDraft[];
   contracts: ExecutionContract[];
   amendments: ContractAmendment[];
+  events: OrchestrationEvent[];
+  tasks: OrchestrationTask[];
+  applicationMaps: ApplicationMapSummary[];
+  contextPackets: ContextPacketSummary[];
+  attempts: WorkerAttempt[];
+  artifacts: SharedArtifact[];
+  verifications: VerificationRecord[];
 }
 
 const emptyDatabase = (): OrchestrationDb => ({
@@ -23,17 +37,33 @@ const emptyDatabase = (): OrchestrationDb => ({
   intentDrafts: [],
   contracts: [],
   amendments: [],
+  events: [],
+  tasks: [],
+  applicationMaps: [],
+  contextPackets: [],
+  attempts: [],
+  artifacts: [],
+  verifications: [],
 });
+
+const REQUIRED_ARRAY_KEYS: Array<keyof OrchestrationDb> = [
+  "orchestrations",
+  "intentDrafts",
+  "contracts",
+  "amendments",
+  "events",
+  "tasks",
+  "applicationMaps",
+  "contextPackets",
+  "attempts",
+  "artifacts",
+  "verifications",
+];
 
 function isPlausibleDatabase(value: unknown): value is OrchestrationDb {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<OrchestrationDb>;
-  return (
-    Array.isArray(candidate.orchestrations) &&
-    Array.isArray(candidate.intentDrafts) &&
-    Array.isArray(candidate.contracts) &&
-    Array.isArray(candidate.amendments)
-  );
+  return REQUIRED_ARRAY_KEYS.every((key) => Array.isArray(candidate[key]));
 }
 
 /**

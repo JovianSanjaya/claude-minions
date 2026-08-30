@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken } from "./api";
+import { api, ApiError, orchestrationApi, setAuthToken } from "./api";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import { OrchestrationPanel } from "./orchestration/OrchestrationPanel";
+import "./orchestration/orchestration.css";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -220,29 +222,38 @@ export default function App() {
     }
   };
 
+  const sendDirectMessage = useCallback(
+    async (content: string) => {
+      if (!selected || !content.trim()) return;
+      setError(null);
+      try {
+        const result = await api.sendMessage(selected.id, content.trim());
+        if (selectedIdRef.current === selected.id) {
+          setMessages((current) => [...current, result.message]);
+          setActiveRun(result.run);
+        }
+        setAgents((current) =>
+          current.map((agent) =>
+            agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+          ),
+        );
+        await pollRun(result.run.id, selected.id);
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        setActiveRun(null);
+        await refreshAgents();
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selected],
+  );
+
   const sendMessage = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!selected || !prompt.trim()) return;
-    const content = prompt.trim();
+    if (!prompt.trim()) return;
+    const content = prompt;
     setPrompt("");
-    setError(null);
-    try {
-      const result = await api.sendMessage(selected.id, content);
-      if (selectedIdRef.current === selected.id) {
-        setMessages((current) => [...current, result.message]);
-        setActiveRun(result.run);
-      }
-      setAgents((current) =>
-        current.map((agent) =>
-          agent.id === selected.id ? { ...agent, status: "busy" } : agent,
-        ),
-      );
-      await pollRun(result.run.id, selected.id);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      setActiveRun(null);
-      await refreshAgents();
-    }
+    await sendDirectMessage(content);
   };
 
   const unlock = async (event: React.FormEvent) => {
@@ -582,6 +593,14 @@ export default function App() {
                 </div>
               </form>
             </section>
+
+            <OrchestrationPanel
+              agentId={selected.id}
+              agentStatus={selected.status}
+              api={orchestrationApi}
+              onDirectSend={sendDirectMessage}
+              systemSummary={system?.arkConfigured ? undefined : "Ark is not configured — orchestration model calls will fail until ARK_API_KEY/ARK_MODEL are set."}
+            />
           </>
         ) : (
           <div className="no-agent">

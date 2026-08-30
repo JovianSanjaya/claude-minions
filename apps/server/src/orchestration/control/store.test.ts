@@ -28,6 +28,13 @@ describe("OrchestrationStore", () => {
       intentDrafts: [],
       contracts: [],
       amendments: [],
+      events: [],
+      tasks: [],
+      applicationMaps: [],
+      contextPackets: [],
+      attempts: [],
+      artifacts: [],
+      verifications: [],
     });
   });
 
@@ -102,6 +109,13 @@ describe("OrchestrationStore", () => {
         intentDrafts: [],
         contracts: [],
         amendments: [],
+        events: [],
+        tasks: [],
+        applicationMaps: [],
+        contextPackets: [],
+        attempts: [],
+        artifacts: [],
+        verifications: [],
       }),
       "utf8",
     );

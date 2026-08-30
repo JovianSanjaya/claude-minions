@@ -7,11 +7,17 @@ import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { HttpError } from "../../errors.js";
 import type {
+  ClarificationQuestion,
   CostEstimate,
   ElaborateIntentInput,
+  ExecuteInput,
+  ExecutionOutcome,
+  IntentClaim,
   IntentDraft,
   OrchestrationExecutionDriver,
   OrchestrationSink,
+  PlanInput,
+  PlanResult,
 } from "../contracts.js";
 import { registerOrchestrationRoutes } from "./routes.js";
 import type { AgentAccessPort, AgentSnapshot } from "./service.js";
@@ -26,18 +32,46 @@ afterEach(async () => {
   );
 });
 
+function claim(text: string, overrides: Partial<IntentClaim> = {}): IntentClaim {
+  return {
+    id: "",
+    text,
+    provenance: "user-explicit",
+    materiality: "trivial",
+    rationale: null,
+    supersedes: null,
+    ...overrides,
+  };
+}
+
+function question(overrides: Partial<ClarificationQuestion> = {}): ClarificationQuestion {
+  return {
+    id: randomUUID(),
+    prompt: "Should reset tokens expire after 1 hour or 24 hours?",
+    materiality: "material",
+    consequenceIfWrong: "Tokens could remain valid too long",
+    options: [
+      { id: "opt-1h", label: "1 hour", resolutionText: "Reset tokens expire after 1 hour", delegate: false },
+      { id: "opt-24h", label: "24 hours", resolutionText: "Reset tokens expire after 24 hours", delegate: false },
+    ],
+    category: "requirements",
+    relatedClaimIds: [],
+    ...overrides,
+  };
+}
+
 function draftSkeleton(overrides: Partial<IntentDraft> = {}): IntentDraft {
   return {
     id: "",
     orchestrationId: "placeholder",
     revision: 0,
     goal: "Add password reset",
-    requirements: ["Users can request a reset email"],
+    requirements: [claim("Users can request a reset email")],
     assumptions: [],
     nonGoals: [],
     architectureDecisions: [],
-    materialQuestions: [],
     manualExpectations: [],
+    openQuestions: [],
     createdAt: "placeholder",
     ...overrides,
   };
@@ -57,24 +91,39 @@ function estimateSkeleton(overrides: Partial<CostEstimate> = {}): CostEstimate {
   };
 }
 
-function createFakeDriver(
-  elaborate: (
+function defaultPlan(input: PlanInput): PlanResult {
+  return {
+    selectedMode: "direct",
+    routeReason: "single small task",
+    tasks: [],
+    applicationMap: {
+      orchestrationId: input.orchestration.id,
+      version: 1,
+      repositoryHash: "fake-hash",
+      summary: "root",
+      fileCount: 1,
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+interface FakeDriverOverrides {
+  elaborate?: (
     input: ElaborateIntentInput,
     sink: OrchestrationSink,
-  ) => Promise<{ draft: IntentDraft; estimate: CostEstimate }> = async () => ({
-    draft: draftSkeleton(),
-    estimate: estimateSkeleton(),
-  }),
-): OrchestrationExecutionDriver {
+  ) => Promise<{ draft: IntentDraft; estimate: CostEstimate }>;
+  plan?: (input: PlanInput, sink: OrchestrationSink) => Promise<PlanResult>;
+  execute?: (input: ExecuteInput, sink: OrchestrationSink) => Promise<ExecutionOutcome>;
+  cancel?: (orchestrationId: string) => Promise<boolean>;
+}
+
+function createFakeDriver(overrides: FakeDriverOverrides = {}): OrchestrationExecutionDriver {
   return {
-    elaborateIntent: (input, sink) => elaborate(input, sink),
-    plan: () => {
-      throw new Error("plan() is out of scope for this restricted control-plane build");
-    },
-    execute: () => {
-      throw new Error("execute() is out of scope for this restricted control-plane build");
-    },
-    cancel: async () => false,
+    elaborateIntent:
+      overrides.elaborate ?? (async () => ({ draft: draftSkeleton(), estimate: estimateSkeleton() })),
+    plan: overrides.plan ?? (async (input) => defaultPlan(input)),
+    execute: overrides.execute ?? (async () => ({ kind: "completed", finalOutput: "done" })),
+    cancel: overrides.cancel ?? (async () => true),
   };
 }
 
@@ -196,7 +245,10 @@ describe("orchestration control-plane HTTP routes", () => {
   });
 
   it("returns 409 when a second orchestration is created for an already-active Agent", async () => {
-    const { app } = await createHarness(undefined, createFakeDriver(() => new Promise<never>(() => undefined)));
+    const { app } = await createHarness(
+      undefined,
+      createFakeDriver({ elaborate: () => new Promise<never>(() => undefined) }),
+    );
     const first = await app.inject({
       method: "POST",
       url: `/api/agents/${AGENT_ID}/orchestrations`,
@@ -215,15 +267,22 @@ describe("orchestration control-plane HTTP routes", () => {
 
   it("walks intent revise -> confirm -> amendment confirm through HTTP with correct status codes", async () => {
     let call = 0;
-    const driver = createFakeDriver(async () => {
-      call += 1;
-      if (call === 1) {
-        return {
-          draft: draftSkeleton({ materialQuestions: ["1h or 24h expiry?"] }),
-          estimate: estimateSkeleton(),
-        };
-      }
-      return { draft: draftSkeleton(), estimate: estimateSkeleton() };
+    const driver = createFakeDriver({
+      elaborate: async () => {
+        call += 1;
+        if (call === 1) {
+          return {
+            draft: draftSkeleton({ openQuestions: [question()] }),
+            estimate: estimateSkeleton(),
+          };
+        }
+        return { draft: draftSkeleton(), estimate: estimateSkeleton() };
+      },
+      // proposeAmendment is only legal while status is "planning" (i.e.
+      // before the automatic post-confirm plan() resolves) or during
+      // execution — hang plan() so this HTTP round-trip lands there
+      // deterministically instead of racing the background planning task.
+      plan: () => new Promise<never>(() => undefined),
     });
     const { app, service } = await createHarness(undefined, driver);
 
@@ -280,8 +339,48 @@ describe("orchestration control-plane HTTP routes", () => {
     await app.close();
   });
 
+  it("answers a material clarification question over HTTP and then allows confirmation", async () => {
+    const q = question();
+    const driver = createFakeDriver({
+      elaborate: async () => ({ draft: draftSkeleton({ openQuestions: [q] }), estimate: estimateSkeleton() }),
+    });
+    const { app, service } = await createHarness(undefined, driver);
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/agents/${AGENT_ID}/orchestrations`,
+      payload: { prompt: "Add password reset flow" },
+    });
+    const orchestrationId = created.json().orchestration.id as string;
+    await service.waitForPendingWork(orchestrationId);
+
+    const badAnswer = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${orchestrationId}/intent/questions/${q.id}/answer`,
+      payload: {},
+    });
+    expect(badAnswer.statusCode).toBe(400);
+
+    const answer = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${orchestrationId}/intent/questions/${q.id}/answer`,
+      payload: { optionId: "opt-1h" },
+    });
+    expect(answer.statusCode).toBe(200);
+
+    const confirm = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${orchestrationId}/confirm`,
+    });
+    expect(confirm.statusCode).toBe(200);
+    await service.waitForPendingWork(orchestrationId);
+    await app.close();
+  });
+
   it("returns 409 for a reject on an amendment that is already confirmed", async () => {
-    const { app, service } = await createHarness();
+    // proposeAmendment requires status "planning"; hang plan() so the
+    // orchestration stays there deterministically after /confirm instead of
+    // racing the background planning task to "ready".
+    const { app, service } = await createHarness(undefined, createFakeDriver({ plan: () => new Promise<never>(() => undefined) }));
     const created = await app.inject({
       method: "POST",
       url: `/api/agents/${AGENT_ID}/orchestrations`,
@@ -313,10 +412,9 @@ describe("orchestration control-plane HTTP routes", () => {
   });
 
   it("returns 422 when confirmation would exceed the configured hard budget", async () => {
-    const driver = createFakeDriver(async () => ({
-      draft: draftSkeleton(),
-      estimate: estimateSkeleton({ inputTokenLow: 5000 }),
-    }));
+    const driver = createFakeDriver({
+      elaborate: async () => ({ draft: draftSkeleton(), estimate: estimateSkeleton({ inputTokenLow: 5000 }) }),
+    });
     const { app, service } = await createHarness(undefined, driver);
     const created = await app.inject({
       method: "POST",
@@ -341,6 +439,79 @@ describe("orchestration control-plane HTTP routes", () => {
       url: "/api/orchestrations/not-a-uuid",
     });
     expect(response.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("starts execution, publishes evidence, and exposes it through the events/tasks/artifacts/verifications routes", async () => {
+    const { app, service } = await createHarness();
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/agents/${AGENT_ID}/orchestrations`,
+      payload: { prompt: "Add password reset flow" },
+    });
+    const orchestrationId = created.json().orchestration.id as string;
+    await service.waitForPendingWork(orchestrationId);
+    await app.inject({ method: "POST", url: `/api/orchestrations/${orchestrationId}/confirm` });
+    await service.waitForPendingWork(orchestrationId); // background planning: planning -> ready
+
+    const start = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${orchestrationId}/start`,
+    });
+    expect(start.statusCode).toBe(202);
+    await service.waitForPendingWork(orchestrationId);
+
+    const fetched = await app.inject({ method: "GET", url: `/api/orchestrations/${orchestrationId}` });
+    expect(fetched.json().orchestration.status).toBe("completed");
+
+    const events = await app.inject({
+      method: "GET",
+      url: `/api/orchestrations/${orchestrationId}/events`,
+    });
+    expect(events.statusCode).toBe(200);
+    expect(events.json().events.length).toBeGreaterThan(0);
+
+    const tasks = await app.inject({
+      method: "GET",
+      url: `/api/orchestrations/${orchestrationId}/tasks`,
+    });
+    expect(tasks.statusCode).toBe(200);
+
+    const artifacts = await app.inject({
+      method: "GET",
+      url: `/api/orchestrations/${orchestrationId}/artifacts`,
+    });
+    expect(artifacts.statusCode).toBe(200);
+
+    const verifications = await app.inject({
+      method: "GET",
+      url: `/api/orchestrations/${orchestrationId}/verifications`,
+    });
+    expect(verifications.statusCode).toBe(200);
+
+    await app.close();
+  });
+
+  it("cancels a running orchestration via HTTP", async () => {
+    const driver = createFakeDriver({ execute: () => new Promise<never>(() => undefined) });
+    const { app, service } = await createHarness(undefined, driver);
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/agents/${AGENT_ID}/orchestrations`,
+      payload: { prompt: "Add password reset flow" },
+    });
+    const orchestrationId = created.json().orchestration.id as string;
+    await service.waitForPendingWork(orchestrationId);
+    await app.inject({ method: "POST", url: `/api/orchestrations/${orchestrationId}/confirm` });
+    await service.waitForPendingWork(orchestrationId); // background planning: planning -> ready
+    await app.inject({ method: "POST", url: `/api/orchestrations/${orchestrationId}/start` });
+
+    const cancel = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${orchestrationId}/cancel`,
+    });
+    expect(cancel.statusCode).toBe(200);
+    expect(cancel.json().orchestration.status).toBe("cancelled");
     await app.close();
   });
 });

@@ -44,3 +44,6 @@ tmp/
 temp/
 .cache/
 *.tmp
+
+# Personal notes (local-only, not for the repo)
+NOTES.md

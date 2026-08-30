@@ -32,19 +32,32 @@ const proposeAmendmentBody = z.object({
   assumptions: z.array(z.string().trim().min(1).max(2000)).optional(),
   nonGoals: z.array(z.string().trim().min(1).max(2000)).optional(),
   architectureDecisions: z.array(z.string().trim().min(1).max(2000)).optional(),
-  materialQuestions: z.array(z.string().trim().min(1).max(2000)).optional(),
   manualExpectations: z.array(z.string().trim().min(1).max(2000)).optional(),
   criteria: criteriaOverrideSchema.optional(),
 });
 
+const answerClarificationParams = z.object({
+  orchestrationId: z.string().uuid(),
+  questionId: z.string().min(1),
+});
+
+const answerClarificationBody = z
+  .object({
+    optionId: z.string().min(1).optional(),
+    freeText: z.string().trim().min(1).max(2000).optional(),
+  })
+  .refine((value) => Boolean(value.optionId) !== Boolean(value.freeText), {
+    message: "Provide exactly one of optionId or freeText",
+  });
+
 /**
- * Registers the subset of the frozen orchestration control-plane route
- * surface that this restricted build implements: intent draft/revision/
- * confirmation, immutable contract versions/amendments, and the estimate
- * shown before a hard-budget-gated confirmation. Routes covering execution,
- * task/artifact/verification evidence, and cancellation are out of scope
- * here (see docs/handoffs/task-1-control-plane.md) and are left for the
- * fuller Task 1 build.
+ * Registers the orchestration control-plane route surface: intent draft/
+ * revision/confirmation, the deterministic clarification-question answer
+ * path, immutable contract versions/amendments, the estimate/hard-budget
+ * gate, plan+execute lifecycle (start/cancel), and read-only evidence
+ * endpoints (events/tasks/artifacts/verifications). See
+ * docs/handoffs/task-1-control-plane.md for the full capability list and
+ * any remaining gaps.
  *
  * Assumes the host app's existing bearer-token hook already protects
  * `/api/*`; this plugin adds no separate authentication mechanism.
@@ -82,6 +95,21 @@ export function registerOrchestrationRoutes(
     return reply.code(202).send({ orchestration });
   });
 
+  app.post(
+    "/api/orchestrations/:orchestrationId/intent/questions/:questionId/answer",
+    async (request) => {
+      const { orchestrationId, questionId } = answerClarificationParams.parse(request.params);
+      const body = answerClarificationBody.parse(request.body);
+      const orchestration = await service.answerClarification({
+        orchestrationId,
+        questionId,
+        optionId: body.optionId,
+        freeText: body.freeText,
+      });
+      return { orchestration };
+    },
+  );
+
   app.post("/api/orchestrations/:orchestrationId/confirm", async (request) => {
     const { orchestrationId } = orchestrationIdParams.parse(request.params);
     const body = confirmIntentBody.parse(request.body ?? {});
@@ -116,4 +144,36 @@ export function registerOrchestrationRoutes(
       return { amendment };
     },
   );
+
+  app.post("/api/orchestrations/:orchestrationId/start", async (request, reply) => {
+    const { orchestrationId } = orchestrationIdParams.parse(request.params);
+    const orchestration = await service.startOrchestration(orchestrationId);
+    return reply.code(202).send({ orchestration });
+  });
+
+  app.post("/api/orchestrations/:orchestrationId/cancel", async (request) => {
+    const { orchestrationId } = orchestrationIdParams.parse(request.params);
+    const orchestration = await service.cancelOrchestration(orchestrationId);
+    return { orchestration };
+  });
+
+  app.get("/api/orchestrations/:orchestrationId/events", async (request) => {
+    const { orchestrationId } = orchestrationIdParams.parse(request.params);
+    return { events: service.getReadModel(orchestrationId).events };
+  });
+
+  app.get("/api/orchestrations/:orchestrationId/tasks", async (request) => {
+    const { orchestrationId } = orchestrationIdParams.parse(request.params);
+    return { tasks: service.getReadModel(orchestrationId).tasks };
+  });
+
+  app.get("/api/orchestrations/:orchestrationId/artifacts", async (request) => {
+    const { orchestrationId } = orchestrationIdParams.parse(request.params);
+    return { artifacts: service.getReadModel(orchestrationId).artifacts };
+  });
+
+  app.get("/api/orchestrations/:orchestrationId/verifications", async (request) => {
+    const { orchestrationId } = orchestrationIdParams.parse(request.params);
+    return { verifications: service.getReadModel(orchestrationId).verifications };
+  });
 }

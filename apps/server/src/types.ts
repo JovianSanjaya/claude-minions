@@ -73,10 +73,31 @@ export interface RunnerRequest {
   workspacePath: string;
   prompt: string;
   threadId: string | null;
+  /**
+   * Distinguishes concurrent calls for the same Agent — e.g. several
+   * orchestration workers running in isolated workspace copies under one
+   * Agent. When omitted, runner implementations key their internal active-
+   * process bookkeeping by `agentId` alone (the original, single-run
+   * behavior), so direct Playground execution is unaffected.
+   */
+  executionId?: string | undefined;
+  /**
+   * Restricts this call's sandbox mode below the server's configured
+   * default (e.g. a read-only worker preflight before any writable
+   * execution). Never widens it — a request cannot use this to escalate
+   * past `CODEX_SANDBOX_MODE`; runner implementations that don't support a
+   * per-call override simply ignore it and use the configured default.
+   */
+  sandboxMode?: "read-only" | "workspace-write" | undefined;
 }
 
 export interface AgentRunner {
   run(request: RunnerRequest): Promise<RunnerResult>;
-  cancel(agentId: string): Promise<boolean>;
+  /**
+   * Cancels the active run(s) for an Agent. With `executionId`, cancels only
+   * that specific execution; without it, cancels every currently active
+   * execution for the Agent (the original behavior when only one exists).
+   */
+  cancel(agentId: string, executionId?: string): Promise<boolean>;
   isAvailable(): Promise<boolean>;
 }

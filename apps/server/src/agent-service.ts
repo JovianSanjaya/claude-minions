@@ -15,6 +15,20 @@ import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+/**
+ * Lets an injected orchestration control plane (Task 1) and this baseline
+ * direct-execution service avoid racing on the same Agent workspace,
+ * without AgentService depending on any orchestration type. Shape matches
+ * `OrchestrationCoordinator` from
+ * apps/server/src/orchestration/control/service.ts exactly, so Final
+ * Assembly can pass that object straight through. Omitted by default —
+ * every existing construction/test keeps working unchanged.
+ */
+export interface AgentExecutionCoordinator {
+  assertAgentAvailableForDirect(agentId: string): void;
+  cancelForAgent(agentId: string): Promise<void>;
+}
+
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
@@ -24,6 +38,7 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly coordinator?: AgentExecutionCoordinator,
   ) {}
 
   async initialize(): Promise<void> {
@@ -107,6 +122,7 @@ export class AgentService {
   async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
     await this.cancelExecution(id);
+    await this.coordinator?.cancelForAgent(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
       database.agents = database.agents.filter((item) => item.id !== id);
@@ -123,6 +139,7 @@ export class AgentService {
   async stopAgent(id: string): Promise<Agent> {
     this.getAgent(id);
     await this.cancelExecution(id);
+    await this.coordinator?.cancelForAgent(id);
     return this.setStatus(id, "stopped");
   }
 
@@ -154,6 +171,7 @@ export class AgentService {
     agentId: string,
     prompt: string,
   ): Promise<{ run: AgentRun; message: Message }> {
+    this.coordinator?.assertAgentAvailableForDirect(agentId);
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
         503,
