@@ -12,6 +12,16 @@ The starter kit already provides Agent CRUD, persistent workspaces, direct resum
 
 Requirements: Node.js 22+, npm, Codex CLI (or Docker/Colima/Podman), and a ModelArk endpoint.
 
+**Recommended path — local container Runtime (matches the default judging path):**
+
+```bash
+ARK_API_KEY=your-ark-api-key ARK_MODEL=ep-your-endpoint-id npm run poc
+```
+
+The first run installs dependencies and builds the Runtime image; open [http://localhost:3000](http://localhost:3000) when it's ready. This runs every Codex turn in a disposable, isolated container (`RUNTIME_PROVIDER=container`), the same execution boundary this branch's middleware hardens against.
+
+**Alternative — local-process development (hot reload, no container engine required):**
+
 ```bash
 cp .env.example .env
 npm install
@@ -19,7 +29,9 @@ set -a; source .env; set +a
 npm run dev
 ```
 
-Set `ARK_API_KEY` and `ARK_MODEL` in `.env`, then open [http://localhost:5173](http://localhost:5173). Create an Agent, choose **Auto** or **Orchestrated**, submit a task, review/revise the generated intent, explicitly confirm it, inspect the plan, then press **Start execution**. Direct mode remains available in both the new execution control and classic chat below it.
+Set `ARK_API_KEY` and `ARK_MODEL` in `.env`, then open [http://localhost:5173](http://localhost:5173). This runs Codex directly as a host process instead of inside a container — faster to iterate on, but without the container as an isolation boundary.
+
+Either way: create an Agent, choose **Auto** or **Orchestrated**, submit a task, review/revise the generated intent, explicitly confirm it, inspect the plan, then press **Start execution**. Direct mode remains available in both the new execution control and classic chat below it.
 
 The UI itself is visible without Ark credentials, but model-backed intent/planning/execution needs valid credentials. Never place secrets in prompts, Agent workspaces, browser configuration, commits, screenshots, or event metadata.
 
