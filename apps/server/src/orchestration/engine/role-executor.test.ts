@@ -158,4 +158,89 @@ describe("RoleExecutor", () => {
       await rm(runtimeRoot, { recursive: true, force: true });
     }
   });
+
+  it("enters a preserved connection pause, retries immediately on request, and reports recovery", async () => {
+    const runtimeRoot = await mkdtemp(path.join(os.tmpdir(), "role-executor-pause-"));
+    let reservation = 0;
+    let execution = 0;
+    const recordEvent = vi.fn().mockResolvedValue(undefined);
+    const sink = {
+      reserveModelCall: vi.fn().mockImplementation(async () => ({
+        allowed: true,
+        reservationId: `reservation-${++reservation}`,
+      })),
+      commitModelUsage: vi.fn().mockResolvedValue(undefined),
+      recordEvent,
+    } as unknown as OrchestrationSink;
+    const run = vi.fn()
+      .mockRejectedValueOnce(new RunnerExecutionError("ETIMEDOUT while sending request", {
+        threadId: "preserved-thread",
+        output: null,
+        usage: null,
+      }))
+      .mockResolvedValueOnce({
+        output: "RECOVERED",
+        threadId: "preserved-thread",
+        usage: { inputTokens: 3, cachedInputTokens: 0, outputTokens: 1 },
+        modelId: "big",
+      });
+    const diagnoseTransport = vi.fn().mockResolvedValue({
+      checkedAt: new Date().toISOString(),
+      target: "https://ark.example/api/v3/responses",
+      dnsAddress: "203.0.113.4",
+      httpStatus: null,
+      elapsedMs: 10_000,
+      errorCode: "ETIMEDOUT",
+      errorMessage: "fetch timed out",
+    });
+    const runner = {
+      run,
+      cancel: vi.fn().mockResolvedValue(false),
+      diagnoseTransport,
+    } as unknown as AgentRunner;
+    try {
+      const roles = new RoleExecutor(
+        runner,
+        sink,
+        { planner: "big", worker: "small", verifier: "big", integrator: "big" },
+        runtimeRoot,
+        () => `execution-${++execution}`,
+        1_800_000,
+        {
+          maxRetries: null,
+          pauseAfterMs: 0,
+          baseDelayMs: 60_000,
+          maxDelayMs: 60_000,
+          jitterRatio: 0,
+        },
+      );
+      const pending = roles.text({
+        orchestrationId: "orchestration-1",
+        agentId: "agent-1",
+        taskId: null,
+        role: "planner",
+        workspacePath: runtimeRoot,
+        prompt: "plan",
+        sandboxMode: "read-only",
+        signal: new AbortController().signal,
+      });
+      await vi.waitFor(() => {
+        expect(recordEvent).toHaveBeenCalledWith(expect.objectContaining({
+          type: "role-call-connection-paused",
+          metadata: expect.objectContaining({
+            diagnosticErrorCode: "ETIMEDOUT",
+            resumesThread: true,
+          }),
+        }));
+      });
+      expect(roles.retryNow("orchestration-1")).toBe(true);
+      await expect(pending).resolves.toMatchObject({ value: "RECOVERED" });
+      expect(run.mock.calls[1]?.[0]).toEqual(expect.objectContaining({ threadId: "preserved-thread" }));
+      expect(recordEvent).toHaveBeenCalledWith(expect.objectContaining({
+        type: "role-call-connection-restored",
+      }));
+    } finally {
+      await rm(runtimeRoot, { recursive: true, force: true });
+    }
+  });
 });

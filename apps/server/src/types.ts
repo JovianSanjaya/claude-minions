@@ -74,6 +74,16 @@ export interface RunnerResult {
   modelFallback?: boolean | undefined;
 }
 
+export interface TransportDiagnostics {
+  checkedAt: string;
+  target: string;
+  dnsAddress: string | null;
+  httpStatus: number | null;
+  elapsedMs: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
 export interface RunnerRequest {
   executionId: string;
   agentId: string;
@@ -86,6 +96,7 @@ export interface RunnerRequest {
   modelId?: string | undefined;
   runtimeHomePath?: string | undefined;
   sandboxMode?: "read-only" | "workspace-write" | undefined;
+  allowedWritePaths?: string[] | undefined;
   runtimeProfile?: "default" | "verification" | undefined;
   maxArkApiTurns?: number | undefined;
   maxInputTokens?: number | undefined;
@@ -95,6 +106,7 @@ export interface AgentRunner {
   run(request: RunnerRequest): Promise<RunnerResult>;
   cancel(executionId: string): Promise<boolean>;
   isAvailable(): Promise<boolean>;
+  diagnoseTransport?(): Promise<TransportDiagnostics>;
 }
 
 export interface AgentExecutionCoordinator {

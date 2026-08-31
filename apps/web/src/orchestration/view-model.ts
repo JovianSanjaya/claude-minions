@@ -25,6 +25,15 @@ export const canConfirmIntent = (view: OrchestrationReadModel | null) =>
       view.activeDraft.materialQuestions.length === 0,
   );
 export const statusLabel = (status: string) => status.replaceAll("-", " ");
+export function executionHeading(status: OrchestrationStatus): string {
+  if (status === "completed") return "Complete";
+  if (status === "failed") return "Stopped";
+  if (status === "budget-exhausted") return "Stopped at usage limit";
+  if (status === "cancelled") return "Cancelled";
+  if (status === "needs-user") return "Needs your input";
+  if (status === "connection-paused") return "Connection paused";
+  return "Executing…";
+}
 export const formatNumber = (value: number) => new Intl.NumberFormat().format(value);
 export const formatTokens = formatNumber;
 export const formatEstimatedCost = (value: number | null) =>
@@ -106,6 +115,11 @@ export function orchestrationProgress(
       "Verifying integration",
       "Trusted checks are running before publication.",
     ],
+    "connection-paused": [
+      "Connection recovery",
+      "Connection paused",
+      "Completed workspace changes, model thread state, and checkpoints are preserved while automatic retries continue.",
+    ],
     completed: ["Step 5 of 5", "Completed", "The verified result is ready."],
     failed: ["Step 5 of 5", "Stopped", view.orchestration.error ?? "Execution failed."],
     "budget-exhausted": [
@@ -146,6 +160,9 @@ export function orchestrationProgress(
       "worker-compact-continuation",
       "worker-retry-wait",
       "role-call-transport-retry",
+      "role-call-connection-paused",
+      "role-call-connection-restored",
+      "connection-retry-requested",
       "worker-transport-retries-exhausted",
       "worker-supervisor-escalation",
       "worker-supervisor-decision",
@@ -224,6 +241,10 @@ export function orchestrationProgress(
       ? "The verification model is checking unresolved requirements"
       : "Running deterministic checks on the integrated result";
   }
+  if (effectiveStatus === "connection-paused") {
+    activity = "Model connection unavailable — retrying automatically";
+    detail = "The worker did not choose to disconnect. The platform preserved this execution and will resume it when the endpoint responds.";
+  }
   if (!activeStart && actionEvent?.type === "role-call-transport-retry") {
     activity = "Connection interrupted — reconnecting automatically";
     detail = "Completed workspace changes and checkpoints are preserved while the model connection is restored.";
@@ -240,13 +261,19 @@ export function orchestrationProgress(
     view.orchestration.updatedAt;
   const timeout = activeStart?.metadata.timeoutMs;
   const timeoutMs = typeof timeout === "number" ? timeout : null;
-  const elapsedMs = Math.max(0, nowMs - Date.parse(startedAt));
+  const elapsedMs = isTerminal(status)
+    ? elapsedMsFor(view, nowMs)
+    : Math.max(0, nowMs - Date.parse(startedAt));
+
+  const percentStatus = effectiveStatus === "connection-paused"
+    ? view.orchestration.connectionResumeStatus ?? "running"
+    : effectiveStatus;
 
   let percent = 5;
-  if (effectiveStatus === "awaiting-confirmation") percent = 15;
-  if (effectiveStatus === "planning") percent = 25;
-  if (effectiveStatus === "ready") percent = 35;
-  if (effectiveStatus === "running") {
+  if (percentStatus === "awaiting-confirmation") percent = 15;
+  if (percentStatus === "planning") percent = 25;
+  if (percentStatus === "ready") percent = 35;
+  if (percentStatus === "running") {
     const passed = view.tasks.filter((task) => task.status === "passed").length;
     const activeCredit = view.tasks.some((task) =>
       ["preflight", "running", "verifying"].includes(task.status),
@@ -257,10 +284,10 @@ export function orchestrationProgress(
       ? 40 + Math.round(((passed + activeCredit) / view.tasks.length) * 35)
       : 40;
   }
-  if (effectiveStatus === "integrating") percent = 82;
-  if (effectiveStatus === "verifying") percent = 92;
-  if (effectiveStatus === "completed") percent = 100;
-  if (["failed", "cancelled", "budget-exhausted"].includes(effectiveStatus)) {
+  if (percentStatus === "integrating") percent = 82;
+  if (percentStatus === "verifying") percent = 92;
+  if (percentStatus === "completed") percent = 100;
+  if (["failed", "cancelled", "budget-exhausted"].includes(percentStatus)) {
     percent = Math.max(15, workflowState(view).reachedIndex * 20);
   }
 
@@ -277,7 +304,7 @@ export function orchestrationProgress(
     phase: phase[1],
     detail,
     activity,
-    loading: !["completed", "failed", "budget-exhausted", "cancelled", "needs-user", "awaiting-confirmation"].includes(effectiveStatus),
+    loading: !["completed", "failed", "budget-exhausted", "cancelled", "needs-user", "awaiting-confirmation", "connection-paused"].includes(effectiveStatus),
     activeRole: activeStart?.actorRole ?? null,
     elapsedMs,
     timeoutRemainingMs: timeoutMs === null ? null : Math.max(0, timeoutMs - elapsedMs),
@@ -305,7 +332,10 @@ export function workflowState(view: OrchestrationReadModel): {
   reachedIndex: number;
   activeIndex: number;
 } {
-  const { status } = view.orchestration;
+  const rawStatus = view.orchestration.status;
+  const status = rawStatus === "connection-paused"
+    ? view.orchestration.connectionResumeStatus ?? rawStatus
+    : rawStatus;
   let reachedIndex = 0;
   if (
     view.plan ||
@@ -507,7 +537,7 @@ export interface StatusPresentation {
 export function eventTone(event: OrchestrationEvent): StatusTone {
   const text = `${event.type} ${event.summary}`;
   if (/fail|error|denied|exhaust/i.test(text)) return "danger";
-  if (/cancel|stale|needs-user|escalat|warn/i.test(text)) return "warning";
+  if (/cancel|stale|needs-user|escalat|warn|pause|disconnect|retry/i.test(text)) return "warning";
   if (/complete|passed|publish|verified|confirm/i.test(text)) return "success";
   return "pending";
 }

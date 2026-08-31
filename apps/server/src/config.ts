@@ -28,7 +28,7 @@ const envSchema = z.object({
   CODEX_SANDBOX_MODE: z
     .enum(["read-only", "workspace-write", "danger-full-access"])
     .default("workspace-write"),
-  CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
+  CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(1_800_000),
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
@@ -83,6 +83,14 @@ const envSchema = z.object({
   ORCHESTRATION_MAX_ARK_API_TURNS: optionalNonNegativeNumber,
   ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION: optionalNonNegativeNumber,
   ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION: optionalNonNegativeNumber,
+  ORCHESTRATION_TRANSPORT_MAX_RETRIES: optionalNonNegativeNumber,
+  ORCHESTRATION_TRANSPORT_RETRY_WINDOW_MS: optionalNonNegativeNumber,
+  ORCHESTRATION_TRANSPORT_RETRY_BASE_MS: optionalNonNegativeNumber,
+  ORCHESTRATION_TRANSPORT_RETRY_MAX_DELAY_MS: optionalNonNegativeNumber,
+  ORCHESTRATION_TRANSPORT_RETRY_JITTER_RATIO: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.coerce.number().finite().min(0).max(1).optional(),
+  ),
   ARK_REQUEST_MAX_RETRIES: optionalNonNegativeNumber,
   ARK_STREAM_MAX_RETRIES: optionalNonNegativeNumber,
   ARK_STREAM_IDLE_TIMEOUT_MS: optionalNonNegativeNumber,
@@ -183,11 +191,21 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     orchestrationPricing: env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined
       ? (["planner", "worker", "verifier", "integrator"] as const).map((role) => ({ role, modelId: orchestrationModels[role], inputUsdPerMillion: env.ARK_INPUT_USD_PER_MILLION!, cachedInputUsdPerMillion: env.ARK_CACHED_INPUT_USD_PER_MILLION!, outputUsdPerMillion: env.ARK_OUTPUT_USD_PER_MILLION! }))
       : [],
+    orchestrationTransportRetryPolicy: {
+      // Zero means durable retries until the orchestration is cancelled.
+      maxRetries: env.ORCHESTRATION_TRANSPORT_MAX_RETRIES
+        ? Math.floor(env.ORCHESTRATION_TRANSPORT_MAX_RETRIES)
+        : null,
+      pauseAfterMs: Math.floor(env.ORCHESTRATION_TRANSPORT_RETRY_WINDOW_MS ?? 300_000),
+      baseDelayMs: Math.max(1, Math.floor(env.ORCHESTRATION_TRANSPORT_RETRY_BASE_MS ?? 1_000)),
+      maxDelayMs: Math.max(1, Math.floor(env.ORCHESTRATION_TRANSPORT_RETRY_MAX_DELAY_MS ?? 30_000)),
+      jitterRatio: env.ORCHESTRATION_TRANSPORT_RETRY_JITTER_RATIO ?? 0.2,
+    },
     orchestrationDemoFixture: env.ORCHESTRATION_DEMO_FIXTURE,
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
     arkRequestMaxRetries: Math.floor(env.ARK_REQUEST_MAX_RETRIES ?? 3),
     arkStreamMaxRetries: Math.floor(env.ARK_STREAM_MAX_RETRIES ?? 3),
-    arkStreamIdleTimeoutMs: Math.floor(env.ARK_STREAM_IDLE_TIMEOUT_MS ?? 180_000),
+    arkStreamIdleTimeoutMs: Math.floor(env.ARK_STREAM_IDLE_TIMEOUT_MS ?? 1_800_000),
     nodeEnv: env.NODE_ENV,
   };
 }

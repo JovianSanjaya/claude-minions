@@ -38,7 +38,11 @@ import {
   recoveryEvidence,
   type RecoveryDecision,
 } from "./recovery.js";
-import { RoleExecutor, type RoleModelConfiguration } from "./role-executor.js";
+import {
+  RoleExecutor,
+  type ModelTransportRetryPolicy,
+  type RoleModelConfiguration,
+} from "./role-executor.js";
 import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
 import {
@@ -344,7 +348,7 @@ export interface EngineDriverOptions {
   id?: () => string;
   clock?: () => Date;
   modelCallTimeoutMs?: number;
-  modelTransportMaxRetries?: number;
+  modelTransportRetryPolicy?: Partial<ModelTransportRetryPolicy>;
 }
 
 function zeroUsage(): TokenUsage {
@@ -888,6 +892,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     return (await this.activeRoles.get(orchestrationId)?.cancelOrchestration(orchestrationId)) ?? false;
   }
 
+  resumeConnection(orchestrationId: string): boolean {
+    return this.activeRoles.get(orchestrationId)?.retryNow(orchestrationId) ?? false;
+  }
+
   private roles(orchestrationId: string, sink: OrchestrationSink): RoleExecutor {
     const existing = this.activeRoles.get(orchestrationId);
     if (existing) return existing;
@@ -898,7 +906,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       this.options.runtimeHomeRoot,
       this.newId,
       this.options.modelCallTimeoutMs,
-      this.options.modelTransportMaxRetries,
+      this.options.modelTransportRetryPolicy,
     );
     this.activeRoles.set(orchestrationId, roles);
     return roles;
@@ -1341,6 +1349,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       role: "planner",
       workspacePath: result.workspace.path,
       sandboxMode: "workspace-write",
+      allowedWritePaths: result.task.allowedPaths,
       signal,
       prompt: [
         "Resume the confirmed Direct execution as the same big-model executor.",
@@ -1413,6 +1422,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         role: "worker",
         workspacePath: result.workspace.path,
         sandboxMode: "workspace-write",
+        allowedWritePaths: result.task.allowedPaths,
         signal,
         prompt: [
           "A big-model supervisor is asking you to repair a failed integrated verification.",
@@ -1481,6 +1491,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       role: "integrator",
       workspacePath: candidate.path,
       sandboxMode: "workspace-write",
+      allowedWritePaths: allowedPaths,
       signal,
       prompt: [
         "Apply the supervisor's integration recovery instructions to the integrated candidate.",
@@ -1561,6 +1572,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       role: "planner",
       workspacePath: workspace.path,
       sandboxMode: "workspace-write",
+      allowedWritePaths: task.allowedPaths,
       signal,
       prompt: [
         "Execute the confirmed direct task in the workspace as the single big-model implementer.",

@@ -209,6 +209,16 @@ export function commitUsageToDatabase(
   if (!orchestration) {
     throw new InvalidBudgetValueError("Reservation has no orchestration");
   }
+  const completedModelCall = actual.inputTokens > 0 ||
+    actual.cachedInputTokens > 0 ||
+    actual.outputTokens > 0 ||
+    (actual.arkApiTurns ?? 0) > 0 ||
+    (actual.toolCalls ?? 0) > 0 ||
+    (actual.streamRetries ?? 0) > 0;
+  if (!completedModelCall) {
+    database.reservations.splice(reservationIndex, 1);
+    return;
+  }
   const cost = actualUsageCost(
     actual,
     reservation.role,

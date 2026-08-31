@@ -472,6 +472,7 @@ export class BoundedWorkerLoop {
             role: "worker",
             workspacePath: workspace.path,
             sandboxMode: "workspace-write",
+            allowedWritePaths: task.allowedPaths,
             signal,
             prompt: [
               "Implement only this confirmed task in the writable workspace.",
@@ -605,6 +606,46 @@ export class BoundedWorkerLoop {
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         lastChanges = await this.workspaces.changes(workspace).catch(() => lastChanges);
+        const unsafeChanges = scopeViolations(lastChanges, task.allowedPaths);
+        if (unsafeChanges.length) {
+          try {
+            const sanitized = await this.workspaces.sanitizeScopeViolations(workspace);
+            lastChanges = sanitized.changes;
+            await this.sink.recordEvent({
+              orchestrationId: orchestration.id,
+              taskId: task.id,
+              executionId: started.executionId,
+              type: "worker-scope-sanitized",
+              actorRole: "control-plane",
+              modelId: null,
+              summary: "Removed unauthorized worker changes before preserving the retry checkpoint",
+              metadata: {
+                restoredPathCount: sanitized.restoredPaths.length,
+                retainedChangedFiles: sanitized.changes.changedFiles.length,
+                retainedDeletedFiles: sanitized.changes.deletedFiles.length,
+              },
+            });
+          } catch (sanitizationError) {
+            await this.sink.recordEvent({
+              orchestrationId: orchestration.id,
+              taskId: task.id,
+              executionId: started.executionId,
+              type: "worker-scope-sanitization-failed",
+              actorRole: "control-plane",
+              modelId: null,
+              summary: "Could not restore the isolated worker workspace to its authorized scope; retry stopped safely",
+              metadata: {
+                violationCount: unsafeChanges.length,
+                error: sanitizationError instanceof Error
+                  ? sanitizationError.message.slice(0, 1_000)
+                  : String(sanitizationError).slice(0, 1_000),
+              },
+            });
+            throw new Error(
+              `Worker scope restoration failed safely: ${sanitizationError instanceof Error ? sanitizationError.message : String(sanitizationError)}`,
+            );
+          }
+        }
         const partialUsage = usageFromFailure(error);
         const attemptAlreadyCounted = attemptUsage.inputTokens > 0 ||
           attemptUsage.outputTokens > 0 ||
@@ -621,6 +662,10 @@ export class BoundedWorkerLoop {
         const resumableTransportFailure = isResumableWorkerTransportFailure(lastError);
         const transientFailure = transientExecutionFailure(lastError);
         resumeThreadId = resumableTransportFailure ? failedThreadId : null;
+        const checkpointViolations = scopeViolations(lastChanges, task.allowedPaths);
+        if (checkpointViolations.length) {
+          throw new Error(`Refusing to checkpoint unauthorized worker changes: ${checkpointViolations.join(", ")}`);
+        }
         const checkpointed = await this.saveCheckpoint({
           orchestration,
           task,

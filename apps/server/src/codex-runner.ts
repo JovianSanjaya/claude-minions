@@ -5,6 +5,7 @@ import { CodexSessionTelemetryTracker } from "./codex-session-telemetry.js";
 import type { AppConfig } from "./config.js";
 import { writeCodexConfig } from "./config.js";
 import { RunCancelledError, RunnerExecutionError } from "./errors.js";
+import { diagnoseHostTransport } from "./transport-diagnostics.js";
 import type {
   AgentRunner,
   RunUsage,
@@ -154,6 +155,10 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
+  diagnoseTransport() {
+    return diagnoseHostTransport(this.config.arkBaseUrl);
+  }
+
   async cancel(executionId: string): Promise<boolean> {
     const active = this.active.get(executionId);
     if (!active) {
@@ -282,7 +287,12 @@ export class CodexRunner implements AgentRunner {
         throw new RunnerExecutionError(active.budgetExceeded, partial);
       }
       if (exitCode !== 0) {
-        const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
+        const structured = parsed.errors.at(-1)?.trim();
+        const stderr = streams.stderrTail.trim();
+        const detail = [
+          structured,
+          stderr && stderr !== structured ? `stderr: ${stderr}` : null,
+        ].filter(Boolean).join(" | ") || "No error detail";
         throw new RunnerExecutionError("Codex exited with code " + exitCode + ": " + detail, partial);
       }
       const output = parsed.messages.at(-1)?.trim();

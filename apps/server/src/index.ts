@@ -35,7 +35,7 @@ const executionDriver = new ContextAwareExecutionDriver({
   archiveRoot: config.orchestrationArchiveRoot,
   protectedEvaluatorRoot: config.orchestrationProtectedEvaluatorRoot,
   modelCallTimeoutMs: config.codexTimeoutMs,
-  modelTransportMaxRetries: Math.max(config.arkRequestMaxRetries, config.arkStreamMaxRetries),
+  modelTransportRetryPolicy: config.orchestrationTransportRetryPolicy,
   verificationChecks: [
     { id: "workspace-readable", description: "Candidate workspace is readable", scope: "worker-visible", run: async (candidate) => { const info = await stat(candidate); return { passed: info.isDirectory(), summary: info.isDirectory() ? "Candidate workspace is readable" : "Candidate workspace is not a directory" }; } },
     { id: "protected-boundary", description: "Protected evaluator remains outside the candidate", scope: "protected", run: async (candidate) => ({ passed: !path.resolve(config.orchestrationProtectedEvaluatorRoot).startsWith(path.resolve(candidate) + path.sep), summary: "Protected evaluator boundary remained separate" }) },

@@ -24,7 +24,7 @@ describe("Container Codex runner", () => {
       expect(contents).toContain("model_supports_reasoning_summaries = false");
       expect(contents).toContain("request_max_retries = 3");
       expect(contents).toContain("stream_max_retries = 3");
-      expect(contents).toContain("stream_idle_timeout_ms = 180000");
+      expect(contents).toMatch(/^stream_idle_timeout_ms = 1800000$/m);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -127,6 +127,51 @@ describe("Container Codex runner", () => {
     expect(args).not.toContain("type=bind,src=/tmp/workspace,dst=/workspace,readonly");
     expect(args).toContain("danger-full-access");
     expect(args).not.toContain("workspace-write");
+  });
+
+  it("mounts the workspace read-only and overlays only authorized worker paths as writable", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      CODEX_HOME: "/tmp/codex-home",
+      RUNTIME_PROVIDER: "container",
+    });
+    const args = buildContainerRunArgs({
+      executionId: "scoped-write-execution",
+      agentId: "agent",
+      workspacePath: "/tmp/workspace",
+      prompt: "build the backend",
+      threadId: null,
+      sandboxMode: "workspace-write",
+      allowedWritePaths: ["server", "server/routes", "package.json"],
+    }, config);
+
+    expect(args).toContain("type=bind,src=/tmp/workspace,dst=/workspace,readonly");
+    expect(args).toContain("type=bind,src=/tmp/workspace/server,dst=/workspace/server");
+    expect(args).toContain("type=bind,src=/tmp/workspace/package.json,dst=/workspace/package.json");
+    expect(args).not.toContain("type=bind,src=/tmp/workspace/server/routes,dst=/workspace/server/routes");
+    expect(args.some((value) => value.includes("public"))).toBe(false);
+  });
+
+  it("rejects unsafe container write scopes", () => {
+    const config = loadConfig({ NODE_ENV: "test", CODEX_HOME: "/tmp/codex-home" });
+    expect(() => buildContainerRunArgs({
+      executionId: "unsafe-write-execution",
+      agentId: "agent",
+      workspacePath: "/tmp/workspace",
+      prompt: "escape",
+      threadId: null,
+      sandboxMode: "workspace-write",
+      allowedWritePaths: ["../outside"],
+    }, config)).toThrow("Unsafe allowed write path");
+    expect(() => buildContainerRunArgs({
+      executionId: "unsafe-mount-option",
+      agentId: "agent",
+      workspacePath: "/tmp/workspace",
+      prompt: "escape",
+      threadId: null,
+      sandboxMode: "workspace-write",
+      allowedWritePaths: ["server,readonly"],
+    }, config)).toThrow("Unsafe allowed write path");
   });
 
   it("resumes a thread inside the mounted Runtime workspace", () => {

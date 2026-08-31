@@ -135,6 +135,12 @@ export function registerOrchestrationRoutes(
     return reply.code(202).send({ cancelled });
   });
 
+  app.post("/api/orchestrations/:orchestrationId/connection/resume", async (request, reply) => {
+    const { orchestrationId } = parse(orchestrationParams, request.params);
+    const retryStarted = await service.resumeConnection(orchestrationId);
+    return reply.code(202).send({ retryStarted });
+  });
+
   app.get("/api/orchestrations/:orchestrationId/events", async (request) => {
     const { orchestrationId } = parse(orchestrationParams, request.params);
     return { events: service.getOrchestration(orchestrationId).events };

@@ -102,6 +102,7 @@ const orchestrationSchema = z.object({
     "running",
     "integrating",
     "verifying",
+    "connection-paused",
     "needs-user",
     "budget-exhausted",
     "completed",
@@ -138,6 +139,24 @@ const orchestrationSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   completedAt: z.string().nullable(),
+  connectionResumeStatus: z.enum([
+    "drafting-intent",
+    "awaiting-confirmation",
+    "planning",
+    "ready",
+    "running",
+    "integrating",
+    "verifying",
+    "connection-paused",
+    "needs-user",
+    "budget-exhausted",
+    "completed",
+    "failed",
+    "cancelled",
+  ]).nullable().optional().default(null),
+  connectionPausedAt: z.string().nullable().optional().default(null),
+  connectionNextRetryAt: z.string().nullable().optional().default(null),
+  connectionPauseKeys: z.array(z.string()).optional().default([]),
 });
 
 const criterionSchema = z.object({

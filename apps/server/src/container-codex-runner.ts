@@ -1,4 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 import { CodexSessionTelemetryTracker } from "./codex-session-telemetry.js";
 import type { AppConfig } from "./config.js";
@@ -9,11 +11,13 @@ import {
   parseCodexEventLine,
 } from "./codex-runner.js";
 import { RunCancelledError, RunnerExecutionError } from "./errors.js";
+import { errorIdentity, transportTarget } from "./transport-diagnostics.js";
 import type {
   AgentRunner,
   RunUsage,
   RunnerRequest,
   RunnerResult,
+  TransportDiagnostics,
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -42,12 +46,62 @@ export function containerName(executionId: string, instanceId = "default"): stri
   return "launchpad-" + safeInstance + "-" + safeExecution;
 }
 
+function normalizedAllowedWritePaths(request: RunnerRequest): string[] {
+  if (request.sandboxMode !== "workspace-write" || !request.allowedWritePaths?.length) {
+    return [];
+  }
+  const normalized = request.allowedWritePaths.map((value) => {
+    const raw = value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+    const candidate = path.posix.normalize(raw);
+    if (candidate === ".") return candidate;
+    if (
+      !candidate || candidate.startsWith("/") || candidate.split("/").includes("..") ||
+      /^[A-Za-z]:\//.test(candidate) || /[,\0\r\n]/.test(candidate)
+    ) {
+      throw new Error(`Unsafe allowed write path: ${value}`);
+    }
+    return candidate;
+  }).sort((left, right) => left.split("/").length - right.split("/").length || left.localeCompare(right));
+  const result: string[] = [];
+  for (const candidate of normalized) {
+    if (result.some((parent) => parent === "." || candidate === parent || candidate.startsWith(`${parent}/`))) {
+      continue;
+    }
+    result.push(candidate);
+  }
+  return result;
+}
+
+function scopedWorkspaceMountArgs(request: RunnerRequest): string[] {
+  const allowed = normalizedAllowedWritePaths(request);
+  if (!allowed.length || allowed.includes(".")) return [];
+  return allowed.flatMap((relative) => [
+    "--mount",
+    `type=bind,src=${path.join(request.workspacePath, ...relative.split("/"))},dst=/workspace/${relative}`,
+  ]);
+}
+
+function likelyFilePath(relative: string): boolean {
+  const name = path.posix.basename(relative);
+  if (path.posix.extname(name)) return true;
+  return new Set([
+    ".gitignore",
+    ".dockerignore",
+    "Dockerfile",
+    "Makefile",
+    "Procfile",
+    "LICENSE",
+  ]).has(name);
+}
+
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
 ): string[] {
   const name = containerName(request.executionId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
+  const allowedWritePaths = normalizedAllowedWritePaths(request);
+  const scopedWorkspace = allowedWritePaths.length > 0 && !allowedWritePaths.includes(".");
   return [
     "run",
     "--rm",
@@ -109,7 +163,8 @@ export function buildContainerRunArgs(
     "NO_COLOR=1",
     "--mount",
     "type=bind,src=" + request.workspacePath + ",dst=/workspace" +
-      (request.sandboxMode === "read-only" ? ",readonly" : ""),
+      (request.sandboxMode === "read-only" || scopedWorkspace ? ",readonly" : ""),
+    ...scopedWorkspaceMountArgs(request),
     "--mount",
     "type=bind,src=" + (request.runtimeHomePath ?? config.codexHome) + ",dst=/codex-home",
     "--workdir",
@@ -151,6 +206,46 @@ export class ContainerCodexRunner implements AgentRunner {
     }
   }
 
+  async diagnoseTransport(): Promise<TransportDiagnostics> {
+    const target = transportTarget(this.config.arkBaseUrl);
+    const checkedAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const script = [
+      "const {lookup}=require('node:dns').promises;",
+      "const target=process.argv[1];",
+      "const started=Date.now();",
+      "let dnsAddress=null;",
+      "const identity=(error)=>({code:error?.code??error?.cause?.code??null,message:error?.cause?.message&&!String(error?.message).includes(error.cause.message)?String(error?.message)+': '+error.cause.message:String(error?.message??error)});",
+      "(async()=>{try{dnsAddress=(await lookup(new URL(target).hostname)).address;}catch(error){const e=identity(error);console.log(JSON.stringify({dnsAddress,httpStatus:null,elapsedMs:Date.now()-started,errorCode:e.code,errorMessage:e.message}));return;}try{const response=await fetch(target,{method:'GET',redirect:'manual',signal:AbortSignal.timeout(10000)});await response.body?.cancel();console.log(JSON.stringify({dnsAddress,httpStatus:response.status,elapsedMs:Date.now()-started,errorCode:null,errorMessage:null}));}catch(error){const e=identity(error);console.log(JSON.stringify({dnsAddress,httpStatus:null,elapsedMs:Date.now()-started,errorCode:e.code,errorMessage:e.message}));}})();",
+    ].join("");
+    try {
+      const { stdout } = await execFileAsync(
+        this.config.containerEngine,
+        [
+          "run", "--rm", "--network", "bridge", "--read-only",
+          "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+          "--user", this.config.containerUser,
+          this.config.containerRuntimeImage,
+          "node", "-e", script, target,
+        ],
+        { timeout: 15_000, env: this.childEnvironment(), maxBuffer: 65_536 },
+      );
+      const parsed = JSON.parse(stdout.trim()) as Omit<TransportDiagnostics, "checkedAt" | "target">;
+      return { checkedAt, target, ...parsed };
+    } catch (error) {
+      const identity = errorIdentity(error);
+      return {
+        checkedAt,
+        target,
+        dnsAddress: null,
+        httpStatus: null,
+        elapsedMs: Date.now() - startedAt,
+        errorCode: identity.code,
+        errorMessage: `Container transport diagnostic failed: ${identity.message}`,
+      };
+    }
+  }
+
   async cancel(executionId: string): Promise<boolean> {
     const active = this.active.get(executionId);
     if (!active) return false;
@@ -186,6 +281,7 @@ export class ContainerCodexRunner implements AgentRunner {
     if (request.runtimeHomePath) {
       await writeCodexConfig(this.config, request.runtimeHomePath);
     }
+    await this.prepareAllowedWriteMounts(request);
 
     const child = spawn(
       this.config.containerEngine,
@@ -292,7 +388,12 @@ export class ContainerCodexRunner implements AgentRunner {
         throw new RunnerExecutionError(active.budgetExceeded, partial);
       }
       if (exitCode !== 0) {
-        const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
+        const structured = parsed.errors.at(-1)?.trim();
+        const stderr = streams.stderrTail.trim();
+        const detail = [
+          structured,
+          stderr && stderr !== structured ? `stderr: ${stderr}` : null,
+        ].filter(Boolean).join(" | ") || "No error detail";
         throw new RunnerExecutionError(
           this.config.containerEngine +
             " Runtime exited with code " +
@@ -321,6 +422,36 @@ export class ContainerCodexRunner implements AgentRunner {
       clearTimeout(timeout);
       if (telemetryInterval) clearInterval(telemetryInterval);
       this.active.delete(request.executionId);
+    }
+  }
+
+  private async prepareAllowedWriteMounts(request: RunnerRequest): Promise<void> {
+    const allowed = normalizedAllowedWritePaths(request);
+    if (!allowed.length || allowed.includes(".")) return;
+    const workspaceRoot = await realpath(request.workspacePath);
+    for (const relative of allowed) {
+      const target = path.resolve(workspaceRoot, ...relative.split("/"));
+      if (!target.startsWith(`${workspaceRoot}${path.sep}`)) {
+        throw new Error(`Allowed write path escapes the workspace: ${relative}`);
+      }
+      let current = workspaceRoot;
+      for (const segment of relative.split("/")) {
+        current = path.join(current, segment);
+        const currentStats = await lstat(current).catch(() => null);
+        if (!currentStats) break;
+        if (currentStats.isSymbolicLink()) {
+          throw new Error(`Allowed write path cannot traverse a symlink: ${relative}`);
+        }
+      }
+      const stats = await lstat(target).catch(() => null);
+      if (stats) continue;
+      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+      if (likelyFilePath(relative)) {
+        const handle = await open(target, "a", 0o600);
+        await handle.close();
+      } else {
+        await mkdir(target, { recursive: true, mode: 0o700 });
+      }
     }
   }
 

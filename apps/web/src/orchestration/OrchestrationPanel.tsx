@@ -19,6 +19,7 @@ import {
   budgetStopReason,
   elapsedMsFor,
   evidenceCounters,
+  executionHeading,
   isTerminal,
   orchestrationProgress,
   statusLabel,
@@ -297,6 +298,11 @@ export function OrchestrationPanel({
     });
   };
 
+  const retryConnection = async () => {
+    if (!view || view.orchestration.status !== "connection-paused") return;
+    await runAction(() => api.resumeConnection(view.orchestration.id));
+  };
+
   const openStep = (stepId: WorkflowStepId, index: number) => {
     if (!steps || index > steps.reachedIndex) return;
     setActivePage(stepId);
@@ -527,7 +533,7 @@ export function OrchestrationPanel({
             <AssistantMessage agentName={agentName} meta={statusLabel(view.orchestration.status)}>
               <div className="orch-executing-head">
                 <div>
-                  <strong>{progress.percent === 100 ? "Complete" : "Executing…"}</strong>
+                  <strong>{executionHeading(view.orchestration.status)}</strong>
                   <button type="button" onClick={() => setActivePage("orchestration")}>
                     Open live log ↗
                   </button>
@@ -555,6 +561,34 @@ export function OrchestrationPanel({
                 {progress.activity}
               </p>
               <p className="orch-note">{progress.detail}</p>
+              {view.orchestration.status === "connection-paused" && (
+                <div className="orch-connection-actions">
+                  <span>
+                    Automatic retries remain active
+                    {view.orchestration.connectionNextRetryAt
+                      ? ` · next scheduled ${formatTime(view.orchestration.connectionNextRetryAt)}`
+                      : ""}
+                  </span>
+                  <div>
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      disabled={pending}
+                      onClick={() => void retryConnection()}
+                    >
+                      Retry now
+                    </button>
+                    <button
+                      type="button"
+                      className="button"
+                      disabled={pending}
+                      onClick={() => void runAction(() => api.cancel(view.orchestration.id))}
+                    >
+                      Stop run
+                    </button>
+                  </div>
+                </div>
+              )}
               {view.orchestration.status === "ready" && error && (
                 <button
                   type="button"

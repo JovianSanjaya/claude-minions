@@ -262,6 +262,7 @@ export class OrchestrationControlService implements OrchestrationSink {
       "running",
       "integrating",
       "verifying",
+      "connection-paused",
     ]);
     await this.store.mutate((database) => {
       const now = this.now().toISOString();
@@ -271,6 +272,10 @@ export class OrchestrationControlService implements OrchestrationSink {
         orchestration.error = "Cancelled during restart reconciliation";
         orchestration.updatedAt = now;
         orchestration.completedAt = now;
+        orchestration.connectionResumeStatus = null;
+        orchestration.connectionPausedAt = null;
+        orchestration.connectionNextRetryAt = null;
+        orchestration.connectionPauseKeys = [];
         database.reservations = database.reservations.filter(
           (entry) => entry.orchestrationId !== orchestration.id,
         );
@@ -366,6 +371,10 @@ export class OrchestrationControlService implements OrchestrationSink {
       createdAt: now,
       updatedAt: now,
       completedAt: null,
+      connectionResumeStatus: null,
+      connectionPausedAt: null,
+      connectionNextRetryAt: null,
+      connectionPauseKeys: [],
     };
     await this.store.mutate((database) => {
       if (
@@ -583,6 +592,10 @@ export class OrchestrationControlService implements OrchestrationSink {
         orchestration.error = "Cancelled by user";
         orchestration.completedAt = now;
         orchestration.updatedAt = now;
+        orchestration.connectionResumeStatus = null;
+        orchestration.connectionPausedAt = null;
+        orchestration.connectionNextRetryAt = null;
+        orchestration.connectionPauseKeys = [];
       }
       database.reservations = database.reservations.filter(
         (entry) => entry.orchestrationId !== orchestrationId,
@@ -597,6 +610,30 @@ export class OrchestrationControlService implements OrchestrationSink {
       this.setCleanup(database, orchestrationId, "pending", "Execution engine must reconcile task-specific temporary state");
     });
     return true;
+  }
+
+  async resumeConnection(orchestrationId: string): Promise<boolean> {
+    const snapshot = this.getOrchestration(orchestrationId).orchestration;
+    if (snapshot.status !== "connection-paused") {
+      throw new OrchestrationConflictError("The orchestration is not waiting for its model connection");
+    }
+    const retryStarted = await this.driver.resumeConnection?.(orchestrationId) ?? false;
+    await this.store.mutate((database) => {
+      const orchestration = findOrchestration(database, orchestrationId);
+      if (orchestration.status !== "connection-paused") return;
+      const requestedAt = this.now().toISOString();
+      orchestration.connectionNextRetryAt = retryStarted ? requestedAt : null;
+      orchestration.updatedAt = requestedAt;
+      database.events.push(this.makeEvent(
+        orchestrationId,
+        "connection-retry-requested",
+        retryStarted
+          ? "The next model connection retry was requested immediately"
+          : "A model connection attempt is already in progress",
+        { retryStarted },
+      ));
+    });
+    return retryStarted;
   }
 
   async confirmAmendment(
@@ -823,11 +860,57 @@ export class OrchestrationControlService implements OrchestrationSink {
         );
         throw new BudgetExhaustedError("Step budget exhausted");
       }
+      const eventTime = this.now().toISOString();
+      if (event.type === "role-call-connection-paused" && !isTerminalStatus(orchestration.status)) {
+        const connectionKey = typeof event.metadata.connectionKey === "string"
+          ? event.metadata.connectionKey
+          : `${event.actorRole}:${event.taskId ?? "global"}`;
+        if (orchestration.status !== "connection-paused") {
+          assertTransition(orchestration.status, "connection-paused");
+          orchestration.connectionResumeStatus = orchestration.status;
+          orchestration.status = "connection-paused";
+          orchestration.connectionPausedAt = eventTime;
+        }
+        orchestration.connectionPauseKeys = [
+          ...new Set([...(orchestration.connectionPauseKeys ?? []), connectionKey]),
+        ];
+        orchestration.connectionNextRetryAt = typeof event.metadata.nextRetryAt === "string"
+          ? event.metadata.nextRetryAt
+          : null;
+        orchestration.updatedAt = eventTime;
+      } else if (event.type === "role-call-transport-retry" && orchestration.status === "connection-paused") {
+        orchestration.connectionNextRetryAt = typeof event.metadata.nextRetryAt === "string"
+          ? event.metadata.nextRetryAt
+          : orchestration.connectionNextRetryAt ?? null;
+        orchestration.updatedAt = eventTime;
+      } else if (event.type === "role-call-connection-restored" && orchestration.status === "connection-paused") {
+        const connectionKey = typeof event.metadata.connectionKey === "string"
+          ? event.metadata.connectionKey
+          : `${event.actorRole}:${event.taskId ?? "global"}`;
+        orchestration.connectionPauseKeys = (orchestration.connectionPauseKeys ?? [])
+          .filter((key) => key !== connectionKey);
+        if (orchestration.connectionPauseKeys.length > 0) {
+          orchestration.updatedAt = eventTime;
+        } else {
+          const resumeStatus = orchestration.connectionResumeStatus;
+          if (!resumeStatus || resumeStatus === "connection-paused" || isTerminalStatus(resumeStatus)) {
+            throw new OrchestrationConflictError("The preserved orchestration phase cannot be resumed");
+          }
+          assertTransition(orchestration.status, resumeStatus);
+          orchestration.status = resumeStatus;
+          orchestration.connectionResumeStatus = null;
+          orchestration.connectionPausedAt = null;
+          orchestration.connectionNextRetryAt = null;
+          orchestration.connectionPauseKeys = [];
+          orchestration.error = null;
+          orchestration.updatedAt = eventTime;
+        }
+      }
       database.events.push({
         ...redactClone(event),
         id: this.newId(),
         summary: redactString(event.summary),
-        createdAt: this.now().toISOString(),
+        createdAt: eventTime,
       });
     });
   }
@@ -1098,7 +1181,7 @@ export class OrchestrationControlService implements OrchestrationSink {
           const message = redactString(
             error instanceof Error ? error.message : String(error),
           );
-          if (orchestration.status === "running") {
+          if (orchestration.status === "running" || orchestration.status === "connection-paused") {
             orchestration.status = "failed";
           } else if (orchestration.status === "drafting-intent" || orchestration.status === "planning") {
             orchestration.status = "failed";
@@ -1106,6 +1189,10 @@ export class OrchestrationControlService implements OrchestrationSink {
             return;
           }
           orchestration.error = message;
+          orchestration.connectionResumeStatus = null;
+          orchestration.connectionPausedAt = null;
+          orchestration.connectionNextRetryAt = null;
+          orchestration.connectionPauseKeys = [];
           orchestration.completedAt = this.now().toISOString();
           orchestration.updatedAt = orchestration.completedAt;
           database.events.push(

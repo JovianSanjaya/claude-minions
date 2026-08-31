@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -184,6 +184,50 @@ describe("engine primitives", () => {
     expect(scopeViolations(changes, worker.allowedPaths)).toEqual(["src/b.ts"]);
     expect(await readFile(path.join(source, "src", "a.ts"), "utf8")).toBe("a\n");
     expect(await manager.cleanup(worker, "clean")).toEqual({ status: "cleaned", path: null });
+    await expect(realpath(worker.baselinePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("restores unauthorized changes to the immutable worker baseline while retaining allowed work", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "engine-scope-sanitize-"));
+    temporary.push(root);
+    const source = path.join(root, "source");
+    await mkdir(path.join(source, "server"), { recursive: true });
+    await mkdir(path.join(source, "public"), { recursive: true });
+    await writeFile(path.join(source, "server", "index.js"), "server baseline\n");
+    await writeFile(path.join(source, "public", "index.html"), "frontend baseline\n");
+    await writeFile(path.join(source, "README.md"), "readme baseline\n");
+    const manager = new WorkerWorkspaceManager(path.join(root, "temp"), path.join(root, "archive"));
+    const worker = await manager.create(source, "o1", "backend", ["server"]);
+
+    await writeFile(path.join(worker.path, "server", "index.js"), "valid backend work\n");
+    await writeFile(path.join(worker.path, "public", "index.html"), "unauthorized overwrite\n");
+    await writeFile(path.join(worker.path, "public", "placeholder.html"), "unauthorized new file\n");
+    await rm(path.join(worker.path, "README.md"));
+
+    expect(scopeViolations(await manager.changes(worker), worker.allowedPaths)).toEqual([
+      "public/index.html",
+      "public/placeholder.html",
+      "README.md",
+    ]);
+    const sanitized = await manager.sanitizeScopeViolations(worker);
+
+    expect(sanitized.restoredPaths).toEqual([
+      "public/index.html",
+      "public/placeholder.html",
+      "README.md",
+    ]);
+    expect(sanitized.changes.changedFiles).toEqual(["server/index.js"]);
+    expect(sanitized.changes.deletedFiles).toEqual([]);
+    expect(await readFile(path.join(worker.path, "server", "index.js"), "utf8"))
+      .toBe("valid backend work\n");
+    expect(await readFile(path.join(worker.path, "public", "index.html"), "utf8"))
+      .toBe("frontend baseline\n");
+    await expect(readFile(path.join(worker.path, "public", "placeholder.html"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path.join(worker.path, "README.md"), "utf8"))
+      .toBe("readme baseline\n");
+    expect(await readFile(path.join(source, "public", "index.html"), "utf8"))
+      .toBe("frontend baseline\n");
   });
 
   it("repairs one malformed role response and uses distinct execution IDs", async () => {

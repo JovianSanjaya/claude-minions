@@ -102,4 +102,23 @@ describe("budget ledger", () => {
     expect(item.usage.totalEstimatedUsd).toBeNull();
     expect(item.usage.pricingStatus).toBe("unknown");
   });
+
+  it("releases a zero-usage transport reservation without charging a model call", () => {
+    const database = emptyOrchestrationDatabase();
+    const item = orchestration();
+    database.orchestrations.push(item);
+    database.reservations.push({
+      ...reservation, id: "r1", estimatedUsd: 0.0007, createdAt: new Date(0).toISOString(),
+    });
+    commitUsageToDatabase(database, "r1", {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      arkApiTurns: 0,
+      toolCalls: 0,
+      streamRetries: 0,
+    }, pricing);
+    expect(item.usage.byRole.worker).toBeUndefined();
+    expect(database.reservations).toHaveLength(0);
+  });
 });

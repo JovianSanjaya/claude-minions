@@ -10,7 +10,7 @@ describe("orchestration state machine", () => {
   it("accepts every declared legal transition and cancellation from active states", () => {
     const statuses: OrchestrationStatus[] = [
       "drafting-intent", "awaiting-confirmation", "planning", "ready", "running",
-      "integrating", "verifying", "needs-user", "budget-exhausted", "completed",
+      "integrating", "verifying", "connection-paused", "needs-user", "budget-exhausted", "completed",
       "failed", "cancelled",
     ];
     for (const status of statuses) {

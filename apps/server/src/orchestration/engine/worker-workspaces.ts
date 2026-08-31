@@ -12,8 +12,14 @@ export interface WorkerWorkspace {
   orchestrationId: string;
   taskId: string;
   path: string;
+  baselinePath: string;
   base: WorkspaceManifest;
   allowedPaths: string[];
+}
+
+export interface ScopeSanitizationResult {
+  restoredPaths: string[];
+  changes: WorkspaceChanges;
 }
 
 export interface WorkspaceChanges {
@@ -30,6 +36,38 @@ function safeSegment(value: string): string {
 
 function within(root: string, candidate: string): boolean {
   return candidate !== root && candidate.startsWith(`${root}${path.sep}`);
+}
+
+function resolvedChild(root: string, relative: string): string {
+  const normalized = relative.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (!normalized || normalized.startsWith("/") || normalized.split("/").includes("..")) {
+    throw new Error(`Unsafe workspace-relative path: ${relative}`);
+  }
+  const candidate = path.resolve(root, ...normalized.split("/"));
+  if (!within(path.resolve(root), candidate)) {
+    throw new Error(`Workspace path escapes its root: ${relative}`);
+  }
+  return candidate;
+}
+
+async function restoreBaselineEntry(
+  baselineRoot: string,
+  workspaceRoot: string,
+  relative: string,
+): Promise<void> {
+  const baseline = resolvedChild(baselineRoot, relative);
+  const target = resolvedChild(workspaceRoot, relative);
+  const baselineStats = await lstat(baseline).catch(() => null);
+  await rm(target, { recursive: true, force: true });
+  if (!baselineStats) return;
+  await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+  if (baselineStats.isDirectory()) {
+    await copyWorkspaceTree(baseline, target);
+  } else if (baselineStats.isFile()) {
+    await copyFile(baseline, target);
+  } else {
+    throw new Error(`Baseline contains an unsupported entry: ${relative}`);
+  }
 }
 
 export async function copyWorkspaceTree(source: string, destination: string, relative = ""): Promise<void> {
@@ -115,16 +153,21 @@ export class WorkerWorkspaceManager {
       throw new Error("Worker temp root must be separate from the Agent workspace");
     }
     const orchestrationRoot = path.join(temp, safeSegment(orchestrationId));
-    const destination = path.join(orchestrationRoot, safeSegment(taskId));
+    const safeTaskId = safeSegment(taskId);
+    const destination = path.join(orchestrationRoot, safeTaskId);
+    const baseline = path.join(orchestrationRoot, `${safeTaskId}.baseline`);
     if (!within(temp, destination)) throw new Error("Unsafe worker workspace target");
     await mkdir(orchestrationRoot, { recursive: true, mode: 0o700 });
+    await mkdir(baseline, { recursive: false, mode: 0o700 });
+    await copyWorkspaceTree(source, baseline);
     await mkdir(destination, { recursive: false, mode: 0o700 });
-    await copyWorkspaceTree(source, destination);
+    await copyWorkspaceTree(baseline, destination);
     return {
       orchestrationId,
       taskId,
       path: destination,
-      base: await workspaceManifest(destination),
+      baselinePath: baseline,
+      base: await workspaceManifest(baseline),
       allowedPaths: [...allowedPaths],
     };
   }
@@ -133,13 +176,31 @@ export class WorkerWorkspaceManager {
     return diffManifest(workspace.base, await workspaceManifest(workspace.path));
   }
 
+  async sanitizeScopeViolations(
+    workspace: WorkerWorkspace,
+  ): Promise<ScopeSanitizationResult> {
+    const before = await this.changes(workspace);
+    const violations = scopeViolations(before, workspace.allowedPaths);
+    for (const relative of violations) {
+      await restoreBaselineEntry(workspace.baselinePath, workspace.path, relative);
+    }
+    const changes = await this.changes(workspace);
+    const remaining = scopeViolations(changes, workspace.allowedPaths);
+    if (remaining.length) {
+      throw new Error(`Scope sanitation left unauthorized changes: ${remaining.join(", ")}`);
+    }
+    return { restoredPaths: violations, changes };
+  }
+
   async cleanup(
     workspace: WorkerWorkspace,
     policy: "clean" | "archive" | "retain",
   ): Promise<{ status: "cleaned" | "archived" | "retained"; path: string | null }> {
     const temp = await realpath(this.tempRoot);
     const target = await realpath(workspace.path);
+    const baseline = await realpath(workspace.baselinePath);
     if (!within(temp, target)) throw new Error("Refusing unsafe worker cleanup target");
+    if (!within(temp, baseline)) throw new Error("Refusing unsafe worker baseline cleanup target");
     if (policy === "retain") return { status: "retained", path: target };
     if (policy === "archive") {
       const archive = await realpath(this.archiveRoot);
@@ -149,9 +210,11 @@ export class WorkerWorkspaceManager {
       );
       if (!within(archive, destination)) throw new Error("Refusing unsafe archive target");
       await rename(target, destination);
+      await rm(baseline, { recursive: true, force: false });
       return { status: "archived", path: destination };
     }
     await rm(target, { recursive: true, force: false });
+    await rm(baseline, { recursive: true, force: false });
     return { status: "cleaned", path: null };
   }
 

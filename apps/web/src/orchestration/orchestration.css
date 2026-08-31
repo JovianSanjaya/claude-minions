@@ -44,7 +44,7 @@
 .state-completed,.state-passed{background:#dcf2e9;color:#277756}
 .state-failed,.state-budget-exhausted{background:#f6dfdc;color:#ac4343}
 .state-running,.state-planning,.state-verifying,.state-integrating{background:#e8e4fb;color:#5640bc}
-.state-needs-user,.state-stale{background:#fff0c9;color:#785b13}
+.state-needs-user,.state-stale,.state-connection-paused{background:#fff0c9;color:#785b13}
 .orch-filters{display:flex;gap:8px}
 .orch-filters label{font-size:9px}
 .orch-filters select{display:block;margin-top:3px;border:1px solid #d9d7cf;border-radius:7px;padding:5px;background:#fff}
@@ -421,6 +421,22 @@
   font-size: 9px;
 }
 
+.orch-connection-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid #e5ca82;
+  border-radius: 9px;
+  background: #fff7df;
+  color: #70530e;
+  font-size: 10px;
+}
+
+.orch-connection-actions > div { display: flex; gap: 7px; flex: 0 0 auto; }
+
 .orch-inline-result {
   border-left: 3px solid #8c8c84;
   padding: 8px 12px;
@@ -434,6 +450,10 @@
 .orch-inline-result.state-failed,
 .orch-inline-result.state-budget-exhausted {
   border-left-color: #c55353;
+}
+
+.orch-inline-result.state-connection-paused {
+  border-left-color: #c99723;
 }
 
 /* Five-page execution overlay */

@@ -63,6 +63,7 @@ const intent = {
 type RecordedCall = {
   taskId: string | undefined;
   sandboxMode: string | undefined;
+  allowedWritePaths: string[] | undefined;
   runtimeProfile: string | undefined;
   role: string | undefined;
   prompt: string;
@@ -120,6 +121,7 @@ function fakeRunner(
   workerConcurrencyProbe?: WorkerConcurrencyProbe,
   repairMutatesPlanFields = false,
   firstPlanOverTotalBudget = false,
+  firstWorkerScopeViolation = false,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   let recoveryApplied = false;
@@ -127,9 +129,10 @@ function fakeRunner(
   let planningResponses = 0;
   let workerBudgetBoundaryRaised = false;
   let workerGracefulCheckpointRaised = false;
+  let workerScopeViolationRaised = false;
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId });
+      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, allowedWritePaths: request.allowedWritePaths, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId });
       const probesWorker = Boolean(
         workerConcurrencyProbe && request.prompt.includes("Implement only this confirmed task"),
       );
@@ -255,6 +258,14 @@ function fakeRunner(
             path.join(request.workspacePath, isA ? "src/a.ts" : "src/b.ts"),
             isA ? "export const a = 1;\n" : "export const b = 2;\n",
           );
+          if (firstWorkerScopeViolation && isA && !workerScopeViolationRaised) {
+            workerScopeViolationRaised = true;
+            await mkdir(path.join(request.workspacePath, "public"), { recursive: true });
+            await writeFile(
+              path.join(request.workspacePath, "public/index.html"),
+              "<p>unauthorized worker edit</p>\n",
+            );
+          }
         }
         if (!gracefulCheckpointThisCall) {
           output = JSON.stringify({
@@ -348,6 +359,7 @@ async function setup(
   workerConcurrencyProbe?: WorkerConcurrencyProbe,
   repairMutatesPlanFields = false,
   firstPlanOverTotalBudget = false,
+  firstWorkerScopeViolation = false,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
@@ -382,6 +394,7 @@ async function setup(
       workerConcurrencyProbe,
       repairMutatesPlanFields,
       firstPlanOverTotalBudget,
+      firstWorkerScopeViolation,
     ),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
@@ -467,6 +480,49 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
         .toBeLessThan(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write"));
     }
+  });
+
+  it("sanitizes an out-of-scope worker edit before checkpointing and retries from the clean workspace", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null,
+      false, false, false, false, undefined, false, false, true,
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const plan = await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, new AbortController().signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(await readFile(path.join(workspace, "src/a.ts"), "utf8")).toContain("a = 1");
+    await expect(readFile(path.join(workspace, "public/index.html"), "utf8")).rejects.toThrow();
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "worker-scope-sanitized",
+      summary: expect.stringContaining("Removed unauthorized worker changes"),
+    }));
+    expect(sink.attempts).toContainEqual(expect.objectContaining({
+      status: "failed",
+      changedFiles: ["src/a.ts"],
+      errorSummary: expect.stringContaining("Worker scope violation: public/index.html"),
+      checkpointed: true,
+    }));
+    expect(
+      calls.filter((call) =>
+        call.sandboxMode === "workspace-write" &&
+        call.prompt.includes("Task: Add A"),
+      ),
+    ).toEqual(expect.arrayContaining([
+      expect.objectContaining({ allowedWritePaths: ["src/a.ts"] }),
+    ]));
   });
 
   it("executes distinct dependency-ready workers concurrently", async () => {

@@ -9,6 +9,7 @@ export type OrchestrationStatus =
   | "running"
   | "integrating"
   | "verifying"
+  | "connection-paused"
   | "needs-user"
   | "budget-exhausted"
   | "completed"
@@ -111,6 +112,10 @@ export interface OrchestrationSummary {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  connectionResumeStatus: OrchestrationStatus | null;
+  connectionPausedAt: string | null;
+  connectionNextRetryAt: string | null;
+  connectionPauseKeys: string[];
 }
 
 export interface ContractCriterion {

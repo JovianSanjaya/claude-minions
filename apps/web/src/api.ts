@@ -94,6 +94,7 @@ export const orchestrationApi: OrchestrationApi = {
     }),
   }),
   start: (id) => request(`/api/orchestrations/${id}/start`, { method: "POST" }),
+  resumeConnection: (id) => request(`/api/orchestrations/${id}/connection/resume`, { method: "POST" }),
   cancel: (id) => request(`/api/orchestrations/${id}/cancel`, { method: "POST" }),
   confirmAmendment: (id, amendmentId, response) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/confirm`, {
     method: "POST",

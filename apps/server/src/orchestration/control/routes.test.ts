@@ -41,6 +41,9 @@ const driver: OrchestrationExecutionDriver = {
   async cancel() {
     return true;
   },
+  resumeConnection() {
+    return true;
+  },
 };
 
 async function makeApp(auth = false) {
@@ -88,6 +91,33 @@ describe("orchestration routes", () => {
     const id = accepted.json().orchestration.id as string;
     expect(accepted.json().orchestration.requestedMode).toBe("auto");
     await service.waitForIdle(id);
+
+    await service.recordEvent({
+      orchestrationId: id,
+      taskId: null,
+      executionId: null,
+      type: "role-call-connection-paused",
+      actorRole: "planner",
+      modelId: "planner-model",
+      summary: "Connection paused",
+      metadata: { nextRetryAt: new Date().toISOString() },
+    });
+    const resumed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${id}/connection/resume`,
+    });
+    expect(resumed.statusCode).toBe(202);
+    expect(resumed.json().retryStarted).toBe(true);
+    await service.recordEvent({
+      orchestrationId: id,
+      taskId: null,
+      executionId: "execution-restored",
+      type: "role-call-connection-restored",
+      actorRole: "planner",
+      modelId: "planner-model",
+      summary: "Connection restored",
+      metadata: {},
+    });
 
     const revised = await app.inject({
       method: "PATCH",

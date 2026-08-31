@@ -113,7 +113,9 @@ export function EvidenceTimeline({
         <ul className="orch-timeline">
           {[...visible].reverse().map((event) => {
             const tone = eventTone(event);
-            const metadata = Object.entries(event.metadata).slice(0, 8);
+            // Connection diagnostics include target, DNS, HTTP, timing, and the
+            // underlying error identity; keep the complete diagnostic packet visible.
+            const metadata = Object.entries(event.metadata).slice(0, 16);
             return (
               <li key={event.id} data-tone={tone}>
                 <span className="orch-timeline-mark" aria-hidden="true">

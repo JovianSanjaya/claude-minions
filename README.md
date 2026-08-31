@@ -29,11 +29,15 @@ docker build -f Dockerfile.runtime -t volc-agent-runtime:local .
 
 Verifier turns receive a read-only candidate mount plus bounded writable `/tmp`, private shared memory, subprocess support, loopback sockets, and bundled Chromium. They do not launch the host browser or use its profile.
 
+Implementation workers receive a read-only workspace with writable bind overlays only for their planned `allowedPaths`. The control plane also keeps an isolated baseline: if a non-container runner still changes an unauthorized path, that path is restored inside the worker copy before any checkpoint or retry while valid in-scope work is retained. The shared Agent workspace is changed only after integration and verification succeed.
+
 The UI itself is visible without Ark credentials, but model-backed intent/planning/execution needs valid credentials. Never place secrets in prompts, Agent workspaces, browser configuration, commits, screenshots, or event metadata.
 
 ## Configuration
 
 All logical roles default to `ARK_MODEL`; optional `ORCHESTRATION_*_MODEL` variables can select different validated server-side model IDs. Orchestration data, temporary worker copies, archives, Runtime homes, and protected evaluators live under `.data` by default. Dollar values display as unknown until server-side pricing is configured; the UI always calls them **estimated cost**, never billed cost.
+
+Ark's `ARK_REQUEST_MAX_RETRIES` and `ARK_STREAM_MAX_RETRIES` apply only inside one Codex process. The platform-level `ORCHESTRATION_TRANSPORT_*` settings independently provide jittered recovery across processes. By default the platform retries until cancellation, enters a visible `connection-paused` state after five minutes, preserves the model thread and workspace checkpoints, and resumes automatically when ModelArk responds. `CODEX_TIMEOUT_MS` and `ARK_STREAM_IDLE_TIMEOUT_MS` both default to 30 minutes. See `.env.example` for the retry-window, delay, jitter, and optional finite retry controls.
 
 ## Test and demo
 
@@ -45,6 +49,6 @@ See [docs/DEMO.md](docs/DEMO.md) for normal and deterministic budget-stop journe
 
 ## Recovery and limitations
 
-Restart reconciliation cancels interrupted work while retaining redacted evidence. Stop/delete cancels orchestration children; worker scratch state follows the configured archive policy. This is a single-node POC, JSON stores assume one writer process, protected checks reduce gaming but do not prove correctness, ordinary containers are not hardened multi-tenant isolation, and the live benchmark adapter uses a compact common verification check rather than a universal quality oracle.
+Transient ModelArk/DNS/TLS/HTTP transport loss pauses and retries the same in-memory execution while retaining redacted diagnostics. A server-process restart cannot reconstruct an in-flight model call, so restart reconciliation cancels interrupted work while retaining evidence. Stop/delete cancels orchestration children; worker scratch state follows the configured archive policy. This is a single-node POC, JSON stores assume one writer process, protected checks reduce gaming but do not prove correctness, ordinary containers are not hardened multi-tenant isolation, and the live benchmark adapter uses a compact common verification check rather than a universal quality oracle.
 
 Architecture and security details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

@@ -46,6 +46,41 @@ describe("orchestration model configuration", () => {
     });
   });
 
+  it("keeps Ark retries separate from durable orchestration transport recovery", () => {
+    const defaults = loadConfig({ NODE_ENV: "test" });
+    expect(defaults).toMatchObject({
+      codexTimeoutMs: 1_800_000,
+      arkStreamIdleTimeoutMs: 1_800_000,
+      orchestrationTransportRetryPolicy: {
+        maxRetries: null,
+        pauseAfterMs: 300_000,
+        baseDelayMs: 1_000,
+        maxDelayMs: 30_000,
+        jitterRatio: 0.2,
+      },
+    });
+
+    const configured = loadConfig({
+      NODE_ENV: "test",
+      ARK_REQUEST_MAX_RETRIES: "2",
+      ARK_STREAM_MAX_RETRIES: "4",
+      ORCHESTRATION_TRANSPORT_MAX_RETRIES: "12",
+      ORCHESTRATION_TRANSPORT_RETRY_WINDOW_MS: "90000",
+      ORCHESTRATION_TRANSPORT_RETRY_BASE_MS: "250",
+      ORCHESTRATION_TRANSPORT_RETRY_MAX_DELAY_MS: "5000",
+      ORCHESTRATION_TRANSPORT_RETRY_JITTER_RATIO: "0.1",
+    });
+    expect(configured.arkRequestMaxRetries).toBe(2);
+    expect(configured.arkStreamMaxRetries).toBe(4);
+    expect(configured.orchestrationTransportRetryPolicy).toEqual({
+      maxRetries: 12,
+      pauseAfterMs: 90_000,
+      baseDelayMs: 250,
+      maxDelayMs: 5_000,
+      jitterRatio: 0.1,
+    });
+  });
+
   it("shares one big endpoint across trusted roles and one small endpoint across workers", () => {
     const config = loadConfig({
       NODE_ENV: "test",

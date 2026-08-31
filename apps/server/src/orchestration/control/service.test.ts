@@ -19,6 +19,7 @@ const AGENT_ID = "11111111-1111-4111-8111-111111111111";
 
 class FakeDriver implements OrchestrationExecutionDriver {
   cancelled = 0;
+  connectionRetries = 0;
   outcome: ExecutionOutcome = { kind: "completed", finalOutput: "published" };
   materialQuestions: string[] = [];
   reconciliationPrompts: string[] = [];
@@ -94,6 +95,11 @@ class FakeDriver implements OrchestrationExecutionDriver {
 
   async cancel(): Promise<boolean> {
     this.cancelled += 1;
+    return true;
+  }
+
+  resumeConnection(): boolean {
+    this.connectionRetries += 1;
     return true;
   }
 }
@@ -277,6 +283,76 @@ describe("OrchestrationControlService", () => {
     expect(service.getOrchestration(id).events.some((event) => event.type === "cancellation")).toBe(true);
     await service.cancel(id);
     expect(driver.cancelled).toBe(2);
+  });
+
+  it("preserves the current phase during a transport pause and restores it after recovery", async () => {
+    const driver = new FakeDriver();
+    const { service } = await fixture(driver);
+    const created = await service.createOrchestration(AGENT_ID, {
+      prompt: "Recover the connection", requestedMode: "auto",
+    });
+    await service.waitForIdle(created.id);
+    expect(service.getOrchestration(created.id).orchestration.status).toBe("awaiting-confirmation");
+
+    const nextRetryAt = new Date(Date.now() + 30_000).toISOString();
+    await service.recordEvent({
+      orchestrationId: created.id,
+      taskId: null,
+      executionId: null,
+      type: "role-call-connection-paused",
+      actorRole: "planner",
+      modelId: "planner-model",
+      summary: "Planner connection remains unavailable",
+      metadata: { nextRetryAt },
+    });
+    expect(service.getOrchestration(created.id).orchestration).toMatchObject({
+      status: "connection-paused",
+      connectionResumeStatus: "awaiting-confirmation",
+      connectionNextRetryAt: nextRetryAt,
+    });
+    await service.recordEvent({
+      orchestrationId: created.id,
+      taskId: "task-2",
+      executionId: null,
+      type: "role-call-connection-paused",
+      actorRole: "worker",
+      modelId: "worker-model",
+      summary: "Worker connection remains unavailable",
+      metadata: { connectionKey: "worker:task-2", nextRetryAt },
+    });
+
+    await expect(service.resumeConnection(created.id)).resolves.toBe(true);
+    expect(driver.connectionRetries).toBe(1);
+    await service.recordEvent({
+      orchestrationId: created.id,
+      taskId: null,
+      executionId: "execution-2",
+      type: "role-call-connection-restored",
+      actorRole: "planner",
+      modelId: "planner-model",
+      summary: "Planner connection restored",
+      metadata: {},
+    });
+    expect(service.getOrchestration(created.id).orchestration).toMatchObject({
+      status: "connection-paused",
+      connectionPauseKeys: ["worker:task-2"],
+    });
+    await service.recordEvent({
+      orchestrationId: created.id,
+      taskId: "task-2",
+      executionId: "execution-3",
+      type: "role-call-connection-restored",
+      actorRole: "worker",
+      modelId: "worker-model",
+      summary: "Worker connection restored",
+      metadata: { connectionKey: "worker:task-2" },
+    });
+    expect(service.getOrchestration(created.id).orchestration).toMatchObject({
+      status: "awaiting-confirmation",
+      connectionResumeStatus: null,
+      connectionPausedAt: null,
+      connectionNextRetryAt: null,
+    });
   });
 
   it("stores a material amendment and requires renewed explicit confirmation", async () => {

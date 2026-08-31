@@ -7,6 +7,7 @@ export interface OrchestrationApi {
   reviseIntent(id: string, revision: string): Promise<unknown>;
   confirm(id: string, criteria?: ContractCriterion[], answers?: string[]): Promise<unknown>;
   start(id: string): Promise<unknown>;
+  resumeConnection(id: string): Promise<unknown>;
   cancel(id: string): Promise<unknown>;
   confirmAmendment(id: string, amendmentId: string, response?: string): Promise<unknown>;
   rejectAmendment(id: string, amendmentId: string): Promise<unknown>;
