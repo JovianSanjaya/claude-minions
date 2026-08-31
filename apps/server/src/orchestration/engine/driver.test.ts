@@ -68,12 +68,14 @@ type RecordedCall = {
   role: string | undefined;
   prompt: string;
   threadId: string | null | undefined;
+  workspacePath: string;
 };
 
 type WorkerConcurrencyProbe = {
   active: number;
   maximumActive: number;
   startedTaskIds: string[];
+  sawPredecessorOutput?: boolean;
 };
 
 function orchestration(workspace: string): Orchestration {
@@ -132,7 +134,7 @@ function fakeRunner(
   let workerScopeViolationRaised = false;
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, allowedWritePaths: request.allowedWritePaths, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId });
+      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, allowedWritePaths: request.allowedWritePaths, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId, workspacePath: request.workspacePath });
       const probesWorker = Boolean(
         workerConcurrencyProbe && request.prompt.includes("Implement only this confirmed task"),
       );
@@ -149,7 +151,7 @@ function fakeRunner(
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
       } else if (
-        request.prompt.includes("Create a bounded coding plan") ||
+        request.prompt.includes("Create the most execution-efficient correct coding task graph") ||
         ((firstPlanAllowedPath !== null || firstPlanOversizedTask || firstPlanSerialChain || firstPlanOverTotalBudget) && request.prompt.includes("Invalid output to repair"))
       ) {
         const isRepair = request.prompt.includes("Invalid output to repair");
@@ -161,22 +163,6 @@ function fakeRunner(
         const returnSerialChain = firstPlanSerialChain && planningResponses === 0;
         const returnOverTotalBudget = firstPlanOverTotalBudget && planningResponses === 0;
         planningResponses += 1;
-        const acceptanceTests = [
-          { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
-          { id: "accept-b", title: "Module B works", criterionIds: ["c2"], category: "functional", scope: "protected", procedure: "Inspect and exercise module B", expectedOutcome: "B exports the expected value" },
-          { id: "regression", title: "Regression checks pass", criterionIds: [], category: "regression", scope: "global", procedure: "Run relevant repository checks", expectedOutcome: "Checks pass" },
-        ];
-        if (includePostReleaseAcceptance) {
-          acceptanceTests.push({
-            id: "final-reply",
-            title: "User receives the final reply",
-            criterionIds: [],
-            category: "functional",
-            scope: "global",
-            procedure: "Review the agent's final response to the user",
-            expectedOutcome: "The final response tells the user what was delivered",
-          });
-        }
         output = JSON.stringify({
           coupling: "LOW", estimatedCalls: "8",
           estimatedArkApiTurns: returnOversizedTask ? 60 : 10,
@@ -187,7 +173,6 @@ function fakeRunner(
                 { title: "Add A", objective: mutatesPlanFields ? "Unrelated rewritten objective A" : "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], estimatedArkApiTurns: mutatesPlanFields || returnOverTotalBudget ? 80 : 5, estimatedInputTokens: mutatesPlanFields ? 800_000 : 40_000, explanatoryNote: "safe unknown field" },
                 { title: "Add B", objective: mutatesPlanFields ? "Unrelated rewritten objective B" : "Add B", dependsOn: returnSerialChain ? ["0"] : [], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: returnSerialChain ? ["api-contract"] : [], estimatedArkApiTurns: mutatesPlanFields || returnOverTotalBudget ? 80 : 5, estimatedInputTokens: mutatesPlanFields ? 800_000 : 40_000 },
               ],
-          acceptanceTests,
         });
       } else if (request.prompt.includes("Produce a read-only worker preflight")) {
         const isA = request.prompt.includes("Task: Add A");
@@ -221,6 +206,12 @@ function fakeRunner(
         output = "Applied big-model Direct recovery";
       } else if (request.prompt.includes("Implement only this confirmed task")) {
         const isA = request.prompt.includes("Task: Add A");
+        if (!isA && workerConcurrencyProbe) {
+          workerConcurrencyProbe.sawPredecessorOutput = await readFile(
+            path.join(request.workspacePath, "src/a.ts"),
+            "utf8",
+          ).then(() => true).catch(() => false);
+        }
         let gracefulCheckpointThisCall = false;
         if (firstWorkerGracefulCheckpoint && isA && !workerGracefulCheckpointRaised) {
           workerGracefulCheckpointRaised = true;
@@ -321,9 +312,9 @@ function fakeRunner(
         );
         output = JSON.stringify({
           results: [
-            { testId: "accept-a", status: acceptanceShouldFail ? "failed" : "passed", evidence: acceptanceShouldFail ? "Module A did not satisfy its protected behavior check" : "Inspected src/a.ts and confirmed its export" },
-            { testId: "accept-b", status: "passed", evidence: "Inspected src/b.ts and confirmed its export" },
-            { testId: "regression", status: "passed", evidence: "Relevant regression inspection passed" },
+            { testId: "criterion-c1", status: acceptanceShouldFail ? "failed" : "passed", evidence: acceptanceShouldFail ? "Module A did not satisfy its protected behavior check" : "Inspected src/a.ts and confirmed its export" },
+            { testId: "criterion-c2", status: "passed", evidence: "Inspected src/b.ts and confirmed its export" },
+            { testId: "existing-regression-suite", status: "passed", evidence: "Relevant regression inspection passed" },
           ],
         });
       } else {
@@ -429,12 +420,12 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(sink.maps.map((map) => map.version)).toEqual([1, 2]);
     expect(sink.packets.length).toBeGreaterThanOrEqual(2);
     const testPlanArtifacts = sink.artifacts.filter((artifact) =>
-      artifact.name.startsWith("Planner acceptance test:"),
+      artifact.name.startsWith("Contract acceptance test:"),
     );
     expect(testPlanArtifacts).toHaveLength(3);
     expect(testPlanArtifacts[0]).toMatchObject({
       kind: "decision",
-      producerTaskId: "planner",
+      producerTaskId: "control-plane",
     });
     expect(
       sink.artifacts
@@ -448,16 +439,16 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect.arrayContaining(["worker-visible", "protected", "global"]),
     );
     expect(sink.verifications.map((record) => record.commandOrCheck)).toEqual(
-      expect.arrayContaining(["Module A works", "Module B works", "Regression checks pass"]),
+      expect.arrayContaining(["Verify: A works", "Verify: B works", "Existing regression suite remains healthy"]),
     );
     expect(
-      sink.verifications.find((record) => record.commandOrCheck === "Regression checks pass"),
+      sink.verifications.find((record) => record.commandOrCheck === "Existing regression suite remains healthy"),
     ).toMatchObject({
       status: "skipped",
       outputSummary: expect.stringContaining("starting workspace had no existing"),
     });
     expect(sink.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "acceptance-plan-created", actorRole: "planner", modelId: "strong" }),
+      expect.objectContaining({ type: "acceptance-plan-created", actorRole: "control-plane", modelId: null }),
       expect.objectContaining({ type: "acceptance-verification-completed", actorRole: "verifier", modelId: "verify" }),
     ]));
     expect(calls.filter((call) => call.role === "worker" && call.sandboxMode === "workspace-write"))
@@ -465,7 +456,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
         expect.objectContaining({ prompt: expect.stringContaining("Relevant confirmed acceptance criteria") }),
       ]));
     expect(calls.filter((call) => call.role === "worker").map((call) => call.prompt).join("\n"))
-      .not.toContain("Inspect and exercise module A");
+      .not.toContain("Inspect the integrated candidate");
     expect(calls.filter((call) => call.role === "verifier")).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -564,25 +555,38 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     }));
   });
 
-  it("repairs a serial multi-task plan into a genuinely parallel worker batch", async () => {
+  it("accepts an efficient serial multi-worker plan without forcing parallelism", async () => {
+    const probe: WorkerConcurrencyProbe = { active: 0, maximumActive: 0, startedTaskIds: [] };
     const { workspace, driver, calls } = await setup(
       false, false, false, false, false, false, "stop", null,
-      false, false, false, true,
+      false, false, false, true, probe,
     );
     const sink = new Sink();
+    const item = orchestration(workspace);
     const plan = await driver.plan({
-      orchestration: orchestration(workspace),
+      orchestration: item,
       contract: contract(),
       workspacePath: workspace,
     }, sink, new AbortController().signal);
 
     expect(plan.selectedMode).toBe("multi-worker");
-    expect(plan.tasks.every((task) => task.dependsOn.length === 0)).toBe(true);
+    expect(plan.tasks[1]?.dependsOn).toEqual([plan.tasks[0]!.id]);
     const plannerCalls = calls.filter((call) => call.role === "planner");
-    expect(plannerCalls).toHaveLength(2);
-    expect(plannerCalls[1]?.prompt).toContain(
-      "at least one parallel-ready batch of two or more independent tasks",
-    );
+    expect(plannerCalls).toHaveLength(1);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "route-decision",
+      metadata: expect.objectContaining({ maximumParallelWorkers: 1 }),
+    }));
+
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, new AbortController().signal);
+    expect(outcome.kind).toBe("completed");
+    expect(probe.maximumActive).toBe(1);
+    expect(probe.sawPredecessorOutput).toBe(true);
   });
 
   it("continues a token-limited worker from its checkpoint in a fresh Codex thread", async () => {
@@ -694,7 +698,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     }, sink, new AbortController().signal);
 
     const planningCall = calls.find((call) =>
-      call.role === "planner" && call.prompt.includes("Create a bounded coding plan")
+      call.role === "planner" && call.prompt.includes("Create the most execution-efficient correct coding task graph")
     );
     expect(planningCall?.prompt).toContain("Total model-call budget: 100");
     expect(planningCall?.prompt).toContain(
@@ -706,6 +710,8 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(planningCall?.prompt).toContain("Return estimatedCalls no greater than 95");
     expect(planningCall?.prompt).toContain('"estimatedCalls"');
     expect(planningCall?.prompt).toContain('"maximum":95');
+    expect(planningCall?.prompt).toContain("Parallelism is enabled, never forced");
+    expect(planningCall?.prompt).not.toContain("acceptanceTests");
     expect(sink.events).toContainEqual(expect.objectContaining({
       type: "route-decision",
       metadata: expect.objectContaining({
@@ -752,13 +758,16 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(plannerCalls[1]?.prompt).toContain("Invalid output to repair");
   });
 
-  it("repairs overlapping worker ownership instead of combining the plan into one oversized worker", async () => {
+  it("accepts overlapping write scopes once and serializes only the conflicting workers", async () => {
+    const probe: WorkerConcurrencyProbe = { active: 0, maximumActive: 0, startedTaskIds: [] };
     const { workspace, driver, calls } = await setup(
       false, false, false, false, false, false, "stop", "src",
+      false, false, false, false, probe,
     );
     const sink = new Sink();
+    const item = orchestration(workspace);
     const plan = await driver.plan({
-      orchestration: orchestration(workspace),
+      orchestration: item,
       contract: contract(),
       workspacePath: workspace,
     }, sink, new AbortController().signal);
@@ -767,16 +776,28 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(plan.tasks).toHaveLength(2);
     expect(plan.tasks.map((task) => task.title)).toEqual(["Add A", "Add B"]);
     expect(plan.tasks.some((task) => task.title === "Focused combined worker")).toBe(false);
+    expect(plan.tasks.every((task) => task.dependsOn.length === 0)).toBe(true);
     const plannerCalls = calls.filter((call) => call.role === "planner");
-    expect(plannerCalls).toHaveLength(2);
-    expect(plannerCalls[1]?.prompt).toContain("Worker allowedPaths overlap");
-    expect(plannerCalls[1]?.prompt).toContain("Give every writable path exactly one owner");
+    expect(plannerCalls).toHaveLength(1);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "route-decision",
+      metadata: expect.objectContaining({ maximumParallelWorkers: 1 }),
+    }));
+
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, new AbortController().signal);
+    expect(outcome.kind).toBe("completed");
+    expect(probe.maximumActive).toBe(1);
+    expect(probe.sawPredecessorOutput).toBe(true);
   });
 
-  it("preserves task estimates and objectives while repairing overlapping ownership", async () => {
+  it("keeps the planner's valid overlapping ownership without a repair pass", async () => {
     const { workspace, driver, calls } = await setup(
       false, false, false, false, false, false, "stop", "src",
-      false, false, false, false, undefined, true,
     );
     const sink = new Sink();
     const plan = await driver.plan({
@@ -786,11 +807,8 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     }, sink, new AbortController().signal);
 
     expect(plan.tasks.map((task) => task.objective)).toEqual(["Add A", "Add B"]);
-    expect(plan.tasks.flatMap((task) => task.allowedPaths)).toEqual(["src/a.ts", "src/b.ts"]);
-    expect(calls.filter((call) => call.role === "planner")).toHaveLength(2);
-    expect(calls.filter((call) => call.role === "planner")[1]?.prompt).toContain(
-      "Do not increase or otherwise recalculate task estimates",
-    );
+    expect(plan.tasks.flatMap((task) => task.allowedPaths)).toEqual(["src", "src/b.ts"]);
+    expect(calls.filter((call) => call.role === "planner")).toHaveLength(1);
     expect(sink.events).toContainEqual(expect.objectContaining({
       type: "route-decision",
       metadata: expect.objectContaining({
@@ -844,19 +862,26 @@ describe("ContextAwareExecutionDriver acceptance", () => {
   });
 
   it("defers post-release effects without sending them to the release verifier", async () => {
-    const { workspace, driver, calls } = await setup(false, false, false, false, true);
+    const { workspace, driver, calls } = await setup();
     const sink = new Sink();
     const signal = new AbortController().signal;
     const item = orchestration(workspace);
+    const postReleaseContract = contract();
+    postReleaseContract.criteria.push({
+      id: "c3",
+      kind: "functional",
+      description: "User receives the final reply",
+      verification: "visible-test",
+    });
     const plan = await driver.plan({
       orchestration: item,
-      contract: contract(),
+      contract: postReleaseContract,
       workspacePath: workspace,
     }, sink, signal);
 
     const outcome = await driver.execute({
       orchestration: item,
-      contract: contract(),
+      contract: postReleaseContract,
       workspacePath: workspace,
       plan,
     }, sink, signal);
@@ -867,9 +892,9 @@ describe("ContextAwareExecutionDriver acceptance", () => {
         .filter((call) => call.role === "verifier")
         .map((call) => call.prompt)
         .join("\n"),
-    ).not.toContain("final-reply");
+    ).not.toContain("criterion-c3");
     expect(
-      sink.verifications.find((record) => record.commandOrCheck === "User receives the final reply"),
+      sink.verifications.find((record) => record.commandOrCheck === "Verify: User receives the final reply"),
     ).toMatchObject({
       status: "skipped",
       outputSummary: expect.stringContaining("Deferred until after verified publication"),
@@ -931,7 +956,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(sink.verifications.find((record) => record.scope === "global")?.status).toBe("failed");
   });
 
-  it("blocks publication when the big verifier fails a planner-generated acceptance test", async () => {
+  it("blocks publication when the big verifier fails a contract-derived acceptance test", async () => {
     const { workspace, driver } = await setup(false, false, false, true);
     const sink = new Sink();
     const signal = new AbortController().signal;
@@ -943,7 +968,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       kind: "failed",
       reason: "Protected or global verification failed; main workspace was not changed",
     });
-    expect(sink.verifications.find((record) => record.commandOrCheck === "Module A works")?.status)
+    expect(sink.verifications.find((record) => record.commandOrCheck === "Verify: A works")?.status)
       .toBe("failed");
     await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
     expect(sink.events.some((event) => event.type === "verified-publish")).toBe(false);

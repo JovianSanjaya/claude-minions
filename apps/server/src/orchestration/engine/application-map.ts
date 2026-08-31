@@ -70,6 +70,27 @@ function inspectSource(relativePath: string, source: string) {
   return { imports, exports, summary: semanticSummary(relativePath, source) };
 }
 
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, concurrency), values.length) },
+    async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await operation(values[index]!);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 export async function buildApplicationMap(
   workspacePath: string,
   orchestrationId: string,
@@ -83,30 +104,44 @@ export async function buildApplicationMap(
   const walk = async (directory: string): Promise<void> => {
     const children = await readdir(directory, { withFileTypes: true });
     children.sort((a, b) => a.name.localeCompare(b.name));
-    for (const child of children) {
+    const inspected = await mapWithConcurrency(children, 32, async (child) => {
       const absolute = path.join(directory, child.name);
       const relative = path.relative(root, absolute).replaceAll(path.sep, "/");
-      if (isApplicationMapExcluded(relative)) continue;
+      if (isApplicationMapExcluded(relative)) return null;
       const stats = await lstat(absolute);
-      if (stats.isSymbolicLink()) continue;
-      if (stats.isDirectory()) {
-        await walk(absolute);
-        continue;
-      }
-      if (!stats.isFile() || stats.size > 1_000_000) continue;
+      if (stats.isSymbolicLink()) return null;
+      if (stats.isDirectory()) return { kind: "directory" as const, absolute, relative, child };
+      if (!stats.isFile() || stats.size > 1_000_000) return null;
+      return { kind: "file" as const, absolute, relative, child };
+    });
+    for (const candidate of inspected) {
+      if (candidate?.kind === "directory") await walk(candidate.absolute);
+    }
+    const files = inspected.filter(
+      (candidate): candidate is NonNullable<typeof candidate> & { kind: "file" } =>
+        candidate?.kind === "file",
+    );
+    const mapped = await mapWithConcurrency(files, 16, async ({ absolute, relative, child }) => {
       const buffer = await readFile(absolute);
       const sha256 = createHash("sha256").update(buffer).digest("hex");
       const source = textExtensions.has(path.extname(relative).toLowerCase())
         ? buffer.toString("utf8")
         : "";
       const facts = source ? inspectSource(relative, source) : { imports: [], exports: [], summary: `Binary asset ${relative}` };
-      entries.push({ path: relative, sha256, bytes: buffer.byteLength, ...facts });
-      if (/^(?:package\.json|pyproject\.toml|Cargo\.toml|go\.mod)$/.test(child.name)) {
-        packageBoundaries.push(path.dirname(relative) === "." ? "." : path.dirname(relative));
-      }
+      return {
+        entry: { path: relative, sha256, bytes: buffer.byteLength, ...facts },
+        packageBoundary: /^(?:package\.json|pyproject\.toml|Cargo\.toml|go\.mod)$/.test(child.name)
+          ? path.dirname(relative) === "." ? "." : path.dirname(relative)
+          : null,
+      };
+    });
+    for (const result of mapped) {
+      entries.push(result.entry);
+      if (result.packageBoundary !== null) packageBoundaries.push(result.packageBoundary);
     }
   };
   await walk(root);
+  entries.sort((left, right) => left.path.localeCompare(right.path));
   const repositoryHash = createHash("sha256")
     .update(entries.map((entry) => `${entry.path}:${entry.sha256}`).join("\n"))
     .digest("hex");

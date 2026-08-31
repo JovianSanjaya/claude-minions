@@ -17,6 +17,11 @@ export interface IntegrationCandidate {
   conflicts: string[];
 }
 
+export interface ExecutionStage {
+  path: string;
+  base: WorkspaceManifest;
+}
+
 export type ConflictResolver = (input: {
   path: string;
   variants: Array<{ taskId: string; content: Buffer }>;
@@ -33,21 +38,31 @@ function safeRelative(file: string): string {
 export class DeterministicIntegrator {
   constructor(private readonly tempRoot: string) {}
 
-  async integrate(
-    orchestrationId: string,
-    sourceWorkspace: string,
-    workers: IntegrationInput[],
-    resolveConflict?: ConflictResolver,
-  ): Promise<IntegrationCandidate> {
-    const staging = path.join(
+  private stagingPath(orchestrationId: string, name: "integration" | "execution-stage"): string {
+    return path.join(
       this.tempRoot,
       orchestrationId.replace(/[^A-Za-z0-9_.-]/g, "-"),
-      "integration",
+      name,
     );
+  }
+
+  private async createStaging(
+    orchestrationId: string,
+    sourceWorkspace: string,
+    name: "integration" | "execution-stage",
+  ): Promise<ExecutionStage> {
+    const staging = this.stagingPath(orchestrationId, name);
     await mkdir(path.dirname(staging), { recursive: true, mode: 0o700 });
     await mkdir(staging, { recursive: false, mode: 0o700 });
     await copyWorkspaceTree(sourceWorkspace, staging);
-    const base = await workspaceManifest(sourceWorkspace);
+    return { path: staging, base: await workspaceManifest(sourceWorkspace) };
+  }
+
+  private async applyInputs(
+    staging: string,
+    workers: IntegrationInput[],
+    resolveConflict?: ConflictResolver,
+  ): Promise<string[]> {
     const variants = new Map<string, IntegrationInput[]>();
     for (const worker of workers) {
       for (const file of [...worker.changes.changedFiles, ...worker.changes.deletedFiles]) {
@@ -88,12 +103,63 @@ export class DeterministicIntegrator {
       await mkdir(path.dirname(destination), { recursive: true });
       await writeFile(destination, content);
     }
+    return conflicts;
+  }
+
+  async createExecutionStage(
+    orchestrationId: string,
+    sourceWorkspace: string,
+  ): Promise<ExecutionStage> {
+    return this.createStaging(orchestrationId, sourceWorkspace, "execution-stage");
+  }
+
+  async applyExecutionWave(stage: ExecutionStage, workers: IntegrationInput[]): Promise<void> {
+    const conflicts = await this.applyInputs(stage.path, workers);
+    if (conflicts.length) {
+      throw new Error(`Concurrent worker write conflict escaped scheduling: ${conflicts.join(", ")}`);
+    }
+  }
+
+  async discardExecutionStage(orchestrationId: string): Promise<void> {
+    await this.discardNamed(orchestrationId, "execution-stage");
+  }
+
+  async integrate(
+    orchestrationId: string,
+    sourceWorkspace: string,
+    workers: IntegrationInput[],
+    resolveConflict?: ConflictResolver,
+  ): Promise<IntegrationCandidate> {
+    return this.integrateWaves(
+      orchestrationId,
+      sourceWorkspace,
+      [workers],
+      resolveConflict,
+    );
+  }
+
+  async integrateWaves(
+    orchestrationId: string,
+    sourceWorkspace: string,
+    waves: IntegrationInput[][],
+    resolveConflict?: ConflictResolver,
+  ): Promise<IntegrationCandidate> {
+    const { path: staging, base } = await this.createStaging(
+      orchestrationId,
+      sourceWorkspace,
+      "integration",
+    );
+    const conflicts: string[] = [];
+    for (const workers of waves) {
+      conflicts.push(...await this.applyInputs(staging, workers, resolveConflict));
+    }
     if (conflicts.length && !resolveConflict) {
+      const manifest = await workspaceManifest(staging);
       return {
         path: staging,
         base,
-        manifest: await workspaceManifest(staging),
-        changes: diffManifest(base, await workspaceManifest(staging)),
+        manifest,
+        changes: diffManifest(base, manifest),
         conflicts,
       };
     }
@@ -150,11 +216,18 @@ export class DeterministicIntegrator {
   }
 
   async discard(orchestrationId: string): Promise<void> {
+    await this.discardNamed(orchestrationId, "integration");
+  }
+
+  private async discardNamed(
+    orchestrationId: string,
+    name: "integration" | "execution-stage",
+  ): Promise<void> {
     const root = await realpath(this.tempRoot);
     const target = path.join(
       root,
       orchestrationId.replace(/[^A-Za-z0-9_.-]/g, "-"),
-      "integration",
+      name,
     );
     if (target === root || !target.startsWith(`${root}${path.sep}`)) {
       throw new Error("Refusing unsafe integration discard target");

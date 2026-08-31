@@ -96,8 +96,8 @@ export function orchestrationProgress(
     ],
     planning: [
       "Step 2 of 5",
-      "Building the task and test list",
-      "The planner is assigning bounded work and acceptance checks.",
+      "Building the execution graph",
+      "The planner is choosing efficient task boundaries while the control plane derives contract checks.",
     ],
     ready: ["Step 2 of 5", "Plan ready", "Execution will start automatically."],
     running: [

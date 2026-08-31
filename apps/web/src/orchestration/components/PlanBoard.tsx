@@ -25,7 +25,10 @@ function plannedTests(view: OrchestrationReadModel): PlannedAcceptanceTest[] {
     );
   };
   return view.artifacts.flatMap((artifact) => {
-    if (!artifact.name.startsWith("Planner acceptance test:") || !artifact.payload) {
+    if (
+      !(artifact.name.startsWith("Contract acceptance test:") || artifact.name.startsWith("Planner acceptance test:")) ||
+      !artifact.payload
+    ) {
       return [];
     }
     try {
@@ -50,7 +53,7 @@ export function PlanBoard({ view }: { view: OrchestrationReadModel }) {
     <section className="orch-panel" aria-labelledby="orch-plan-heading">
       <header>
         <div>
-          <span className="eyebrow">Planner · Task & Test List</span>
+          <span className="eyebrow">Task graph & contract checks</span>
           <h3 id="orch-plan-heading">
             {view.plan ? routeLabel(view.plan.selectedMode) : "Planning the execution route"}
           </h3>

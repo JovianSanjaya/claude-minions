@@ -185,14 +185,23 @@ export class RoleExecutor {
       return { ...first, value: parseStructured(schema, first.rawOutput) };
     } catch (error) {
       if (!(error instanceof StructuredOutputError)) throw error;
+      const resumesFirstExecution = Boolean(first.threadId);
       const repair = await this.call(
-        input,
-        [
-          repairPrompt(error, jsonSchema),
-          ...(repairOptions.instructions ?? []),
-          "Invalid output to repair:",
-          first.rawOutput,
-        ].join("\n"),
+        first.threadId ? { ...input, threadId: first.threadId } : input,
+        resumesFirstExecution
+          ? [
+              "Correct your immediately preceding JSON response in this same thread.",
+              "Return the complete corrected JSON value only, with no prose or markdown fences.",
+              `Validation problems: ${error.issues.join("; ")}`,
+              ...(repairOptions.instructions ?? []),
+              "Reuse every valid field from your preceding response; change only what these validation problems require.",
+            ].join("\n")
+          : [
+              repairPrompt(error, jsonSchema),
+              ...(repairOptions.instructions ?? []),
+              "Invalid output to repair:",
+              first.rawOutput,
+            ].join("\n"),
       );
       try {
         if (!repairOptions.merge) {

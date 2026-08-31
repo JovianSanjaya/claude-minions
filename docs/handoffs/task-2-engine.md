@@ -130,7 +130,7 @@ Failure tests prove bounded retries, compact planner escalation, global-verifica
 
 - Task 1's current `publishArtifact` store adapter upserts solely by `artifact.id`; Task 2 treats that ID as a stable artifact lineage and emits v1, v2, and later versions. Final Assembly should change Task 1 persistence to retain entries by `(id, version)` so historical versions are not overwritten. Task 2 control-file ownership prevented changing it here.
 - Protected evaluator definitions and the trusted command catalog must be provisioned by Final Assembly. The engine enforces their boundary and never mounts or returns the protected root to workers.
-- Multi-worker batches run concurrently only when their dependency graph says they are ready together; dependent work waits and refreshes focused artifacts.
+- Multi-worker batches run concurrently only when dependencies are satisfied and write scopes do not collide. Colliding writers are serialized automatically, and every later wave starts from the staged output of completed waves.
 - The publish path provides best-effort per-file rollback suitable for the single-user POC, not a cross-process filesystem transaction.
 - Ordinary local/container execution remains a hackathon POC trust boundary, not hardened multi-tenant isolation.
 - Model pricing and dollar accounting remain Task 1/Final Assembly configuration; Task 2 reserves and commits every role call through the frozen sink.

@@ -15,7 +15,7 @@ export const plannedAcceptanceTestSchema = z.object({
 export const protectedAcceptancePlanSchema = z.object({
   orchestrationId: z.string().min(1),
   contractVersion: z.number().int().positive(),
-  generatedBy: z.literal("planner"),
+  generatedBy: z.enum(["planner", "control-plane"]),
   tests: z.array(plannedAcceptanceTestSchema).min(1).max(200),
 }).strict();
 

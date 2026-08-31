@@ -34,13 +34,20 @@ or worker reasoning transcripts.
 
 Persists immutable intent/contract versions, explicit confirmation, task state,
 events, usage reservations, hard budgets, cancellation, and restart reconciliation.
-The execution engine maps the repository, selects a route, gives each worker the
-minimum relevant context, performs a read-only preflight, and uses task-specific
-workspace copies. Shared coordination happens through versioned artifacts.
+The execution engine maps the repository, asks the planner for a compact task
+graph, and selects direct, sequential, parallel, or hybrid execution without
+forcing parallelism. It gives each worker the minimum relevant context,
+performs a read-only preflight, and uses task-specific workspace copies. Shared
+coordination happens through versioned artifacts.
 
-Protected and global checks run outside worker authority. Integration is
-deterministic for non-overlapping edits; a focused integrator handles remaining
-conflicts. The main Agent workspace is updated only after required verification.
+The scheduler computes conflict-free waves: dependency-ready workers with
+non-overlapping write scopes run concurrently, while only colliding writers are
+serialized. Each completed wave is applied to a private stage before the next
+wave starts, so downstream workers see upstream changes and sequential workers
+may safely edit the same path. Protected and global checks run outside worker
+authority. Integration replays the same waves deterministically; a focused
+integrator handles only unexpected same-wave conflicts. The main Agent workspace
+is updated only after required verification.
 Verifier model turns run in the disposable Runtime with the candidate mounted
 read-only. A bounded temporary filesystem, private shared memory, subprocesses,
 loopback sockets, and bundled Chromium provide runtime-test capability without

@@ -184,8 +184,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 250,
       maxWorkerAttempts: env.ORCHESTRATION_MAX_WORKER_ATTEMPTS ?? 3,
       maxContextExpansionsPerTask: env.ORCHESTRATION_MAX_CONTEXT_EXPANSIONS ?? 3,
-      maxArkApiTurns: env.ORCHESTRATION_MAX_ARK_API_TURNS ?? 150,
-      maxArkApiTurnsPerExecution: env.ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION ?? 15,
+      maxArkApiTurns: env.ORCHESTRATION_MAX_ARK_API_TURNS ?? 240,
+      maxArkApiTurnsPerExecution: env.ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION ?? 20,
       maxInputTokensPerExecution: env.ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION ?? 250_000,
     },
     orchestrationPricing: env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined

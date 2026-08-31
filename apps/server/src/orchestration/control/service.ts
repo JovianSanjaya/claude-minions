@@ -161,8 +161,8 @@ const DEFAULT_BUDGET: BudgetPolicy = {
   maxSteps: 250,
   maxWorkerAttempts: 3,
   maxContextExpansionsPerTask: 3,
-  maxArkApiTurns: 150,
-  maxArkApiTurnsPerExecution: 15,
+  maxArkApiTurns: 240,
+  maxArkApiTurnsPerExecution: 20,
   maxInputTokensPerExecution: 250_000,
 };
 

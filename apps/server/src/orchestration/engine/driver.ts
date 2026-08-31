@@ -24,13 +24,16 @@ import {
 } from "./application-map.js";
 import {
   comprehensiveAcceptanceTests,
-  plannedAcceptanceTestSchema,
   requiresPostReleaseVerification,
 } from "./acceptance-plan.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker } from "./context-broker.js";
 import { classifyFailure } from "./failure-packet.js";
-import { DeterministicIntegrator, type IntegrationCandidate } from "./integrator.js";
+import {
+  DeterministicIntegrator,
+  type ExecutionStage,
+  type IntegrationCandidate,
+} from "./integrator.js";
 import {
   isInternalInfrastructureFailure,
   looksUserActionableFailure,
@@ -43,7 +46,7 @@ import {
   type ModelTransportRetryPolicy,
   type RoleModelConfiguration,
 } from "./role-executor.js";
-import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
+import { maximumWriteSafeBatch, selectRoute } from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
 import {
   BoundedWorkerLoop,
@@ -110,52 +113,6 @@ const allowedPathSchema = z.string().min(1).max(500).superRefine((value, context
 
 const PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE = 4;
 
-function recordValue(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function mergeScopedPlanRepair(
-  original: unknown,
-  repaired: unknown,
-  issues: string[],
-): unknown {
-  const mayRepairOwnershipOrDependencies = issues.length > 0 && issues.every((issue) =>
-    /allowedPaths|writable path|write scopes|parallel-ready|dependsOn|dependencies/i.test(issue)
-  );
-  if (!mayRepairOwnershipOrDependencies) return repaired;
-
-  const originalPlan = recordValue(original);
-  const repairedPlan = recordValue(repaired);
-  const originalTasks = originalPlan?.tasks;
-  const repairedTasks = repairedPlan?.tasks;
-  if (!Array.isArray(originalTasks) || !Array.isArray(repairedTasks) || originalTasks.length !== repairedTasks.length) {
-    return repaired;
-  }
-
-  const tasks = originalTasks.map((originalTask, index) => {
-    const originalRecord = recordValue(originalTask);
-    const repairedRecord = recordValue(repairedTasks[index]);
-    if (
-      !originalRecord ||
-      !repairedRecord ||
-      originalRecord.title !== repairedRecord.title ||
-      !Array.isArray(repairedRecord.allowedPaths) ||
-      !Array.isArray(repairedRecord.dependsOn)
-    ) {
-      return null;
-    }
-    return {
-      ...originalRecord,
-      allowedPaths: repairedRecord.allowedPaths,
-      dependsOn: repairedRecord.dependsOn,
-    };
-  });
-  if (tasks.some((task) => task === null)) return repaired;
-  return { ...originalPlan, tasks };
-}
-
 function deterministicPlanArkApiTurns(value: {
   estimatedArkApiTurns: number;
   tasks: Array<{ estimatedArkApiTurns?: number | undefined }>;
@@ -169,18 +126,34 @@ function deterministicPlanArkApiTurns(value: {
   );
 }
 
-function taskWaveWidths(tasks: Array<{ dependsOn: number[] }>): number[] {
+function taskWaveWidths(tasks: Array<{ dependsOn: number[]; allowedPaths: string[] }>): number[] {
   const completed = new Set<number>();
   const remaining = new Set(tasks.map((_, index) => index));
   const widths: number[] = [];
+  const dependentCounts = tasks.map(() => 0);
+  tasks.forEach((task, descendant) => {
+    const ancestors = [...task.dependsOn];
+    const seen = new Set<number>();
+    while (ancestors.length) {
+      const ancestor = ancestors.pop()!;
+      if (seen.has(ancestor)) continue;
+      seen.add(ancestor);
+      dependentCounts[ancestor] = dependentCounts[ancestor]! + 1;
+      ancestors.push(...tasks[ancestor]!.dependsOn);
+    }
+  });
 
   while (remaining.size) {
     const ready = [...remaining].filter((index) =>
       tasks[index]!.dependsOn.every((dependency) => completed.has(dependency))
     );
     if (!ready.length) return [];
-    widths.push(ready.length);
-    for (const index of ready) {
+    const safeBatch = maximumWriteSafeBatch(
+      ready.map((index) => ({ index, allowedPaths: tasks[index]!.allowedPaths })),
+      ({ index }) => 1 + dependentCounts[index]!,
+    );
+    widths.push(safeBatch.length);
+    for (const { index } of safeBatch) {
       remaining.delete(index);
       completed.add(index);
     }
@@ -189,8 +162,44 @@ function taskWaveWidths(tasks: Array<{ dependsOn: number[] }>): number[] {
   return widths;
 }
 
-function maximumTaskWaveWidth(tasks: Array<{ dependsOn: number[] }>): number {
+function maximumTaskWaveWidth(tasks: Array<{ dependsOn: number[]; allowedPaths: string[] }>): number {
   return Math.max(0, ...taskWaveWidths(tasks));
+}
+
+function executionTaskWaves(tasks: OrchestrationTask[]): OrchestrationTask[][] {
+  const completed = new Set<string>();
+  const remaining = new Set(tasks.map((task) => task.id));
+  const waves: OrchestrationTask[][] = [];
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  const dependentCounts = new Map(tasks.map((task) => [task.id, 0]));
+  for (const task of tasks) {
+    const ancestors = [...task.dependsOn];
+    const seen = new Set<string>();
+    while (ancestors.length) {
+      const ancestor = ancestors.pop()!;
+      if (seen.has(ancestor)) continue;
+      seen.add(ancestor);
+      dependentCounts.set(ancestor, (dependentCounts.get(ancestor) ?? 0) + 1);
+      ancestors.push(...(tasksById.get(ancestor)?.dependsOn ?? []));
+    }
+  }
+  while (remaining.size) {
+    const ready = tasks.filter(
+      (task) => remaining.has(task.id) && task.dependsOn.every((dependency) => completed.has(dependency)),
+    );
+    if (!ready.length) throw new Error("Plan dependency graph cannot make progress");
+    const wave = maximumWriteSafeBatch(
+      ready,
+      (task) => 1 + (dependentCounts.get(task.id) ?? 0),
+    );
+    if (!wave.length) throw new Error("Write-safe scheduler cannot make progress");
+    waves.push(wave);
+    for (const task of wave) {
+      remaining.delete(task.id);
+      completed.add(task.id);
+    }
+  }
+  return waves;
 }
 
 const planSchema = (
@@ -198,7 +207,6 @@ const planSchema = (
   maximumEstimatedArkTurns: number,
   maximumTaskArkTurns: number,
   maximumTaskInputTokens: number,
-  requireParallelBatch: boolean,
 ) => z.object({
   coupling: z.preprocess((value) => typeof value === "string" ? value.toLowerCase() : value, z.enum(["low", "medium", "high"])),
   estimatedCalls: z.coerce.number().int().positive().max(maximumEstimatedCalls),
@@ -215,22 +223,12 @@ const planSchema = (
     estimatedArkApiTurns: z.coerce.number().int().positive().optional(),
     estimatedInputTokens: z.coerce.number().int().positive().optional(),
   })).min(1).max(20),
-  acceptanceTests: z.array(plannedAcceptanceTestSchema).max(200).default([]),
-}).strict().superRefine((value, context) => {
-  if (value.tasks.length > 1 && tasksHaveOverlappingWriteScopes(value.tasks)) {
-    context.addIssue({
-      code: "custom",
-      path: ["tasks"],
-      message: "Worker allowedPaths overlap. Give every writable path exactly one owner, assign shared root files to a foundation task, and express ordering with dependsOn.",
-    });
-  }
+}).strip().superRefine((value, context) => {
   const defaultTurns = Math.ceil(value.estimatedArkApiTurns / value.tasks.length);
   const contextPerTask = Math.max(1, Math.ceil(value.estimatedContextTokens / value.tasks.length));
-  let dependenciesAreValid = true;
   value.tasks.forEach((task, index) => {
     for (const dependency of task.dependsOn) {
       if (dependency >= index) {
-        dependenciesAreValid = false;
         context.addIssue({
           code: "custom",
           path: ["tasks", index, "dependsOn"],
@@ -244,7 +242,7 @@ const planSchema = (
       context.addIssue({
         code: "custom",
         path: ["tasks", index, "estimatedArkApiTurns"],
-        message: `Task requires about ${estimatedTurns} Ark turns but its ${maximumTaskArkTurns}-turn continuation capacity is smaller. Split it into bounded tasks with exclusive paths, only necessary dependencies, and a parallel-ready wave when multiple workers are used.`,
+        message: `Task requires about ${estimatedTurns} Ark turns but its ${maximumTaskArkTurns}-turn continuation capacity is smaller. Split it into bounded tasks with coherent objectives, add only genuine data dependencies, and allow the scheduler to serialize overlapping write scopes.`,
       });
     }
     if (estimatedInput > maximumTaskInputTokens) {
@@ -255,18 +253,6 @@ const planSchema = (
       });
     }
   });
-  if (
-    requireParallelBatch &&
-    value.tasks.length > 1 &&
-    dependenciesAreValid &&
-    maximumTaskWaveWidth(value.tasks) < 2
-  ) {
-    context.addIssue({
-      code: "custom",
-      path: ["tasks"],
-      message: "A multi-worker plan must contain at least one parallel-ready batch of two or more independent tasks. Remove unnecessary dependsOn edges, fan out tasks after any required foundation task, or return one combined task if safe parallelism is impossible.",
-    });
-  }
   const allTaskTurnsAreExplicit = value.tasks.every(
     (task) => task.estimatedArkApiTurns !== undefined,
   );
@@ -530,6 +516,25 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         verification,
       })),
     };
+    const planningMap = {
+      summary: map.summary,
+      packageBoundaries: map.packageBoundaries,
+      topLevelAreas: [...new Set(map.entries.map((entry) => entry.path.split("/")[0]))].slice(0, 100),
+      paths: map.entries.slice(0, 800).map((entry) => entry.path),
+      details: map.entries
+        .filter((entry) =>
+          /(^|\/)(?:package\.json|pyproject\.toml|cargo\.toml|go\.mod|readme\.md|[^/]+\.config\.[^/]+)$/i.test(entry.path) ||
+          /(^|\/)(?:src|app|apps|server|client|web|api|public|tests?)\//i.test(entry.path)
+        )
+        .slice(0, 240)
+        .map((entry) => ({
+          path: entry.path,
+          imports: entry.imports.slice(0, 12),
+          exports: entry.exports.slice(0, 12),
+          summary: entry.summary,
+        })),
+      truncated: map.entries.length > 800,
+    };
     const result = await roles.structured(
       {
         orchestrationId: input.orchestration.id,
@@ -540,10 +545,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         sandboxMode: "read-only",
         signal,
         prompt: [
-          "Create a bounded coding plan for the explicitly confirmed contract. Do not edit files.",
-          "The complete planning evidence is supplied below. Do not call tools or independently inspect the workspace during planning.",
+          "Create the most execution-efficient correct coding task graph for the confirmed contract. Do not edit files or call tools.",
           `Compact contract: ${JSON.stringify(compactContract)}`,
-          `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
+          `Compact application map: ${JSON.stringify(planningMap)}`,
           `Total model-call budget: ${input.orchestration.budget.maxModelCalls}`,
           `Model calls already consumed before this planning response: ${alreadyConsumedModelCalls}`,
           `Model calls reserved for this response and one possible format-repair response: ${MAXIMUM_PLANNER_RESPONSE_CALLS}`,
@@ -553,54 +557,51 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Maximum continuation segments per worker task: ${maximumWorkerSegments}`,
           `Maximum cumulative Ark turns one worker task may require across its fresh checkpoint segments: ${maximumTaskArkTurns}`,
           `Maximum cumulative input tokens one worker task may require across its fresh checkpoint segments: ${maximumTaskInputTokens}`,
-          `estimatedCalls counts top-level Codex executions after planning. The control plane deterministically recalculates top-level estimatedArkApiTurns as the sum of explicit task estimates plus a ${PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE}-turn verification/recovery reserve.`,
+          `estimatedCalls counts top-level Codex executions after planning. The control plane recalculates estimatedArkApiTurns as the sum of explicit task estimates plus a ${PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE}-turn verification/recovery reserve.`,
           `Return estimatedCalls no greater than ${availableExecutionModelCalls}. Plan the complete confirmed scope within that allowance by minimizing handoffs, combining tightly coupled work, and preferring deterministic tools and checks where they do not require a model call. Do not drop or weaken confirmed requirements to meet the budget.`,
-          `Return estimatedArkApiTurns no greater than ${availableExecutionArkApiTurns}. Prefer several bounded non-overlapping tasks over one oversized worker. Assign shared root configuration files to one foundation task. Add dependsOn only when a later worker must consume a concrete artifact from that foundation; otherwise encode stable interfaces in task objectives and leave independent feature tasks dependency-free.`,
+          `Return estimatedArkApiTurns no greater than ${availableExecutionArkApiTurns}. Keep every task within its continuation capacity.`,
+          "Choose the graph by total execution efficiency: use one task when delegation overhead would dominate; multiple sequential tasks when specialization helps but ordering is required; parallel tasks when they are genuinely independent; and hybrid dependency waves when both apply. Parallelism is enabled, never forced.",
+          "allowedPaths are WRITE scopes only, not read/context scopes. Workers may read the staged workspace. Tasks with overlapping allowedPaths are valid: the control plane automatically places them in different execution waves. Add dependsOn only when a task must consume another task's output; do not add dependencies merely to prevent simultaneous writes.",
+          "Maximize useful concurrency without fragmenting tightly coupled work. Minimize handoffs and the critical path. A dependent worker receives the integrated output of every completed prior wave.",
           input.orchestration.requestedMode === "direct"
-            ? "The user selected Direct mode, so task parallelism is not required."
-            : "A plan with multiple tasks must produce real parallel execution: include at least one dependency-ready wave containing two or more tasks. Use dependsOn only for genuine hard prerequisites. After any required foundation task, fan out independent backend, frontend, test, documentation, or feature-area tasks so they can run simultaneously. If no two tasks can safely overlap, return one combined task instead of a serial plan labelled multi-worker.",
+            ? "The user selected Direct mode; return the smallest coherent task graph and the control plane will combine it for direct execution."
+            : "The user allows adaptive orchestration. Do not create artificial tasks or dependencies to force either single-worker or multi-worker execution.",
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract. Give each task its own estimatedArkApiTurns and estimatedInputTokens. If a task exceeds its continuation capacity, split it before returning the plan.",
-          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
-          "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
-          "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
           "Protect configuration secrets: allowedPaths must never include .env, .env.local, .env.production, or any other real environment file at any directory depth. Non-secret templates named exactly .env.example, .env.sample, or .env.template are allowed.",
           "Return this exact JSON shape with no additional task fields:",
-          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedArkApiTurns":40,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[],"estimatedArkApiTurns":12,"estimatedInputTokens":120000}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
+          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedArkApiTurns":40,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/write/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[],"estimatedArkApiTurns":12,"estimatedInputTokens":120000}]}',
           "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative, must never begin with /workspace or contain '..', and must follow the environment-file rule above. Use exact criterion IDs from the confirmed contract.",
-        ].join("\n").slice(0, 150_000),
+        ].join("\n"),
       },
       planSchema(
         availableExecutionModelCalls,
         availableExecutionArkApiTurns,
         maximumTaskArkTurns,
         maximumTaskInputTokens,
-        input.orchestration.requestedMode !== "direct",
       ),
       {
         instructions: [
-          "Change only fields identified by the validation problems. Preserve every unrelated valid field.",
-          "For writable-path ownership or dependency repairs, keep task order, titles, objectives, acceptance criteria, artifacts, per-task estimates, top-level estimates, and acceptance tests unchanged. Modify only allowedPaths and dependsOn.",
-          "Do not increase or otherwise recalculate task estimates while repairing path ownership or dependency edges.",
+          "Repair only the listed structural, safety, dependency, capacity, or budget problems in this compact task graph.",
+          "Preserve correct confirmed scope. Parallelism is optional, and overlapping write scopes are valid because the scheduler serializes those workers.",
         ],
-        merge: mergeScopedPlanRepair,
       },
     );
     result.value.estimatedArkApiTurns = deterministicPlanArkApiTurns(result.value);
-    const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
+    const acceptanceTests = comprehensiveAcceptanceTests([], input.contract);
     await this.verification.saveAcceptancePlan({
       orchestrationId: input.orchestration.id,
       contractVersion: input.contract.version,
-      generatedBy: "planner",
+      generatedBy: "control-plane",
       tests: acceptanceTests,
     });
     for (const test of acceptanceTests) {
       await sink.publishArtifact({
         id: this.newId(),
         orchestrationId: input.orchestration.id,
-        producerTaskId: "planner",
+        producerTaskId: "control-plane",
         kind: "decision",
-        name: `Planner acceptance test: ${test.id}`,
+        name: `Contract acceptance test: ${test.id}`,
         version: input.contract.version,
         payload: JSON.stringify({
           ...test,
@@ -615,9 +616,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       taskId: null,
       executionId: result.executionId,
       type: "acceptance-plan-created",
-      actorRole: "planner",
-      modelId: result.actualModelId,
-      summary: "Planner created the protected acceptance-test plan",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: "Control plane derived protected acceptance tests from the confirmed contract",
       metadata: {
         testCount: acceptanceTests.length,
         coveredCriteria: new Set(acceptanceTests.flatMap((test) => test.criterionIds)).size,
@@ -628,7 +629,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       requestedMode: input.orchestration.requestedMode,
       taskCount: result.value.tasks.length,
       changedAreaCount: new Set(result.value.tasks.flatMap((task) => task.allowedPaths.map((entry) => entry.split("/")[0]))).size,
-      hasOverlappingWriteScopes: tasksHaveOverlappingWriteScopes(result.value.tasks),
+      maximumParallelWorkers: maximumTaskWaveWidth(result.value.tasks),
       coupling: result.value.coupling,
       estimatedCalls: result.value.estimatedCalls,
       estimatedContextTokens: result.value.estimatedContextTokens,
@@ -724,18 +725,20 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       this.newId,
     );
     const results: WorkerLoopResult[] = [];
+    let executionStage: ExecutionStage | null = null;
     try {
       if (input.plan.selectedMode === "direct") {
         results.push(await this.runDirect(input, sink, roles, signal));
       } else {
-        const remaining = new Set(input.plan.tasks.map((task) => task.id));
+        executionStage = await this.integrator.createExecutionStage(
+          input.orchestration.id,
+          input.workspacePath,
+        );
+        broker.useWorkspace(executionStage.path);
+        const scheduledWaves = executionTaskWaves(input.plan.tasks);
         let batchNumber = 0;
-        while (remaining.size) {
+        for (const ready of scheduledWaves) {
           if (signal.aborted) return { kind: "cancelled", reason: "Cancelled before worker batch" };
-          const ready = input.plan.tasks.filter(
-            (task) => remaining.has(task.id) && task.dependsOn.every((dependency) => !remaining.has(dependency)),
-          );
-          if (!ready.length) throw new Error("Plan dependency graph cannot make progress");
           for (const task of ready) {
             if (task.status === "stale" || task.requiredArtifactIds.length) await artifacts.refresh(task);
             task.status = "ready";
@@ -767,14 +770,35 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
                 task,
                 tasks: input.plan.tasks,
                 map,
-                mainWorkspacePath: input.workspacePath,
+                mainWorkspacePath: executionStage!.path,
                 signal,
                 deterministicPreflight: true,
               }),
             ),
           );
           results.push(...batch);
-          for (const task of ready) remaining.delete(task.id);
+          await this.integrator.applyExecutionWave(
+            executionStage,
+            batch.map((worker) => ({
+              taskId: worker.task.id,
+              workspacePath: worker.workspace.path,
+              changes: worker.changes,
+            })),
+          );
+          await sink.recordEvent({
+            orchestrationId: input.orchestration.id,
+            taskId: null,
+            executionId: null,
+            type: "worker-batch-staged",
+            actorRole: "control-plane",
+            modelId: null,
+            summary: "Applied the completed wave to the private staged workspace",
+            metadata: {
+              batchNumber,
+              taskIds: ready.map((task) => task.id).join(","),
+              changedFiles: batch.reduce((count, worker) => count + worker.changes.changedFiles.length, 0),
+            },
+          });
         }
       }
 
@@ -884,6 +908,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         ? { kind: "budget-exhausted", reason }
         : { kind: "failed", reason };
     } finally {
+      await this.integrator.discardExecutionStage(input.orchestration.id).catch(() => undefined);
       this.activeRoles.delete(input.orchestration.id);
     }
   }
@@ -1136,14 +1161,22 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         : "Started deterministic-first integration",
       metadata: { workerResultCount: results.length, recoveryRound },
     });
-    const candidate = await this.integrator.integrate(
+    const resultsByTask = new Map(results.map((result) => [result.task.id, result]));
+    const integrationWaves = executionTaskWaves(input.plan.tasks).map((wave) =>
+      wave.map((task) => {
+        const result = resultsByTask.get(task.id);
+        if (!result) throw new Error(`Missing worker result for task ${task.id}`);
+        return {
+          taskId: result.task.id,
+          workspacePath: result.workspace.path,
+          changes: result.changes,
+        };
+      })
+    );
+    const candidate = await this.integrator.integrateWaves(
       input.orchestration.id,
       input.workspacePath,
-      results.map((result) => ({
-        taskId: result.task.id,
-        workspacePath: result.workspace.path,
-        changes: result.changes,
-      })),
+      integrationWaves,
       async (conflict) => {
         const resolved = await roles.structured(
           {

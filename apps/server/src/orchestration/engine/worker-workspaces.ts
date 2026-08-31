@@ -149,13 +149,19 @@ export class WorkerWorkspaceManager {
     await this.initialize();
     const source = await realpath(sourceWorkspace);
     const temp = await realpath(this.tempRoot);
-    if (source === temp || source.startsWith(`${temp}${path.sep}`) || temp.startsWith(`${source}${path.sep}`)) {
-      throw new Error("Worker temp root must be separate from the Agent workspace");
-    }
     const orchestrationRoot = path.join(temp, safeSegment(orchestrationId));
     const safeTaskId = safeSegment(taskId);
     const destination = path.join(orchestrationRoot, safeTaskId);
     const baseline = path.join(orchestrationRoot, `${safeTaskId}.baseline`);
+    if (
+      source === temp ||
+      temp.startsWith(`${source}${path.sep}`) ||
+      destination === source ||
+      destination.startsWith(`${source}${path.sep}`) ||
+      source.startsWith(`${destination}${path.sep}`)
+    ) {
+      throw new Error("Worker temp target must be separate from its source workspace");
+    }
     if (!within(temp, destination)) throw new Error("Unsafe worker workspace target");
     await mkdir(orchestrationRoot, { recursive: true, mode: 0o700 });
     await mkdir(baseline, { recursive: false, mode: 0o700 });

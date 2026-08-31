@@ -28,7 +28,11 @@ import { classifyFailure, createFailurePacket } from "./failure-packet.js";
 import { DeterministicIntegrator } from "./integrator.js";
 import { reviewPreflight } from "./preflight.js";
 import { RoleExecutor } from "./role-executor.js";
-import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
+import {
+  maximumWriteSafeBatch,
+  selectRoute,
+  tasksHaveOverlappingWriteScopes,
+} from "./router.js";
 import { parseStructured, StructuredOutputError } from "./structured-output.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
 import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
@@ -80,14 +84,16 @@ describe("engine primitives", () => {
   });
 
   it("routes tiny, coupled, and modular work adaptively within budget", () => {
-    expect(selectRoute({ requestedMode: "auto", taskCount: 1, changedAreaCount: 1, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 2, estimatedContextTokens: 100, budget }).selectedMode).toBe("direct");
-    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 2, changedAreaCount: 2, hasOverlappingWriteScopes: false, coupling: "high", estimatedCalls: 4, estimatedContextTokens: 100, budget })).toEqual({
+    expect(selectRoute({ requestedMode: "auto", taskCount: 1, changedAreaCount: 1, maximumParallelWorkers: 1, coupling: "low", estimatedCalls: 2, estimatedContextTokens: 100, budget }).selectedMode).toBe("direct");
+    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 2, changedAreaCount: 2, maximumParallelWorkers: 2, coupling: "high", estimatedCalls: 4, estimatedContextTokens: 100, budget })).toEqual({
       selectedMode: "multi-worker",
-      reason: "Coupled work is split into dependency-ordered workers with exclusive file ownership",
+      reason: "Coupled work uses dependency-ordered waves with safe parallelism where available",
     });
-    expect(selectRoute({ requestedMode: "auto", taskCount: 3, changedAreaCount: 3, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("multi-worker");
-    expect(() => selectRoute({ requestedMode: "orchestrated", taskCount: 8, changedAreaCount: 1, hasOverlappingWriteScopes: true, coupling: "low", estimatedCalls: 20, estimatedContextTokens: 100, budget }))
-      .toThrow("must have exclusive writable paths");
+    expect(selectRoute({ requestedMode: "auto", taskCount: 3, changedAreaCount: 3, maximumParallelWorkers: 3, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("multi-worker");
+    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 8, changedAreaCount: 1, maximumParallelWorkers: 1, coupling: "low", estimatedCalls: 20, estimatedContextTokens: 100, budget })).toEqual({
+      selectedMode: "multi-worker",
+      reason: "Specialized workers will run sequentially because dependencies or write scopes prevent safe parallel execution",
+    });
     expect(tasksHaveOverlappingWriteScopes([
       { allowedPaths: ["index.html"] },
       { allowedPaths: ["index.html"] },
@@ -100,6 +106,17 @@ describe("engine primitives", () => {
       { allowedPaths: ["src/app.ts"] },
       { allowedPaths: ["tests/app.test.ts"] },
     ])).toBe(false);
+    expect(maximumWriteSafeBatch([
+      { id: "a", allowedPaths: ["src/shared.ts"] },
+      { id: "b", allowedPaths: ["src/shared.ts"] },
+      { id: "c", allowedPaths: ["tests"] },
+    ]).map((task) => task.id)).toEqual(["a", "c"]);
+    expect(maximumWriteSafeBatch([
+      { id: "foundation", allowedPaths: ["src"] },
+      { id: "leaf-a", allowedPaths: ["src/a.ts"] },
+      { id: "leaf-b", allowedPaths: ["src/b.ts"] },
+    ], (task) => task.id === "foundation" ? 3 : 1).map((task) => task.id))
+      .toEqual(["foundation"]);
   });
 
   it("builds a deterministic map, minimizes context, and denies traversal/symlinks", async () => {
@@ -235,14 +252,16 @@ describe("engine primitives", () => {
     temporary.push(root);
     const sink = new MemorySink();
     const seen: string[] = [];
+    const seenThreads: Array<string | null | undefined> = [];
     const outputs = ["not json", '{"ok":true}'];
     const runner: AgentRunner = {
       async run(request) {
         seen.push(request.executionId);
+        seenThreads.push(request.threadId);
         const output = outputs.shift()!;
         return {
           output,
-          threadId: null,
+          threadId: "planning-thread",
           usage: { inputTokens: 2, outputTokens: 1 },
           modelId: output.startsWith("{") ? "fallback-model" : request.modelId,
           modelFallback: output.startsWith("{"),
@@ -260,6 +279,7 @@ describe("engine primitives", () => {
     expect(result.value.ok).toBe(true);
     expect(result).toMatchObject({ requestedModelId: "p", actualModelId: "fallback-model", modelFallback: true });
     expect(new Set(seen).size).toBe(2);
+    expect(seenThreads).toEqual([null, "planning-thread"]);
     expect(sink.usage).toHaveLength(2);
     expect(sink.events.filter((event) => event.type === "role-call-started")).toHaveLength(2);
   });
@@ -392,6 +412,45 @@ describe("engine primitives", () => {
     const candidate = await integrator.integrate("empty", main, []);
     await expect(integrator.publish(candidate, main)).resolves.toEqual([]);
     expect(await readFile(path.join(main, "README.md"), "utf8")).toBe("base\n");
+  });
+
+  it("hands sequential workers the prior wave and applies overlapping writes in order", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "engine-staged-waves-"));
+    temporary.push(root);
+    const main = path.join(root, "main");
+    await mkdir(path.join(main, "src"), { recursive: true });
+    await writeFile(path.join(main, "src", "shared.ts"), "base\n");
+    const temp = path.join(root, "temp");
+    const manager = new WorkerWorkspaceManager(temp, path.join(root, "archive"));
+    const integrator = new DeterministicIntegrator(temp);
+    const stage = await integrator.createExecutionStage("waves", main);
+
+    const first = await manager.create(stage.path, "waves", "first", ["src/shared.ts"]);
+    await writeFile(path.join(first.path, "src", "shared.ts"), "first\n");
+    const firstInput = {
+      taskId: "first",
+      workspacePath: first.path,
+      changes: await manager.changes(first),
+    };
+    await integrator.applyExecutionWave(stage, [firstInput]);
+
+    const second = await manager.create(stage.path, "waves", "second", ["src/shared.ts"]);
+    expect(await readFile(path.join(second.path, "src", "shared.ts"), "utf8")).toBe("first\n");
+    await writeFile(path.join(second.path, "src", "shared.ts"), "second\n");
+    const secondInput = {
+      taskId: "second",
+      workspacePath: second.path,
+      changes: await manager.changes(second),
+    };
+    await integrator.applyExecutionWave(stage, [secondInput]);
+
+    const candidate = await integrator.integrateWaves(
+      "waves",
+      main,
+      [[firstInput], [secondInput]],
+    );
+    expect(candidate.conflicts).toEqual([]);
+    expect(await readFile(path.join(candidate.path, "src", "shared.ts"), "utf8")).toBe("second\n");
   });
 
   it("gives the integrator only focused conflicting file variants", async () => {

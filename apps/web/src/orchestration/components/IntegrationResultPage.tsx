@@ -11,7 +11,9 @@ export function IntegrationResultPage({ view }: { view: OrchestrationReadModel }
   );
   const changedFiles = [...new Set(view.attempts.flatMap((attempt) => attempt.changedFiles))];
   const publishedArtifacts = view.artifacts.filter(
-    (artifact) => !artifact.name.startsWith("Planner acceptance test:"),
+    (artifact) =>
+      !artifact.name.startsWith("Planner acceptance test:") &&
+      !artifact.name.startsWith("Contract acceptance test:"),
   );
 
   return (

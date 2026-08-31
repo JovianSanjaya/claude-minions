@@ -7,8 +7,8 @@ describe("orchestration model configuration", () => {
     expect(defaults.orchestrationDefaultBudget).toMatchObject({
       maxInputTokens: null,
       maxOutputTokens: null,
-      maxArkApiTurns: 150,
-      maxArkApiTurnsPerExecution: 15,
+      maxArkApiTurns: 240,
+      maxArkApiTurnsPerExecution: 20,
       maxInputTokensPerExecution: 250_000,
     });
 

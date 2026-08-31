@@ -53,7 +53,7 @@ export class ContextBroker {
   private readonly expansions = new Map<string, number>();
 
   constructor(
-    private readonly workspacePath: string,
+    private workspacePath: string,
     private readonly maxExpansionsPerTask: number,
     options: ContextBrokerOptions = {},
   ) {
@@ -61,6 +61,10 @@ export class ContextBroker {
   }
 
   private readonly options: Required<ContextBrokerOptions>;
+
+  useWorkspace(workspacePath: string): void {
+    this.workspacePath = workspacePath;
+  }
 
   async createPacket(
     task: OrchestrationTask,
