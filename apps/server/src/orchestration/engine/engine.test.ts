@@ -238,6 +238,49 @@ describe("engine primitives", () => {
     expect(prompts.join(" ")).not.toContain("protected evaluator");
   });
 
+  it("supplies the complete invalid response to structured-output repair", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "engine-complete-repair-"));
+    temporary.push(root);
+    const marker = "COMPLETE_PLAN_TAIL_MARKER";
+    const prompts: string[] = [];
+    const runner: AgentRunner = {
+      async run(request) {
+        prompts.push(request.prompt);
+        return {
+          output: prompts.length === 1
+            ? JSON.stringify({ padding: "x".repeat(9_000) + marker })
+            : JSON.stringify({ ok: request.prompt.includes(marker) }),
+          threadId: null,
+          usage: null,
+          modelId: request.modelId,
+        };
+      },
+      async cancel() { return true; },
+      async isAvailable() { return true; },
+    };
+    const roles = new RoleExecutor(
+      runner,
+      new MemorySink(),
+      { planner: "p", worker: "w", verifier: "v", integrator: "i" },
+      path.join(root, "homes"),
+    );
+
+    const result = await roles.structured({
+      orchestrationId: "o",
+      agentId: "a",
+      taskId: null,
+      role: "planner",
+      workspacePath: root,
+      prompt: "plan",
+      sandboxMode: "read-only",
+      signal: new AbortController().signal,
+    }, z.object({ ok: z.boolean() }));
+
+    expect(result.value.ok).toBe(true);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(marker);
+  });
+
   it("targets only stale artifact consumers and refreshes them", async () => {
     const sink = new MemorySink();
     const registry = new ArtifactRegistry(sink);

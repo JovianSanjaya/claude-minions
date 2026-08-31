@@ -104,15 +104,101 @@ const allowedPathSchema = z.string().min(1).max(500).superRefine((value, context
   if (problem) context.addIssue({ code: "custom", message: problem });
 });
 
+const PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE = 4;
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function mergeScopedPlanRepair(
+  original: unknown,
+  repaired: unknown,
+  issues: string[],
+): unknown {
+  const mayRepairOwnershipOrDependencies = issues.length > 0 && issues.every((issue) =>
+    /allowedPaths|writable path|write scopes|parallel-ready|dependsOn|dependencies/i.test(issue)
+  );
+  if (!mayRepairOwnershipOrDependencies) return repaired;
+
+  const originalPlan = recordValue(original);
+  const repairedPlan = recordValue(repaired);
+  const originalTasks = originalPlan?.tasks;
+  const repairedTasks = repairedPlan?.tasks;
+  if (!Array.isArray(originalTasks) || !Array.isArray(repairedTasks) || originalTasks.length !== repairedTasks.length) {
+    return repaired;
+  }
+
+  const tasks = originalTasks.map((originalTask, index) => {
+    const originalRecord = recordValue(originalTask);
+    const repairedRecord = recordValue(repairedTasks[index]);
+    if (
+      !originalRecord ||
+      !repairedRecord ||
+      originalRecord.title !== repairedRecord.title ||
+      !Array.isArray(repairedRecord.allowedPaths) ||
+      !Array.isArray(repairedRecord.dependsOn)
+    ) {
+      return null;
+    }
+    return {
+      ...originalRecord,
+      allowedPaths: repairedRecord.allowedPaths,
+      dependsOn: repairedRecord.dependsOn,
+    };
+  });
+  if (tasks.some((task) => task === null)) return repaired;
+  return { ...originalPlan, tasks };
+}
+
+function deterministicPlanArkApiTurns(value: {
+  estimatedArkApiTurns: number;
+  tasks: Array<{ estimatedArkApiTurns?: number | undefined }>;
+}): number {
+  if (!value.tasks.every((task) => task.estimatedArkApiTurns !== undefined)) {
+    return value.estimatedArkApiTurns;
+  }
+  return value.tasks.reduce(
+    (total, task) => total + task.estimatedArkApiTurns!,
+    PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE,
+  );
+}
+
+function taskWaveWidths(tasks: Array<{ dependsOn: number[] }>): number[] {
+  const completed = new Set<number>();
+  const remaining = new Set(tasks.map((_, index) => index));
+  const widths: number[] = [];
+
+  while (remaining.size) {
+    const ready = [...remaining].filter((index) =>
+      tasks[index]!.dependsOn.every((dependency) => completed.has(dependency))
+    );
+    if (!ready.length) return [];
+    widths.push(ready.length);
+    for (const index of ready) {
+      remaining.delete(index);
+      completed.add(index);
+    }
+  }
+
+  return widths;
+}
+
+function maximumTaskWaveWidth(tasks: Array<{ dependsOn: number[] }>): number {
+  return Math.max(0, ...taskWaveWidths(tasks));
+}
+
 const planSchema = (
   maximumEstimatedCalls: number,
   maximumEstimatedArkTurns: number,
   maximumTaskArkTurns: number,
   maximumTaskInputTokens: number,
+  requireParallelBatch: boolean,
 ) => z.object({
   coupling: z.preprocess((value) => typeof value === "string" ? value.toLowerCase() : value, z.enum(["low", "medium", "high"])),
   estimatedCalls: z.coerce.number().int().positive().max(maximumEstimatedCalls),
-  estimatedArkApiTurns: z.coerce.number().int().positive().max(maximumEstimatedArkTurns)
+  estimatedArkApiTurns: z.coerce.number().int().positive()
     .default(Math.min(10, maximumEstimatedArkTurns)),
   estimatedContextTokens: z.coerce.number().int().nonnegative(),
   tasks: z.array(z.object({
@@ -136,14 +222,25 @@ const planSchema = (
   }
   const defaultTurns = Math.ceil(value.estimatedArkApiTurns / value.tasks.length);
   const contextPerTask = Math.max(1, Math.ceil(value.estimatedContextTokens / value.tasks.length));
+  let dependenciesAreValid = true;
   value.tasks.forEach((task, index) => {
+    for (const dependency of task.dependsOn) {
+      if (dependency >= index) {
+        dependenciesAreValid = false;
+        context.addIssue({
+          code: "custom",
+          path: ["tasks", index, "dependsOn"],
+          message: "Task dependencies must reference earlier tasks only",
+        });
+      }
+    }
     const estimatedTurns = task.estimatedArkApiTurns ?? defaultTurns;
     const estimatedInput = task.estimatedInputTokens ?? contextPerTask * estimatedTurns;
     if (estimatedTurns > maximumTaskArkTurns) {
       context.addIssue({
         code: "custom",
         path: ["tasks", index, "estimatedArkApiTurns"],
-        message: `Task requires about ${estimatedTurns} Ark turns but its ${maximumTaskArkTurns}-turn continuation capacity is smaller. Split it into dependency-ordered tasks with exclusive paths.`,
+        message: `Task requires about ${estimatedTurns} Ark turns but its ${maximumTaskArkTurns}-turn continuation capacity is smaller. Split it into bounded tasks with exclusive paths, only necessary dependencies, and a parallel-ready wave when multiple workers are used.`,
       });
     }
     if (estimatedInput > maximumTaskInputTokens) {
@@ -154,18 +251,35 @@ const planSchema = (
       });
     }
   });
+  if (
+    requireParallelBatch &&
+    value.tasks.length > 1 &&
+    dependenciesAreValid &&
+    maximumTaskWaveWidth(value.tasks) < 2
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["tasks"],
+      message: "A multi-worker plan must contain at least one parallel-ready batch of two or more independent tasks. Remove unnecessary dependsOn edges, fan out tasks after any required foundation task, or return one combined task if safe parallelism is impossible.",
+    });
+  }
+  const allTaskTurnsAreExplicit = value.tasks.every(
+    (task) => task.estimatedArkApiTurns !== undefined,
+  );
   const explicitTaskTurns = value.tasks.reduce(
     (total, task) => total + (task.estimatedArkApiTurns ?? 0),
     0,
   );
-  if (
-    value.tasks.every((task) => task.estimatedArkApiTurns !== undefined) &&
-    explicitTaskTurns > value.estimatedArkApiTurns
-  ) {
+  const requiredArkApiTurns = allTaskTurnsAreExplicit
+    ? explicitTaskTurns + PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE
+    : value.estimatedArkApiTurns;
+  if (requiredArkApiTurns > maximumEstimatedArkTurns) {
     context.addIssue({
       code: "custom",
       path: ["estimatedArkApiTurns"],
-      message: "Top-level estimatedArkApiTurns must cover the sum of all task estimates plus verification and recovery.",
+      message: allTaskTurnsAreExplicit
+        ? `Task estimates total ${explicitTaskTurns} Ark turns; with the ${PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE}-turn verification/recovery reserve, ${requiredArkApiTurns} are required but only ${maximumEstimatedArkTurns} are available.`
+        : `The plan estimates ${requiredArkApiTurns} Ark turns but only ${maximumEstimatedArkTurns} are available.`,
     });
   }
 });
@@ -435,9 +549,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Maximum continuation segments per worker task: ${maximumWorkerSegments}`,
           `Maximum cumulative Ark turns one worker task may require across its fresh checkpoint segments: ${maximumTaskArkTurns}`,
           `Maximum cumulative input tokens one worker task may require across its fresh checkpoint segments: ${maximumTaskInputTokens}`,
-          "estimatedCalls counts top-level Codex executions after planning. estimatedArkApiTurns counts the underlying model turns inside those executions, including worker implementation, verification, supervision, retries, and recovery.",
+          `estimatedCalls counts top-level Codex executions after planning. The control plane deterministically recalculates top-level estimatedArkApiTurns as the sum of explicit task estimates plus a ${PLAN_VERIFICATION_RECOVERY_ARK_TURN_RESERVE}-turn verification/recovery reserve.`,
           `Return estimatedCalls no greater than ${availableExecutionModelCalls}. Plan the complete confirmed scope within that allowance by minimizing handoffs, combining tightly coupled work, and preferring deterministic tools and checks where they do not require a model call. Do not drop or weaken confirmed requirements to meet the budget.`,
-          `Return estimatedArkApiTurns no greater than ${availableExecutionArkApiTurns}. Prefer several bounded non-overlapping tasks over one oversized worker. Assign shared root configuration files to one foundation task and make dependent tasks consume that result instead of sharing write ownership.`,
+          `Return estimatedArkApiTurns no greater than ${availableExecutionArkApiTurns}. Prefer several bounded non-overlapping tasks over one oversized worker. Assign shared root configuration files to one foundation task. Add dependsOn only when a later worker must consume a concrete artifact from that foundation; otherwise encode stable interfaces in task objectives and leave independent feature tasks dependency-free.`,
+          input.orchestration.requestedMode === "direct"
+            ? "The user selected Direct mode, so task parallelism is not required."
+            : "A plan with multiple tasks must produce real parallel execution: include at least one dependency-ready wave containing two or more tasks. Use dependsOn only for genuine hard prerequisites. After any required foundation task, fan out independent backend, frontend, test, documentation, or feature-area tasks so they can run simultaneously. If no two tasks can safely overlap, return one combined task instead of a serial plan labelled multi-worker.",
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract. Give each task its own estimatedArkApiTurns and estimatedInputTokens. If a task exceeds its continuation capacity, split it before returning the plan.",
           "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
           "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
@@ -454,8 +571,18 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         availableExecutionArkApiTurns,
         maximumTaskArkTurns,
         maximumTaskInputTokens,
+        input.orchestration.requestedMode !== "direct",
       ),
+      {
+        instructions: [
+          "Change only fields identified by the validation problems. Preserve every unrelated valid field.",
+          "For writable-path ownership or dependency repairs, keep task order, titles, objectives, acceptance criteria, artifacts, per-task estimates, top-level estimates, and acceptance tests unchanged. Modify only allowedPaths and dependsOn.",
+          "Do not increase or otherwise recalculate task estimates while repairing path ownership or dependency edges.",
+        ],
+        merge: mergeScopedPlanRepair,
+      },
     );
+    result.value.estimatedArkApiTurns = deterministicPlanArkApiTurns(result.value);
     const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
     await this.verification.saveAcceptancePlan({
       orchestrationId: input.orchestration.id,
@@ -568,6 +695,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         availableExecutionArkApiTurns,
         maximumTaskArkTurns,
         maximumTaskInputTokens,
+        maximumParallelWorkers: maximumTaskWaveWidth(result.value.tasks),
         alreadyConsumedModelCalls,
         reservedPlanningModelCalls: MAXIMUM_PLANNER_RESPONSE_CALLS,
       },
@@ -597,6 +725,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         results.push(await this.runDirect(input, sink, roles, signal));
       } else {
         const remaining = new Set(input.plan.tasks.map((task) => task.id));
+        let batchNumber = 0;
         while (remaining.size) {
           if (signal.aborted) return { kind: "cancelled", reason: "Cancelled before worker batch" };
           const ready = input.plan.tasks.filter(
@@ -608,6 +737,24 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
             task.status = "ready";
             await sink.upsertTask(task);
           }
+          batchNumber += 1;
+          await sink.recordEvent({
+            orchestrationId: input.orchestration.id,
+            taskId: null,
+            executionId: null,
+            type: "worker-batch-started",
+            actorRole: "control-plane",
+            modelId: null,
+            summary: ready.length > 1
+              ? `Started ${ready.length} independent workers in parallel`
+              : "Started one dependency-ready worker",
+            metadata: {
+              batchNumber,
+              workerCount: ready.length,
+              parallel: ready.length > 1,
+              taskIds: ready.map((task) => task.id).join(","),
+            },
+          });
           const batch = await Promise.all(
             ready.map((task) =>
               loop.run({

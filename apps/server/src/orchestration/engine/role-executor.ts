@@ -9,7 +9,12 @@ import type {
 } from "../contracts.js";
 import type { AgentRunner, RunnerResult } from "../../types.js";
 import { RunCancelledError, RunnerExecutionError } from "../../errors.js";
-import { parseStructured, repairPrompt, StructuredOutputError } from "./structured-output.js";
+import {
+  extractJson,
+  parseStructured,
+  repairPrompt,
+  StructuredOutputError,
+} from "./structured-output.js";
 
 export interface RoleModelConfiguration {
   planner: string;
@@ -44,6 +49,15 @@ export interface RoleCallResult<T = string> {
   modelFallback: boolean;
   usage: TokenUsage;
   threadId: string | null;
+}
+
+export interface StructuredRepairOptions {
+  instructions?: string[];
+  merge?: (
+    original: unknown,
+    repaired: unknown,
+    issues: string[],
+  ) => unknown;
 }
 
 const usageOf = (result: RunnerResult): TokenUsage => ({
@@ -133,6 +147,7 @@ export class RoleExecutor {
   async structured<T>(
     input: RoleCallInput,
     schema: z.ZodType<T>,
+    repairOptions: StructuredRepairOptions = {},
   ): Promise<RoleCallResult<T>> {
     const jsonSchema = z.toJSONSchema(schema) as Record<string, unknown>;
     const responseContract = [
@@ -147,10 +162,28 @@ export class RoleExecutor {
       if (!(error instanceof StructuredOutputError)) throw error;
       const repair = await this.call(
         input,
-        `${repairPrompt(error, jsonSchema)}\nInvalid output to repair:\n${first.rawOutput.slice(0, 8_000)}`,
+        [
+          repairPrompt(error, jsonSchema),
+          ...(repairOptions.instructions ?? []),
+          "Invalid output to repair:",
+          first.rawOutput,
+        ].join("\n"),
       );
       try {
-        return { ...repair, value: parseStructured(schema, repair.rawOutput) };
+        if (!repairOptions.merge) {
+          return { ...repair, value: parseStructured(schema, repair.rawOutput) };
+        }
+        const merged = repairOptions.merge(
+          extractJson(first.rawOutput),
+          extractJson(repair.rawOutput),
+          error.issues,
+        );
+        const mergedOutput = JSON.stringify(merged);
+        return {
+          ...repair,
+          rawOutput: mergedOutput,
+          value: parseStructured(schema, mergedOutput),
+        };
       } catch (repairError) {
         if (!(repairError instanceof StructuredOutputError)) throw repairError;
         throw new StructuredOutputError(

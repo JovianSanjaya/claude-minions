@@ -69,6 +69,12 @@ type RecordedCall = {
   threadId: string | null | undefined;
 };
 
+type WorkerConcurrencyProbe = {
+  active: number;
+  maximumActive: number;
+  startedTaskIds: string[];
+};
+
 function orchestration(workspace: string): Orchestration {
   return {
     id: "orchestration-1", agentId: "agent-1", prompt: "Add A and B",
@@ -110,6 +116,10 @@ function fakeRunner(
   firstWorkerBudgetBoundary = false,
   firstPlanOversizedTask = false,
   firstWorkerGracefulCheckpoint = false,
+  firstPlanSerialChain = false,
+  workerConcurrencyProbe?: WorkerConcurrencyProbe,
+  repairMutatesPlanFields = false,
+  firstPlanOverTotalBudget = false,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   let recoveryApplied = false;
@@ -120,17 +130,33 @@ function fakeRunner(
   return {
     async run(request) {
       calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId });
+      const probesWorker = Boolean(
+        workerConcurrencyProbe && request.prompt.includes("Implement only this confirmed task"),
+      );
+      if (probesWorker && workerConcurrencyProbe) {
+        workerConcurrencyProbe.active += 1;
+        workerConcurrencyProbe.maximumActive = Math.max(
+          workerConcurrencyProbe.maximumActive,
+          workerConcurrencyProbe.active,
+        );
+        workerConcurrencyProbe.startedTaskIds.push(request.taskId ?? "unknown");
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
       let output: string;
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
       } else if (
         request.prompt.includes("Create a bounded coding plan") ||
-        ((firstPlanAllowedPath !== null || firstPlanOversizedTask) && request.prompt.includes("Invalid output to repair"))
+        ((firstPlanAllowedPath !== null || firstPlanOversizedTask || firstPlanSerialChain || firstPlanOverTotalBudget) && request.prompt.includes("Invalid output to repair"))
       ) {
+        const isRepair = request.prompt.includes("Invalid output to repair");
+        const mutatesPlanFields = repairMutatesPlanFields && isRepair;
         const firstTaskAllowedPath = planningResponses === 0 && firstPlanAllowedPath
           ? firstPlanAllowedPath
           : "src/a.ts";
         const returnOversizedTask = firstPlanOversizedTask && planningResponses === 0;
+        const returnSerialChain = firstPlanSerialChain && planningResponses === 0;
+        const returnOverTotalBudget = firstPlanOverTotalBudget && planningResponses === 0;
         planningResponses += 1;
         const acceptanceTests = [
           { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
@@ -155,8 +181,8 @@ function fakeRunner(
           tasks: returnOversizedTask
             ? [{ title: "Build everything", objective: "Build A and B in one oversized task", dependsOn: [], allowedPaths: ["src/a.ts", "src/b.ts"], acceptanceCriterionIds: ["c1", "c2"], requiredArtifactIds: [], estimatedArkApiTurns: 60, estimatedInputTokens: 3_000_000 }]
             : [
-                { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000, explanatoryNote: "safe unknown field" },
-                { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000 },
+                { title: "Add A", objective: mutatesPlanFields ? "Unrelated rewritten objective A" : "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], estimatedArkApiTurns: mutatesPlanFields || returnOverTotalBudget ? 80 : 5, estimatedInputTokens: mutatesPlanFields ? 800_000 : 40_000, explanatoryNote: "safe unknown field" },
+                { title: "Add B", objective: mutatesPlanFields ? "Unrelated rewritten objective B" : "Add B", dependsOn: returnSerialChain ? ["0"] : [], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: returnSerialChain ? ["api-contract"] : [], estimatedArkApiTurns: mutatesPlanFields || returnOverTotalBudget ? 80 : 5, estimatedInputTokens: mutatesPlanFields ? 800_000 : 40_000 },
               ],
           acceptanceTests,
         });
@@ -167,7 +193,7 @@ function fakeRunner(
         output = JSON.stringify({
           understanding: isA ? "Add A" : "Add B",
           expectedFiles: [shouldReject ? "package-boundary/mapped-file1" : isA ? "src/a.ts" : "src/b.ts"],
-          consumedArtifacts: isA ? [] : ["api-contract"],
+          consumedArtifacts: [],
           publishedArtifacts: isA ? ["api-contract"] : [],
           approach: ["Implement module"], missingContext: [], plannedChecks: ["typecheck"],
         });
@@ -292,6 +318,7 @@ function fakeRunner(
       } else {
         output = "done";
       }
+      if (probesWorker && workerConcurrencyProbe) workerConcurrencyProbe.active -= 1;
       return {
         output,
         threadId: null,
@@ -317,6 +344,10 @@ async function setup(
   firstWorkerBudgetBoundary = false,
   firstPlanOversizedTask = false,
   firstWorkerGracefulCheckpoint = false,
+  firstPlanSerialChain = false,
+  workerConcurrencyProbe?: WorkerConcurrencyProbe,
+  repairMutatesPlanFields = false,
+  firstPlanOverTotalBudget = false,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
@@ -347,6 +378,10 @@ async function setup(
       firstWorkerBudgetBoundary,
       firstPlanOversizedTask,
       firstWorkerGracefulCheckpoint,
+      firstPlanSerialChain,
+      workerConcurrencyProbe,
+      repairMutatesPlanFields,
+      firstPlanOverTotalBudget,
     ),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
@@ -394,7 +429,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
         .map((artifact) => artifact.version),
     ).toEqual([1, 2]);
     expect(sink.events.map((event) => event.type)).toEqual(
-      expect.arrayContaining(["route-decision", "preflight-reviewed", "dependency-refreshed", "integration-candidate", "verified-publish"]),
+      expect.arrayContaining(["route-decision", "preflight-reviewed", "integration-candidate", "verified-publish"]),
     );
     expect(sink.verifications.map((record) => record.scope)).toEqual(
       expect.arrayContaining(["worker-visible", "protected", "global"]),
@@ -432,6 +467,66 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
         .toBeLessThan(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write"));
     }
+  });
+
+  it("executes distinct dependency-ready workers concurrently", async () => {
+    const probe: WorkerConcurrencyProbe = { active: 0, maximumActive: 0, startedTaskIds: [] };
+    const { workspace, driver } = await setup(
+      false, false, false, false, false, false, "stop", null,
+      false, false, false, false, probe,
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const plan = await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    expect(plan.selectedMode).toBe("multi-worker");
+    expect(plan.tasks).toHaveLength(2);
+    expect(plan.tasks.every((task) => task.dependsOn.length === 0)).toBe(true);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "route-decision",
+      metadata: expect.objectContaining({ maximumParallelWorkers: 2 }),
+    }));
+
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, new AbortController().signal);
+
+    expect(outcome.kind).toBe("completed");
+    expect(probe.maximumActive).toBe(2);
+    expect(new Set(probe.startedTaskIds).size).toBe(2);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "worker-batch-started",
+      summary: "Started 2 independent workers in parallel",
+      metadata: expect.objectContaining({ workerCount: 2, parallel: true }),
+    }));
+  });
+
+  it("repairs a serial multi-task plan into a genuinely parallel worker batch", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null,
+      false, false, false, true,
+    );
+    const sink = new Sink();
+    const plan = await driver.plan({
+      orchestration: orchestration(workspace),
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    expect(plan.selectedMode).toBe("multi-worker");
+    expect(plan.tasks.every((task) => task.dependsOn.length === 0)).toBe(true);
+    const plannerCalls = calls.filter((call) => call.role === "planner");
+    expect(plannerCalls).toHaveLength(2);
+    expect(plannerCalls[1]?.prompt).toContain(
+      "at least one parallel-ready batch of two or more independent tasks",
+    );
   });
 
   it("continues a token-limited worker from its checkpoint in a fresh Codex thread", async () => {
@@ -622,6 +717,57 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(plannerCalls[1]?.prompt).toContain("Give every writable path exactly one owner");
   });
 
+  it("preserves task estimates and objectives while repairing overlapping ownership", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", "src",
+      false, false, false, false, undefined, true,
+    );
+    const sink = new Sink();
+    const plan = await driver.plan({
+      orchestration: orchestration(workspace),
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    expect(plan.tasks.map((task) => task.objective)).toEqual(["Add A", "Add B"]);
+    expect(plan.tasks.flatMap((task) => task.allowedPaths)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(calls.filter((call) => call.role === "planner")).toHaveLength(2);
+    expect(calls.filter((call) => call.role === "planner")[1]?.prompt).toContain(
+      "Do not increase or otherwise recalculate task estimates",
+    );
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "route-decision",
+      metadata: expect.objectContaining({
+        estimatedArkApiTurns: 14,
+        availableExecutionArkApiTurns: 146,
+      }),
+    }));
+  });
+
+  it("reports exact deterministic arithmetic when task estimates exceed the available Ark budget", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null,
+      false, false, false, false, undefined, false, true,
+    );
+    const sink = new Sink();
+    const plan = await driver.plan({
+      orchestration: orchestration(workspace),
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    expect(plan.tasks).toHaveLength(2);
+    const plannerCalls = calls.filter((call) => call.role === "planner");
+    expect(plannerCalls).toHaveLength(2);
+    expect(plannerCalls[1]?.prompt).toContain(
+      "Task estimates total 160 Ark turns; with the 4-turn verification/recovery reserve, 164 are required but only 146 are available.",
+    );
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "route-decision",
+      metadata: expect.objectContaining({ estimatedArkApiTurns: 14 }),
+    }));
+  });
+
   it("repairs a task that cannot fit within its bounded continuation capacity", async () => {
     const { workspace, driver, calls } = await setup(
       false, false, false, false, false, false, "stop", null, false, true,
@@ -687,7 +833,8 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const before = await readFile(path.join(workspace, "src", "base.ts"), "utf8");
     const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
     expect(outcome).toEqual({ kind: "failed", reason: "Worker failed after bounded retries" });
-    expect(sink.attempts.filter((attempt) => attempt.status === "failed")).toHaveLength(2);
+    expect(sink.attempts.filter((attempt) => attempt.status === "failed")).toHaveLength(4);
+    expect(new Set(sink.attempts.map((attempt) => attempt.taskId)).size).toBe(2);
     expect(sink.events.some((event) => event.type === "worker-supervisor-decision")).toBe(true);
     expect(
       calls.filter((call) => call.role === "worker").at(-1)?.prompt,
@@ -708,7 +855,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(outcome.kind).toBe("completed");
     expect(sink.events.some((event) => event.type === "preflight-reviewed" && event.metadata.deterministic === true)).toBe(true);
     const modelPreflights = calls.filter((call) => call.prompt.includes("Produce a read-only worker preflight"));
-    expect(modelPreflights).toHaveLength(2);
+    expect(modelPreflights).toHaveLength(0);
     expect(calls.filter((call) => call.sandboxMode === "workspace-write").length).toBeGreaterThanOrEqual(plan.tasks.length);
   });
 
