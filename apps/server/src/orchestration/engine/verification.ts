@@ -69,6 +69,7 @@ export class VerificationService {
     scopes: VerificationRecord["scope"][],
     sink: OrchestrationSink,
     signal: AbortSignal,
+    recordKey?: string,
   ): Promise<VerificationRecord[]> {
     await this.initialize();
     const records: VerificationRecord[] = [];
@@ -81,9 +82,16 @@ export class VerificationService {
         status = "skipped";
         outputSummary = "Manual criterion requires explicit human review";
       } else if (check.run) {
-        const result = await check.run(workspacePath, signal);
-        status = result.passed ? "passed" : "failed";
-        outputSummary = result.summary;
+        try {
+          const result = await check.run(workspacePath, signal);
+          status = result.passed ? "passed" : "failed";
+          outputSummary = result.summary;
+        } catch (error) {
+          if (signal.aborted) throw error;
+          outputSummary = error instanceof Error
+            ? `Verification check error: ${error.message}`
+            : `Verification check error: ${String(error)}`;
+        }
       } else if (check.executable) {
         if (!this.allowedExecutables.has(check.executable)) {
           throw new Error(`Verification executable is not trusted: ${check.executable}`);
@@ -93,16 +101,20 @@ export class VerificationService {
             cwd: workspacePath,
             timeout: check.timeoutMs ?? 120_000,
             maxBuffer: 256_000,
+            signal,
           });
           status = "passed";
           outputSummary = (result.stdout || result.stderr || "Check passed").slice(0, 8_000);
         } catch (error) {
+          if (signal.aborted) throw error;
           const detail = error as { stdout?: string; stderr?: string; message?: string };
           outputSummary = (detail.stdout || detail.stderr || detail.message || "Check failed").slice(0, 8_000);
         }
       }
       const record: VerificationRecord = {
-        id: this.newId(),
+        id: recordKey
+          ? `${orchestrationId}-${taskId ?? "global"}-${recordKey}-${check.id}`.replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 500)
+          : this.newId(),
         orchestrationId,
         taskId,
         scope: check.scope,
@@ -125,5 +137,5 @@ export class VerificationService {
 }
 
 export function requiredVerificationPassed(records: VerificationRecord[]): boolean {
-  return records.every((record) => record.status !== "failed");
+  return records.length > 0 && records.every((record) => record.status !== "failed");
 }

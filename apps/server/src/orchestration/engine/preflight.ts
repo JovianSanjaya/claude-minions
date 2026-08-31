@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ExecutionContract, OrchestrationTask } from "../contracts.js";
+import { isProtectedEnvironmentPath } from "./application-map.js";
 
 export const workerPreflightSchema = z.object({
   understanding: z.string().min(1).max(4_000),
@@ -31,7 +32,9 @@ export function reviewPreflight(
   const allowed = task.allowedPaths.map((entry) => entry.replaceAll("\\", "/").replace(/\/$/, ""));
   const outside = preflight.expectedFiles.filter((file) => {
     const normalized = file.replaceAll("\\", "/");
-    return !allowed.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
+    return isProtectedEnvironmentPath(normalized) ||
+      (!allowed.includes(".") &&
+        !allowed.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`)));
   });
   if (outside.length) {
     return {

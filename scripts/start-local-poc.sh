@@ -4,12 +4,22 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
+# `npm run poc` is the complete local startup command. Load repository-local
+# configuration so credentials and newly added runtime flags take effect.
+if [[ -f "$repo_dir/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$repo_dir/.env"
+  set +a
+fi
+
 runtime_image="${CONTAINER_RUNTIME_IMAGE:-volc-agent-runtime:local}"
 runtime_base_image="${CONTAINER_RUNTIME_BASE_IMAGE:-node:22-bookworm-slim}"
 runtime_apt_mirror="${CONTAINER_APT_MIRROR:-}"
 runtime_apt_security_mirror="${CONTAINER_APT_SECURITY_MIRROR:-}"
 runtime_apt_packages="${CONTAINER_RUNTIME_APT_PACKAGES:-ca-certificates git ripgrep chromium fonts-liberation}"
 codex_sandbox_mode="${CODEX_SANDBOX_MODE:-workspace-write}"
+rebuild_runtime="${LOCAL_POC_REBUILD_RUNTIME:-false}"
 
 log() {
   printf '[local-poc] %s\n' "$*" >&2
@@ -125,15 +135,19 @@ mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME"
 log "Persistent state: data=$APP_DATA_DIR workspaces=$AGENT_WORKSPACE_ROOT codex-home=$CODEX_HOME"
 export CONTAINER_USER="${CONTAINER_USER:-$(id -u):$(id -g)}"
 
-log "Building $runtime_image from Dockerfile.runtime (base: $runtime_base_image)."
-"$engine" build \
-  --file Dockerfile.runtime \
-  --build-arg "NODE_IMAGE=$runtime_base_image" \
-  --build-arg "DEBIAN_MIRROR=$runtime_apt_mirror" \
-  --build-arg "DEBIAN_SECURITY_MIRROR=$runtime_apt_security_mirror" \
-  --build-arg "RUNTIME_APT_PACKAGES=$runtime_apt_packages" \
-  --tag "$runtime_image" \
-  .
+if [[ "$rebuild_runtime" == "true" ]] || ! "$engine" image inspect "$runtime_image" >/dev/null 2>&1; then
+  log "Building $runtime_image from Dockerfile.runtime (base: $runtime_base_image)."
+  "$engine" build \
+    --file Dockerfile.runtime \
+    --build-arg "NODE_IMAGE=$runtime_base_image" \
+    --build-arg "DEBIAN_MIRROR=$runtime_apt_mirror" \
+    --build-arg "DEBIAN_SECURITY_MIRROR=$runtime_apt_security_mirror" \
+    --build-arg "RUNTIME_APT_PACKAGES=$runtime_apt_packages" \
+    --tag "$runtime_image" \
+    .
+else
+  log "Using existing $runtime_image (set LOCAL_POC_REBUILD_RUNTIME=true to rebuild)."
+fi
 
 log "Checking that the Runtime can bind-mount the configured state directories."
 preflight_user_args=(--user "$CONTAINER_USER")

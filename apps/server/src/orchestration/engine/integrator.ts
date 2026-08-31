@@ -33,6 +33,30 @@ function safeRelative(file: string): string {
 export class DeterministicIntegrator {
   constructor(private readonly tempRoot: string) {}
 
+  async loadRetained(
+    orchestrationId: string,
+    sourceWorkspace: string,
+  ): Promise<IntegrationCandidate> {
+    const root = await realpath(this.tempRoot);
+    const candidatePath = await realpath(path.join(
+      root,
+      orchestrationId.replace(/[^A-Za-z0-9_.-]/g, "-"),
+      "integration",
+    ));
+    if (candidatePath === root || !candidatePath.startsWith(`${root}${path.sep}`)) {
+      throw new Error("Retained integration candidate is outside the orchestration temp root");
+    }
+    const base = await workspaceManifest(sourceWorkspace);
+    const manifest = await workspaceManifest(candidatePath);
+    return {
+      path: candidatePath,
+      base,
+      manifest,
+      changes: diffManifest(base, manifest),
+      conflicts: [],
+    };
+  }
+
   async integrate(
     orchestrationId: string,
     sourceWorkspace: string,

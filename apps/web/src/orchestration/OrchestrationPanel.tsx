@@ -190,6 +190,10 @@ export function OrchestrationPanel({
   const questions = currentDraftQuestions.length ? currentDraftQuestions : questionHistory;
   const currentQuestion = questions[answers.length] ?? null;
   const orchestrationBusy = Boolean(view && !isTerminal(view.orchestration.status));
+  const canRetryVerification = Boolean(
+    view?.orchestration.status === "failed" &&
+    view.events.some((event) => event.type === "verification-candidate-retained"),
+  );
   const previousOrchestrations = useMemo(
     () =>
       orchestrationHistory
@@ -295,6 +299,36 @@ export function OrchestrationPanel({
       await api.rejectAmendment(view.orchestration.id, view.pendingAmendment!.id);
       await api.cancel(view.orchestration.id);
     });
+  };
+
+  const recoverTerminalRun = async () => {
+    if (!view) return;
+    setPending(true);
+    setError(null);
+    try {
+      const result = await api.recover(view.orchestration.id);
+      setOrchestrationHistory((current) => [
+        result.orchestration,
+        ...current.filter((item) => item.id !== result.orchestration.id),
+      ]);
+      setAnswers([]);
+      setQuestionHistory([]);
+      setRecoveryResponse("");
+      setActivePage(null);
+      setView(null);
+      followLatest.current = true;
+      setFollowingLatest(true);
+      setActiveId(result.orchestration.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const retryVerificationOnly = async () => {
+    if (!view) return;
+    await runAction(() => api.retryVerification(view.orchestration.id));
   };
 
   const openStep = (stepId: WorkflowStepId, index: number) => {
@@ -654,6 +688,43 @@ export function OrchestrationPanel({
                   <button type="button" onClick={() => setActivePage("integration")}>
                     Open Integration (Result) ↗
                   </button>
+                )}
+                {["failed", "budget-exhausted", "cancelled"].includes(
+                  view.orchestration.status,
+                ) && (
+                  <div className="orch-terminal-recovery">
+                    {canRetryVerification ? (
+                      <>
+                        <button
+                          type="button"
+                          className="button button-primary"
+                          disabled={pending}
+                          onClick={() => void retryVerificationOnly()}
+                        >
+                          {pending ? "Retrying verification…" : "Retry verification"}
+                        </button>
+                        <small>
+                          Reuses the unchanged integrated candidate. Workers and integration
+                          are not rerun.
+                        </small>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          className="button button-primary"
+                          disabled={pending}
+                          onClick={() => void recoverTerminalRun()}
+                        >
+                          {pending ? "Recovering…" : "Recover as new run"}
+                        </button>
+                        <small>
+                          Re-plans from the last verified Agent workspace. Unpublished worker
+                          scratch is not restored.
+                        </small>
+                      </>
+                    )}
+                  </div>
                 )}
               </div>
             </AssistantMessage>

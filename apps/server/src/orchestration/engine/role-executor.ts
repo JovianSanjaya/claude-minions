@@ -32,6 +32,9 @@ export interface RoleCallInput {
   estimatedOutputTokens?: number;
   maxArkApiTurns?: number | undefined;
   maxInputTokens?: number | undefined;
+  maxToolCalls?: number | undefined;
+  timeoutMs?: number | undefined;
+  maxTransportRetries?: number | undefined;
   threadId?: string | null;
 }
 
@@ -88,13 +91,31 @@ const zeroUsage = (): TokenUsage => ({
   peakContextTokens: 0,
 });
 
+function remainingLimit(limit: number | undefined, used: number): number | undefined {
+  return limit === undefined ? undefined : Math.max(0, Math.floor(limit) - Math.max(0, Math.floor(used)));
+}
+
 export function isRetryableRoleTransportFailure(error: unknown): boolean {
   if (error instanceof RunCancelledError) return false;
   const message = error instanceof Error ? error.message : String(error);
+  // A local execution deadline means the model used its complete allotted
+  // time. Replaying the same expensive call is not a connection recovery and
+  // previously multiplied a 90-second verifier timeout by every transport
+  // retry. Let the caller retain the candidate and expose an explicit retry.
+  if (isRoleRuntimeTimeout(error)) return false;
   if (/budget denied|input-token limit|ark-turn limit|scope violation|permission denied|unauthori[sz]ed|forbidden/i.test(message)) {
     return false;
   }
   return /stream disconnected|error sending request|connection (?:reset|closed|refused)|socket|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|network error|temporar(?:y|ily)|overload|service unavailable|gateway timeout|\b408\b|\b409\b|\b429\b|too many requests|rate limit|\b5\d\d\b|timed? out|timeout/i.test(message);
+}
+
+export function isRoleRuntimeTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^Runtime timed out after \d+ ms$/i.test(message.trim());
+}
+
+export function isVerificationInfrastructureFailure(error: unknown): boolean {
+  return isRoleRuntimeTimeout(error) || isRetryableRoleTransportFailure(error);
 }
 
 async function waitForTransportRetry(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -111,6 +132,10 @@ async function waitForTransportRetry(milliseconds: number, signal: AbortSignal):
     signal.addEventListener("abort", onAbort, { once: true });
     timer.unref();
   });
+}
+
+export function transportRetryDelayMs(failedAttempt: number): number {
+  return Math.min(30_000, 2_000 * (2 ** Math.max(0, failedAttempt - 1)));
 }
 
 export class RoleExecutor {
@@ -134,6 +159,7 @@ export class RoleExecutor {
     input: RoleCallInput,
     schema: z.ZodType<T>,
   ): Promise<RoleCallResult<T>> {
+    const structuredStartedAt = Date.now();
     const jsonSchema = z.toJSONSchema(schema) as Record<string, unknown>;
     const responseContract = [
       "RESPONSE CONTRACT:",
@@ -145,9 +171,25 @@ export class RoleExecutor {
       return { ...first, value: parseStructured(schema, first.rawOutput) };
     } catch (error) {
       if (!(error instanceof StructuredOutputError)) throw error;
+      const repairBudget = {
+        maxArkApiTurns: remainingLimit(input.maxArkApiTurns, first.usage.arkApiTurns ?? 0),
+        maxInputTokens: remainingLimit(input.maxInputTokens, first.usage.inputTokens),
+        maxToolCalls: remainingLimit(input.maxToolCalls, first.usage.toolCalls ?? 0),
+        timeoutMs: input.timeoutMs === undefined
+          ? undefined
+          : Math.max(0, input.timeoutMs - (Date.now() - structuredStartedAt)),
+      };
+      if ((repairBudget.timeoutMs !== undefined && repairBudget.timeoutMs < 1_000) ||
+        [repairBudget.maxArkApiTurns, repairBudget.maxInputTokens, repairBudget.maxToolCalls]
+          .some((remaining) => remaining !== undefined && remaining < 1)) {
+        throw new StructuredOutputError(
+          `Model response was invalid and the shared structured-output repair budget was exhausted: ${error.issues.slice(0, 6).join("; ")}`,
+          error.issues,
+        );
+      }
       const repair = await this.call(
-        input,
-        `${repairPrompt(error, jsonSchema)}\nInvalid output to repair:\n${first.rawOutput.slice(0, 8_000)}`,
+        { ...input, ...repairBudget },
+        `${repairPrompt(error, jsonSchema)}\nInvalid output to repair:\n${first.rawOutput.slice(0, 40_000)}`,
       );
       try {
         return { ...repair, value: parseStructured(schema, repair.rawOutput) };
@@ -170,7 +212,10 @@ export class RoleExecutor {
   private async call(input: RoleCallInput, prompt: string): Promise<Omit<RoleCallResult, "value">> {
     let accumulatedUsage = zeroUsage();
     let retryThreadId = input.threadId ?? null;
-    const maximumAttempts = Math.max(1, Math.floor(this.maxTransportRetries) + 1);
+    const maximumAttempts = Math.max(
+      1,
+      Math.floor(input.maxTransportRetries ?? this.maxTransportRetries) + 1,
+    );
     for (let transportAttempt = 1; transportAttempt <= maximumAttempts; transportAttempt += 1) {
       try {
         const result = await this.callOnce(
@@ -186,7 +231,12 @@ export class RoleExecutor {
           : zeroUsage();
         accumulatedUsage = addUsage(accumulatedUsage, partial);
         if (error instanceof RunnerExecutionError && error.partial.threadId) {
-          retryThreadId = error.partial.threadId;
+          // A locally-created Codex thread is not resumable evidence when the
+          // provider disconnected before completing any Ark turn. Retrying
+          // that empty session can repeat a poisoned previous-response state.
+          retryThreadId = (partial.arkApiTurns ?? 0) > 0
+            ? error.partial.threadId
+            : input.threadId ?? null;
         }
         const canRetry = transportAttempt < maximumAttempts &&
           !input.signal.aborted &&
@@ -201,7 +251,7 @@ export class RoleExecutor {
           }
           throw error;
         }
-        const retryDelayMs = Math.min(8_000, 500 * (2 ** (transportAttempt - 1)));
+        const retryDelayMs = transportRetryDelayMs(transportAttempt);
         await this.sink.recordEvent({
           orchestrationId: input.orchestrationId,
           taskId: input.taskId,
@@ -216,6 +266,8 @@ export class RoleExecutor {
             maximumAttempts,
             retryDelayMs,
             resumesThread: Boolean(retryThreadId),
+            freshThreadAfterZeroTurnDisconnect:
+              !retryThreadId && Boolean(error instanceof RunnerExecutionError && error.partial.threadId),
             partialArkApiTurns: partial.arkApiTurns ?? 0,
             partialInputTokens: partial.inputTokens,
           },
@@ -259,11 +311,14 @@ export class RoleExecutor {
       modelId: requestedModelId,
       summary: `${input.role} model call started`,
       metadata: {
-        timeoutMs: this.modelCallTimeoutMs,
+        timeoutMs: input.timeoutMs ?? this.modelCallTimeoutMs,
         transportAttempt,
         maximumTransportAttempts,
         estimatedInputTokens: input.estimatedInputTokens ?? Math.max(1, Math.ceil(prompt.length / 4)),
         estimatedOutputTokens: input.estimatedOutputTokens ?? 2_000,
+        maxArkApiTurns: input.maxArkApiTurns ?? null,
+        maxInputTokens: input.maxInputTokens ?? null,
+        maxToolCalls: input.maxToolCalls ?? null,
       },
     });
     const heartbeat = setInterval(() => {
@@ -277,7 +332,7 @@ export class RoleExecutor {
         summary: `${input.role} model call is still running`,
         metadata: {
           elapsedMs: Date.now() - startedAt,
-          timeoutMs: this.modelCallTimeoutMs,
+          timeoutMs: input.timeoutMs ?? this.modelCallTimeoutMs,
         },
       }).catch(() => undefined);
     }, 15_000);
@@ -308,6 +363,8 @@ export class RoleExecutor {
         runtimeProfile: input.runtimeProfile ?? "default",
         maxArkApiTurns: input.maxArkApiTurns,
         maxInputTokens: input.maxInputTokens,
+        maxToolCalls: input.maxToolCalls,
+        timeoutMs: input.timeoutMs,
       });
       await this.sink.commitModelUsage(reservation.reservationId, usageOf(result));
     } catch (error) {

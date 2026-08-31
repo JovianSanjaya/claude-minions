@@ -68,6 +68,32 @@ export interface CodexSessionTelemetry extends Required<Pick<
   lastEventAt: string | null;
 }
 
+export interface ExecutionTelemetryLimits {
+  maxArkApiTurns?: number | undefined;
+  maxInputTokens?: number | undefined;
+  maxToolCalls?: number | undefined;
+}
+
+export function executionBudgetExceeded(
+  limits: ExecutionTelemetryLimits,
+  telemetry: Pick<CodexSessionTelemetry, "arkApiTurns" | "inputTokens" | "toolCalls">,
+): string | null {
+  // Telemetry for a completed turn/tool can be persisted just before Codex
+  // emits its final agent message. Stopping at equality kills a valid final
+  // response at the boundary, so terminate only after the allowance is
+  // actually exceeded.
+  if (limits.maxArkApiTurns && telemetry.arkApiTurns > limits.maxArkApiTurns) {
+    return `Ark-turn limit exceeded (${telemetry.arkApiTurns}/${limits.maxArkApiTurns})`;
+  }
+  if (limits.maxInputTokens && telemetry.inputTokens > limits.maxInputTokens) {
+    return `Per-execution input-token limit exceeded (${telemetry.inputTokens}/${limits.maxInputTokens})`;
+  }
+  if (limits.maxToolCalls && telemetry.toolCalls > limits.maxToolCalls) {
+    return `Per-execution tool-call limit exceeded (${telemetry.toolCalls}/${limits.maxToolCalls})`;
+  }
+  return null;
+}
+
 const emptyTelemetry = (): CodexSessionTelemetry => ({
   inputTokens: 0,
   cachedInputTokens: 0,

@@ -11,10 +11,12 @@ import type { OrchestrationControlService } from "./orchestration/control/servic
 import { registerOrchestrationRoutes } from "./orchestration/control/routes.js";
 import type { BenchmarkService } from "./orchestration/benchmark/service.js";
 import { registerBenchmarkRoutes } from "./orchestration/benchmark/routes.js";
+import type { AuditLog } from "./audit-log.js";
 
 export interface AppExtensions {
   orchestration?: OrchestrationControlService;
   benchmark?: BenchmarkService;
+  auditLog?: AuditLog;
 }
 
 const agentIdParams = z.object({ id: z.string().uuid() });
@@ -43,6 +45,26 @@ export async function createApp(
       redact: ["req.headers.authorization", "req.headers.cookie"],
     },
     bodyLimit: 1_048_576,
+  });
+
+  app.addHook("onRequest", async (request) => {
+    (request as typeof request & { auditStartedAt?: number }).auditStartedAt = Date.now();
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    if (!extensions.auditLog) return;
+    const startedAt = (request as typeof request & { auditStartedAt?: number }).auditStartedAt;
+    void extensions.auditLog.write({
+      category: "http", action: "request", outcome: reply.statusCode >= 400 ? "failed" : "completed",
+      orchestrationId: null, taskId: null, executionId: request.id, agentId: null,
+      durationMs: startedAt === undefined ? null : Date.now() - startedAt,
+      data: {
+        method: request.method,
+        url: request.url.split("?")[0],
+        statusCode: reply.statusCode,
+        remoteAddress: request.ip,
+      },
+    });
   });
 
   await app.register(cors, {

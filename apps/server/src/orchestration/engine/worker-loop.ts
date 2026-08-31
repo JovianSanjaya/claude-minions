@@ -29,6 +29,7 @@ import { RoleExecutor, type RoleCallResult } from "./role-executor.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
 import {
   scopeViolations,
+  scopeViolationSummary,
   type WorkerWorkspace,
   type WorkerWorkspaceManager,
   type WorkspaceChanges,
@@ -92,7 +93,7 @@ function usageFromFailure(error: unknown): TokenUsage {
 }
 
 export function isWorkerExecutionBudgetBoundary(value: string): boolean {
-  return /ark-turn limit|input-token limit/i.test(value);
+  return /ark-turn limit|input-token limit|tool-call limit/i.test(value);
 }
 
 export function isResumableWorkerTransportFailure(value: string): boolean {
@@ -103,6 +104,37 @@ export function workerContinuationSegmentLimit(budget: BudgetPolicy): number {
   const turnsPerSegment = Math.max(1, budget.maxArkApiTurnsPerExecution ?? 15);
   const totalTurns = Math.max(turnsPerSegment, budget.maxArkApiTurns ?? 150);
   return Math.max(1, Math.min(100, Math.ceil(totalTurns / turnsPerSegment)));
+}
+
+export type WorkerComplexity = "simple" | "standard" | "complex";
+
+export interface AdaptiveWorkerProfile {
+  name: WorkerComplexity;
+  maximumFailureAttempts: number;
+  timeoutMs: number;
+}
+
+export function selectAdaptiveWorkerProfile(input: {
+  allowedPaths: readonly string[];
+  criterionCount: number;
+  repositoryFileCount: number;
+}): AdaptiveWorkerProfile {
+  const ownsWholeRepository = input.allowedPaths.includes(".");
+  if (ownsWholeRepository || input.criterionCount > 10 || input.repositoryFileCount > 250) {
+    return { name: "complex", maximumFailureAttempts: 4, timeoutMs: 480_000 };
+  }
+  if (input.allowedPaths.length <= 2 && input.criterionCount <= 5 && input.repositoryFileCount <= 80) {
+    return { name: "simple", maximumFailureAttempts: 2, timeoutMs: 180_000 };
+  }
+  return { name: "standard", maximumFailureAttempts: 3, timeoutMs: 300_000 };
+}
+
+function changeSignature(changes: WorkspaceChanges): string {
+  return JSON.stringify({
+    changed: changes.changedFiles,
+    deleted: changes.deletedFiles,
+    hashes: changes.hashes,
+  });
 }
 
 function transientExecutionFailure(value: string): boolean {
@@ -402,10 +434,36 @@ export class BoundedWorkerLoop {
     let lastThreadId: string | null = null;
     let resumeThreadId: string | null = null;
     const staleTaskIds = new Set<string>();
-    const maximumFailureAttempts = Math.max(1, orchestration.budget.maxWorkerAttempts);
-    const maximumContinuationSegments = workerContinuationSegmentLimit(orchestration.budget);
+    const workerProfile = selectAdaptiveWorkerProfile({
+      allowedPaths: task.allowedPaths,
+      criterionCount: task.acceptanceCriterionIds.length,
+      repositoryFileCount: map.entries.length,
+    });
+    const maximumFailureAttempts = Math.max(1, Math.min(
+      orchestration.budget.maxWorkerAttempts,
+      workerProfile.maximumFailureAttempts,
+    ));
+    const maximumContinuationSegments = 100;
     let failureAttempts = 0;
     let segmentNumber = 0;
+    let noProgressSegments = 0;
+    let previousChangeSignature = changeSignature(lastChanges);
+    await this.sink.recordEvent({
+      orchestrationId: orchestration.id,
+      taskId: task.id,
+      executionId: null,
+      type: "worker-profile-selected",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: `Selected the ${workerProfile.name} adaptive worker profile`,
+      metadata: {
+        profile: workerProfile.name,
+        arkApiTurnLimit: null,
+        inputTokenLimit: null,
+        toolCallLimit: null,
+        maximumFailureAttempts,
+      },
+    });
     while (
       failureAttempts < maximumFailureAttempts &&
       segmentNumber < maximumContinuationSegments
@@ -453,10 +511,6 @@ export class BoundedWorkerLoop {
       await this.sink.recordAttempt(started);
       let attemptUsage: TokenUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
       try {
-        const hardTurnLimit = orchestration.budget.maxArkApiTurnsPerExecution ?? 15;
-        const hardInputLimit = orchestration.budget.maxInputTokensPerExecution ?? 250_000;
-        const checkpointTurnTarget = Math.max(1, hardTurnLimit - Math.max(2, Math.ceil(hardTurnLimit * 0.2)));
-        const checkpointInputTarget = Math.max(1, Math.floor(hardInputLimit * 0.8));
         const retryContext = segmentNumber === 1
           ? contextText(packet)
           : [
@@ -474,15 +528,22 @@ export class BoundedWorkerLoop {
             sandboxMode: "workspace-write",
             signal,
             prompt: [
-              "Implement only this confirmed task in the writable workspace.",
+              task.allowedPaths.includes(".")
+                ? "Implement the complete confirmed application. You may create, modify, or delete any repository file inside this Agent workspace except real environment/secret files."
+                : "Implement only this confirmed task in the writable workspace.",
               `Task: ${task.title}: ${task.objective}`,
-              `Authoritative allowed edit paths: ${JSON.stringify(task.allowedPaths)}.`,
-              "Create or modify only those exact repository-relative paths or their descendants. Do not rename planned files, use /workspace-prefixed paths, create package-boundary placeholders, or edit anything else.",
-              "Do not weaken criteria or edit outside allowed paths.",
+              task.allowedPaths.includes(".")
+                ? "Authoritative edit scope: the complete repository workspace. Never edit .env, .env.local, .env.production, or another real secret-bearing environment file."
+                : `Authoritative allowed edit paths: ${JSON.stringify(task.allowedPaths)}.`,
+              task.allowedPaths.includes(".")
+                ? "Create all scaffolding, manifests, source files, assets, tests, and documentation required to finish the application."
+                : "Create or modify only those exact repository-relative paths or their descendants. Do not rename planned files, use /workspace-prefixed paths, create package-boundary placeholders, or edit anything else.",
+              "Do not weaken confirmed criteria or edit outside the Agent workspace.",
+              "Runtime caches belong outside the repository. Do not override TMPDIR, NPM_CONFIG_CACHE, NODE_COMPILE_CACHE, or XDG_CACHE_HOME to point into the workspace. Package manifests, lockfiles, generated databases, and entry scaffolds are read-only unless they appear explicitly in this task's allowed paths.",
               retryContext,
               `Relevant confirmed acceptance criteria: ${relevantCriteriaText(task, contract)}.`,
               `Failure attempt: ${number}. Continuation segment: ${segmentNumber}.`,
-              `This bounded work segment has a hard ceiling of ${hardTurnLimit} raw model turns and ${hardInputLimit} cumulative input tokens. Aim to stop by about ${checkpointTurnTarget} turns or ${checkpointInputTarget} input tokens so there is room to return the response contract.`,
+              `Adaptive worker profile: ${workerProfile.name}. No Ark-turn, input-token, or tool-call execution ceiling is configured. Finish the assigned task efficiently and return the response contract immediately after the required implementation and checks pass.`,
               ...(supervisorGuidance
                 ? [
                     `Previous attempt failure: ${lastError}`,
@@ -491,10 +552,10 @@ export class BoundedWorkerLoop {
                   ]
                 : []),
               "Keep tool output compact: batch related inspection, use targeted searches, and never print full dependency trees, generated files, or long successful logs.",
+              "Run related inspections and checks in batches. Do not reread unchanged files, repeat successful commands, or continue exploring after the acceptance criteria and relevant deterministic checks are satisfied.",
               "Checkpoint by leaving every completed edit in the workspace. If the entire assigned task is finished, return completed=true and remainingWork as an empty string. If this segment reaches its target before the task is finished, return completed=false with a precise remainingWork handoff. Always return the JSON response before beginning another large exploration phase.",
             ].join("\n"),
-            maxArkApiTurns: orchestration.budget.maxArkApiTurnsPerExecution,
-            maxInputTokens: orchestration.budget.maxInputTokensPerExecution,
+            timeoutMs: workerProfile.timeoutMs,
             threadId: resumeThreadId,
           },
           workerResultSchema,
@@ -508,8 +569,18 @@ export class BoundedWorkerLoop {
           throw new Error("Worker reported completion without making any workspace changes");
         }
         const violations = scopeViolations(lastChanges, task.allowedPaths);
-        if (violations.length) throw new Error(`Worker scope violation: ${violations.join(", ")}`);
+        if (violations.length) {
+          throw new Error(`Worker scope violation: ${scopeViolationSummary(violations)}`);
+        }
         if (!call.value.completed) {
+          const currentChangeSignature = changeSignature(lastChanges);
+          noProgressSegments = currentChangeSignature === previousChangeSignature
+            ? noProgressSegments + 1
+            : 0;
+          previousChangeSignature = currentChangeSignature;
+          if (noProgressSegments >= 3) {
+            throw new Error("Worker stopped after three continuation segments without meaningful file progress");
+          }
           lastError = call.value.remainingWork
             ? `Worker saved a bounded checkpoint with remaining work: ${call.value.remainingWork}`
             : "Worker saved a bounded checkpoint before completing the assigned task";
@@ -605,6 +676,13 @@ export class BoundedWorkerLoop {
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         lastChanges = await this.workspaces.changes(workspace).catch(() => lastChanges);
+        const failedChangeSignature = changeSignature(lastChanges);
+        noProgressSegments = failedChangeSignature === previousChangeSignature
+          ? noProgressSegments + 1
+          : 0;
+        previousChangeSignature = failedChangeSignature;
+        const stalled = noProgressSegments >= 3;
+        if (stalled) lastError = "Worker stopped after three segments without meaningful file progress";
         const partialUsage = usageFromFailure(error);
         const attemptAlreadyCounted = attemptUsage.inputTokens > 0 ||
           attemptUsage.outputTokens > 0 ||
@@ -642,6 +720,19 @@ export class BoundedWorkerLoop {
           threadId: failedThreadId,
           checkpointed,
         });
+        if (stalled) {
+          await this.sink.recordEvent({
+            orchestrationId: orchestration.id,
+            taskId: task.id,
+            executionId: started.executionId,
+            type: "worker-no-progress-stopped",
+            actorRole: "control-plane",
+            modelId: null,
+            summary: lastError,
+            metadata: { segment: segmentNumber, noProgressSegments },
+          });
+          break;
+        }
         if (resumableTransportFailure) {
           await this.sink.recordEvent({
             orchestrationId: orchestration.id,

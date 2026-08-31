@@ -42,6 +42,7 @@ import {
   OrchestrationStore,
   type OrchestrationDatabase,
 } from "./store.js";
+import type { AuditEntry, AuditLog } from "../../audit-log.js";
 
 export interface AgentAccessRecord {
   id: string;
@@ -68,6 +69,7 @@ export interface OrchestrationServiceOptions {
   clock?: () => Date;
   id?: () => string;
   cleanupPolicy?: "clean" | "archive" | "retain";
+  auditLog?: AuditLog;
 }
 
 export interface CreateOrchestrationInput {
@@ -157,14 +159,16 @@ const DEFAULT_BUDGET: BudgetPolicy = {
   maxInputTokens: null,
   maxOutputTokens: null,
   maxEstimatedUsd: null,
-  maxModelCalls: 100,
-  maxSteps: 250,
-  maxWorkerAttempts: 3,
-  maxContextExpansionsPerTask: 3,
-  maxArkApiTurns: 150,
-  maxArkApiTurnsPerExecution: 15,
-  maxInputTokensPerExecution: 250_000,
+  maxModelCalls: 250,
+  maxSteps: 750,
+  maxWorkerAttempts: 5,
+  maxContextExpansionsPerTask: 6,
+  maxArkApiTurns: 500,
+  maxArkApiTurnsPerExecution: 25,
+  maxInputTokensPerExecution: 500_000,
 };
+
+const MAX_ARTIFACT_PAYLOAD_CHARACTERS = 64_000;
 
 const MAX_BUDGET: Record<keyof BudgetPolicy, number> = {
   maxInputTokens: 100_000_000,
@@ -240,6 +244,7 @@ export class OrchestrationControlService implements OrchestrationSink {
   private readonly now: () => Date;
   private readonly newId: () => string;
   private readonly cleanupPolicy: "clean" | "archive" | "retain";
+  private readonly auditLog: AuditLog | undefined;
   private readonly controllers = new Map<string, AbortController>();
   private readonly background = new Map<string, Promise<void>>();
 
@@ -252,6 +257,7 @@ export class OrchestrationControlService implements OrchestrationSink {
     this.now = options.clock ?? (() => new Date());
     this.newId = options.id ?? randomUUID;
     this.cleanupPolicy = options.cleanupPolicy ?? "archive";
+    this.auditLog = options.auditLog;
   }
 
   async initialize(): Promise<void> {
@@ -294,6 +300,18 @@ export class OrchestrationControlService implements OrchestrationSink {
 
   getOrchestration(orchestrationId: string): OrchestrationReadModel {
     return buildReadModel(this.store.snapshot(), orchestrationId);
+  }
+
+  async getAuditLog(orchestrationId: string, limit = 500): Promise<{
+    entries: AuditEntry[];
+    filePath: string | null;
+  }> {
+    this.getOrchestration(orchestrationId);
+    if (!this.auditLog) return { entries: [], filePath: null };
+    return {
+      entries: await this.auditLog.readOrchestration(orchestrationId, limit),
+      filePath: this.auditLog.orchestrationPath(orchestrationId),
+    };
   }
 
   hasActiveOrchestration(agentId: string): boolean {
@@ -387,6 +405,84 @@ export class OrchestrationControlService implements OrchestrationSink {
     });
     this.launch(id, (signal) => this.elaborate(id, agent.workspacePath, 1, signal));
     return redactClone(orchestration);
+  }
+
+  async recoverAsNew(orchestrationId: string): Promise<Orchestration> {
+    const source = this.getOrchestration(orchestrationId).orchestration;
+    if (!["failed", "budget-exhausted", "cancelled"].includes(source.status)) {
+      throw new OrchestrationSemanticError(
+        "Only failed, budget-exhausted, or cancelled runs can be recovered",
+      );
+    }
+    const recovered = await this.createOrchestration(source.agentId, {
+      prompt: source.prompt,
+      requestedMode: source.requestedMode,
+    });
+    await this.store.mutate((database) => {
+      database.events.push(
+        this.makeEvent(
+          source.id,
+          "recovery-run-created",
+          "A linked recovery run was created from the last verified Agent workspace",
+          { recoveredAsOrchestrationId: recovered.id },
+        ),
+        this.makeEvent(
+          recovered.id,
+          "recovery-run-started",
+          "This run recovers a previous terminal run using fresh high-complexity budgets",
+          { recoveredFromOrchestrationId: source.id },
+        ),
+      );
+    });
+    return this.getOrchestration(recovered.id).orchestration;
+  }
+
+  async retryVerification(orchestrationId: string): Promise<Orchestration> {
+    const model = this.getOrchestration(orchestrationId);
+    if (model.orchestration.status !== "failed") {
+      throw new OrchestrationSemanticError("Verification can only be retried for a failed run");
+    }
+    if (!model.events.some((event) => event.type === "verification-candidate-retained")) {
+      throw new OrchestrationSemanticError("This run has no retained integration candidate to verify");
+    }
+    if (!this.driver.retryVerification || !model.activeContract || !model.plan) {
+      throw new OrchestrationSemanticError("Verification-only recovery is unavailable for this run");
+    }
+    const agent = await this.requireRunnableAgent(model.orchestration.agentId);
+    const plan: PlanResult = {
+      selectedMode: model.plan.selectedMode,
+      routeReason: model.plan.routeReason,
+      tasks: model.tasks,
+      applicationMap: model.applicationMaps.find(
+        (entry) => entry.version === model.plan!.applicationMapVersion,
+      )!,
+    };
+    const verificationRound = model.events.filter(
+      (event) => event.type === "verification-only-retry-started",
+    ).length + 1;
+    await this.store.mutate((database) => {
+      const orchestration = findOrchestration(database, orchestrationId);
+      orchestration.status = "verifying";
+      orchestration.error = null;
+      orchestration.completedAt = null;
+      orchestration.updatedAt = this.now().toISOString();
+      database.events.push(this.makeEvent(
+        orchestrationId,
+        "verification-only-retry-requested",
+        "User requested verification against the retained candidate without rerunning workers",
+        { verificationRound },
+      ));
+      this.setCleanup(database, orchestrationId, "retained", "Integrated candidate retained during verification-only recovery");
+    });
+    this.launch(orchestrationId, (signal) => this.retryVerificationExecution(
+      orchestrationId,
+      agent.workspacePath,
+      model.activeContract!,
+      plan,
+      verificationRound,
+      signal,
+    ));
+    return this.getOrchestration(orchestrationId).orchestration;
   }
 
   async reviseIntent(orchestrationId: string, revision: string): Promise<Orchestration> {
@@ -883,27 +979,21 @@ export class OrchestrationControlService implements OrchestrationSink {
   }
 
   async publishArtifact(artifact: SharedArtifact): Promise<void> {
-    if (artifact.payload.length > 8_000) {
-      throw new OrchestrationSemanticError("Artifact payload exceeds the safe summary limit");
-    }
     if (/protected evaluator source|-----BEGIN .*PRIVATE KEY-----/i.test(artifact.payload)) {
       throw new OrchestrationSemanticError("Artifact payload contains protected content");
     }
+    const safeArtifact = redactClone(artifact);
+    safeArtifact.payload = redactString(
+      artifact.payload,
+      MAX_ARTIFACT_PAYLOAD_CHARACTERS,
+    );
     await this.store.mutate((database) => {
       findOrchestration(database, artifact.orchestrationId);
-      const conflicting = database.artifacts.find(
-        (entry) =>
-          entry.orchestrationId === artifact.orchestrationId &&
-          entry.name === artifact.name &&
-          entry.version === artifact.version &&
-          entry.id !== artifact.id,
-      );
-      if (conflicting) throw new OrchestrationConflictError("Artifact version already exists");
       const existing = database.artifacts.findIndex(
         (entry) => entry.id === artifact.id && entry.version === artifact.version,
       );
-      if (existing < 0) database.artifacts.push(redactClone(artifact));
-      else database.artifacts[existing] = redactClone(artifact);
+      if (existing < 0) database.artifacts.push(safeArtifact);
+      else database.artifacts[existing] = safeArtifact;
     });
   }
 
@@ -1073,12 +1163,52 @@ export class OrchestrationControlService implements OrchestrationSink {
         current.status = "cancelled";
         current.error = redactString(outcome.reason);
         current.completedAt = now;
+      } else if (outcome.kind === "verification-failed") {
+        assertTransition(current.status, "failed");
+        current.status = "failed";
+        current.error = redactString(outcome.reason);
+        current.completedAt = now;
+        this.setCleanup(database, orchestrationId, "retained", "Integrated candidate retained for verification-only retry");
       } else {
         assertTransition(current.status, "failed");
         current.status = "failed";
         current.error = redactString(outcome.reason);
         current.completedAt = now;
       }
+      current.updatedAt = now;
+    });
+  }
+
+  private async retryVerificationExecution(
+    orchestrationId: string,
+    workspacePath: string,
+    contract: ExecutionContract,
+    plan: PlanResult,
+    verificationRound: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const orchestration = this.getOrchestration(orchestrationId).orchestration;
+    const outcome = await this.driver.retryVerification!(
+      { orchestration, contract, workspacePath, plan },
+      this,
+      signal,
+      verificationRound,
+    );
+    await this.store.mutate((database) => {
+      const current = findOrchestration(database, orchestrationId);
+      if (current.status !== "verifying") return;
+      const now = this.now().toISOString();
+      if (outcome.kind === "completed") {
+        current.status = "completed";
+        current.finalOutput = redactString(outcome.finalOutput, 20_000);
+        current.error = null;
+        this.setCleanup(database, orchestrationId, "pending", "Retained candidate was verified and published");
+      } else {
+        current.status = outcome.kind === "cancelled" ? "cancelled" : "failed";
+        current.error = redactString("reason" in outcome ? outcome.reason : "Verification retry failed");
+        this.setCleanup(database, orchestrationId, "retained", "Integrated candidate remains available for verification-only retry");
+      }
+      current.completedAt = now;
       current.updatedAt = now;
     });
   }
@@ -1098,7 +1228,7 @@ export class OrchestrationControlService implements OrchestrationSink {
           const message = redactString(
             error instanceof Error ? error.message : String(error),
           );
-          if (orchestration.status === "running") {
+          if (orchestration.status === "running" || orchestration.status === "verifying") {
             orchestration.status = "failed";
           } else if (orchestration.status === "drafting-intent" || orchestration.status === "planning") {
             orchestration.status = "failed";

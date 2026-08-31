@@ -254,6 +254,7 @@ export interface PlanResult {
 
 export type ExecutionOutcome =
   | { kind: "completed"; finalOutput: string }
+  | { kind: "verification-failed"; reason: string; candidateRetained: true }
   | { kind: "needs-user"; amendment: ContractAmendment }
   | { kind: "budget-exhausted"; reason: string }
   | { kind: "cancelled"; reason: string }
@@ -322,6 +323,12 @@ export interface OrchestrationExecutionDriver {
     input: ExecuteInput,
     sink: OrchestrationSink,
     signal: AbortSignal,
+  ): Promise<ExecutionOutcome>;
+  retryVerification?(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    signal: AbortSignal,
+    verificationRound: number,
   ): Promise<ExecutionOutcome>;
   cancel(orchestrationId: string): Promise<boolean>;
 }

@@ -24,9 +24,17 @@ function normalizedScope(scope: string): string {
   return scope.replace(/^\.\//, "").replace(/\/+$/, "");
 }
 
-export function tasksHaveOverlappingWriteScopes(
+export interface WriteScopeConflict {
+  leftTaskIndex: number;
+  leftPath: string;
+  rightTaskIndex: number;
+  rightPath: string;
+}
+
+export function overlappingWriteScopeConflicts(
   tasks: Array<{ allowedPaths: string[] }>,
-): boolean {
+): WriteScopeConflict[] {
+  const conflicts: WriteScopeConflict[] = [];
   for (let leftIndex = 0; leftIndex < tasks.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < tasks.length; rightIndex += 1) {
       for (const leftValue of tasks[leftIndex]!.allowedPaths) {
@@ -34,13 +42,24 @@ export function tasksHaveOverlappingWriteScopes(
         for (const rightValue of tasks[rightIndex]!.allowedPaths) {
           const right = normalizedScope(rightValue);
           if (left === right || left.startsWith(right + "/") || right.startsWith(left + "/")) {
-            return true;
+            conflicts.push({
+              leftTaskIndex: leftIndex,
+              leftPath: left,
+              rightTaskIndex: rightIndex,
+              rightPath: right,
+            });
           }
         }
       }
     }
   }
-  return false;
+  return conflicts;
+}
+
+export function tasksHaveOverlappingWriteScopes(
+  tasks: Array<{ allowedPaths: string[] }>,
+): boolean {
+  return overlappingWriteScopeConflicts(tasks).length > 0;
 }
 
 export function selectRoute(facts: RoutingFacts): RouteDecision {

@@ -7,9 +7,25 @@ describe("orchestration model configuration", () => {
     expect(defaults.orchestrationDefaultBudget).toMatchObject({
       maxInputTokens: null,
       maxOutputTokens: null,
-      maxArkApiTurns: 150,
-      maxArkApiTurnsPerExecution: 15,
-      maxInputTokensPerExecution: 250_000,
+      maxModelCalls: 250,
+      maxSteps: 750,
+      maxWorkerAttempts: 5,
+      maxContextExpansionsPerTask: 6,
+      maxArkApiTurns: 500,
+      maxArkApiTurnsPerExecution: 25,
+      maxInputTokensPerExecution: 500_000,
+    });
+    expect(defaults).toMatchObject({
+      codexTimeoutMs: 1_200_000,
+      codexMaxOutputBytes: 4_194_304,
+      containerCpuLimit: 4,
+      containerMemoryLimit: "4g",
+      containerPidsLimit: 512,
+      containerTmpfsSize: "1g",
+      containerShmSize: "512m",
+      auditLogEnabled: true,
+      auditLogMaximumBytes: 26_214_400,
+      auditLogMaximumFiles: 5,
     });
 
     const configured = loadConfig({
@@ -29,6 +45,7 @@ describe("orchestration model configuration", () => {
       ARK_REQUEST_MAX_RETRIES: "5",
       ARK_STREAM_MAX_RETRIES: "7",
       ARK_STREAM_IDLE_TIMEOUT_MS: "240000",
+      ORCHESTRATION_MODEL_TRANSPORT_MAX_RETRIES: "8",
       ORCHESTRATION_MAX_ARK_API_TURNS: "300",
       ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION: "12",
       ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION: "175000",
@@ -38,11 +55,32 @@ describe("orchestration model configuration", () => {
       arkRequestMaxRetries: 5,
       arkStreamMaxRetries: 7,
       arkStreamIdleTimeoutMs: 240_000,
+      orchestrationModelTransportMaxRetries: 8,
       orchestrationDefaultBudget: {
         maxArkApiTurns: 300,
         maxArkApiTurnsPerExecution: 12,
         maxInputTokensPerExecution: 175_000,
       },
+    });
+  });
+
+  it("supports an effectively unbounded full-application profile", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      ORCHESTRATION_UNRESTRICTED_MODE: "true",
+    });
+    expect(config.orchestrationUnrestrictedMode).toBe(true);
+    expect(config.orchestrationDefaultBudget).toEqual({
+      maxInputTokens: null,
+      maxOutputTokens: null,
+      maxEstimatedUsd: null,
+      maxModelCalls: 10_000,
+      maxSteps: 100_000,
+      maxWorkerAttempts: 100,
+      maxContextExpansionsPerTask: 100,
+      maxArkApiTurns: 100_000,
+      maxArkApiTurnsPerExecution: 50,
+      maxInputTokensPerExecution: 1_000_000,
     });
   });
 

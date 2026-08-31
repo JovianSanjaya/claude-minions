@@ -47,4 +47,12 @@ See [docs/DEMO.md](docs/DEMO.md) for normal and deterministic budget-stop journe
 
 Restart reconciliation cancels interrupted work while retaining redacted evidence. Stop/delete cancels orchestration children; worker scratch state follows the configured archive policy. This is a single-node POC, JSON stores assume one writer process, protected checks reduce gaming but do not prove correctness, ordinary containers are not hardened multi-tenant isolation, and the live benchmark adapter uses a compact common verification check rather than a universal quality oracle.
 
+## Audit logs
+
+The server writes redacted, append-only JSONL audit logs by default. The complete cross-system timeline is at `.data/logs/audit.jsonl`; each orchestration also receives `.data/logs/orchestrations/<orchestration-id>.jsonl`. Logs include HTTP timing, model execution boundaries and budgets, token/tool usage, state transitions, worker attempts, changed-file lists, verification evidence, artifacts by hash, recovery, cleanup, and failures. Prompts, model outputs, artifact payloads, authorization headers, cookies, API keys, and environment secrets are not copied into audit logs; sensitive bodies are represented by character counts and SHA-256 fingerprints.
+
+Use `GET /api/orchestrations/:orchestrationId/audit-log?limit=500` to retrieve the newest redacted entries. Configure the system with `AUDIT_LOG_ENABLED`, `AUDIT_LOG_DIR`, `AUDIT_LOG_MAX_BYTES`, and `AUDIT_LOG_MAX_FILES`. Rotation is enabled by default at 25 MiB with five retained files.
+
+Transient ModelArk transport failures are retried with bounded exponential backoff. `ORCHESTRATION_MODEL_TRANSPORT_MAX_RETRIES` controls the orchestration-level retry count independently of the Codex provider's request and stream retry settings; zero-turn disconnects restart with a fresh Codex thread.
+
 Architecture and security details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

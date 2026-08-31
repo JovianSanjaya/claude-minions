@@ -89,6 +89,8 @@ export interface RunnerRequest {
   runtimeProfile?: "default" | "verification" | undefined;
   maxArkApiTurns?: number | undefined;
   maxInputTokens?: number | undefined;
+  maxToolCalls?: number | undefined;
+  timeoutMs?: number | undefined;
 }
 
 export interface AgentRunner {

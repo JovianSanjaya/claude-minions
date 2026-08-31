@@ -5,7 +5,8 @@ import type { ApplicationMapSummary } from "../contracts.js";
 
 const excludedNames = new Set([
   ".git", "node_modules", "dist", "build", "coverage", ".next", ".cache",
-  ".npm", ".npm-cache", ".pnpm-store", ".yarn-cache", ".parcel-cache", ".turbo",
+  ".npm", ".npm-cache", ".npm-tmp", ".node-compile-cache", ".pnpm-store",
+  ".yarn-cache", ".parcel-cache", ".turbo",
   ".codex", ".orchestration", "orchestration-work", "protected-evaluators",
 ]);
 const protectedSecretName = /(?:^|\/)[^/]*(?:private[-_]?key|credential|secret)[^/]*$/i;

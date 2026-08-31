@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ExecutionContract } from "../contracts.js";
 import {
+  consolidateAcceptanceTests,
   comprehensiveAcceptanceTests,
   requiresPostReleaseVerification,
 } from "./acceptance-plan.js";
@@ -33,6 +34,44 @@ const contract: ExecutionContract = {
 };
 
 describe("planner acceptance plan", () => {
+  it("batches oversized plans without dropping criterion coverage", () => {
+    const tests = Array.from({ length: 30 }, (_, index) => ({
+      id: `test-${index}`,
+      title: `Behavior ${index}`,
+      criterionIds: [`criterion-${index}`],
+      category: "functional" as const,
+      scope: "protected" as const,
+      verificationPhase: "release-gate" as const,
+      procedure: `Exercise behavior ${index}`,
+      expectedOutcome: `Behavior ${index} works`,
+    }));
+    const compact = consolidateAcceptanceTests(tests);
+    expect(compact).toHaveLength(1);
+    expect(new Set(compact.flatMap((test) => test.criterionIds))).toEqual(
+      new Set(tests.flatMap((test) => test.criterionIds)),
+    );
+    expect(compact[0]?.procedure).toContain("Exercise behavior 29");
+  });
+
+  it("keeps a mixed oversized plan within the lean six-check ceiling", () => {
+    const tests = Array.from({ length: 18 }, (_, index) => ({
+      id: `mixed-${index}`,
+      title: `Check ${index}`,
+      criterionIds: [`criterion-${index}`],
+      category: index % 5 === 0 ? "regression" as const : "functional" as const,
+      scope: index % 2 === 0 ? "protected" as const : "global" as const,
+      verificationPhase: index % 7 === 0 ? "post-release" as const : "release-gate" as const,
+      procedure: `Run check ${index}`,
+      expectedOutcome: `Check ${index} passes`,
+    }));
+
+    const compact = consolidateAcceptanceTests(tests);
+    expect(compact.length).toBeLessThanOrEqual(6);
+    expect(new Set(compact.flatMap((test) => test.criterionIds))).toEqual(
+      new Set(tests.flatMap((test) => test.criterionIds)),
+    );
+  });
+
   it("fills every uncovered criterion and always includes regression coverage", () => {
     const tests = comprehensiveAcceptanceTests([
       {

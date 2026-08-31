@@ -22,6 +22,50 @@ export const protectedAcceptancePlanSchema = z.object({
 export type PlannedAcceptanceTest = z.infer<typeof plannedAcceptanceTestSchema>;
 export type ProtectedAcceptancePlan = z.infer<typeof protectedAcceptancePlanSchema>;
 
+export function consolidateAcceptanceTests(
+  tests: readonly PlannedAcceptanceTest[],
+  threshold = 6,
+): PlannedAcceptanceTest[] {
+  if (tests.length <= threshold) return [...tests];
+  const groups = new Map<string, PlannedAcceptanceTest[]>();
+  for (const test of tests) {
+    // Preserve regression/manual semantics, but batch ordinary functional,
+    // architectural, scope, and runtime assertions that the verifier can
+    // prove with the same pass through a candidate.
+    const key = test.scope === "manual" || test.category === "manual"
+      ? "manual"
+      : test.verificationPhase === "post-release"
+        ? "post-release"
+        : test.category === "regression"
+          ? `${test.scope}:release-regression`
+          : `${test.scope}:release-implementation`;
+    const group = groups.get(key) ?? [];
+    group.push(test);
+    groups.set(key, group);
+  }
+  return [...groups.entries()].map(([key, group], index) => {
+    if (group.length === 1) return group[0]!;
+    const first = group[0]!;
+    const label = key.replaceAll(":", "-");
+    return {
+      id: safeTestId(`batch-${label}-${index + 1}`),
+      title: `Verify ${group.length} related ${first.category} requirements`.slice(0, 500),
+      criterionIds: [...new Set(group.flatMap((test) => test.criterionIds))],
+      category: first.category,
+      scope: first.scope,
+      verificationPhase: first.verificationPhase,
+      procedure: group
+        .map((test, itemIndex) => `${itemIndex + 1}. ${test.title}: ${test.procedure}`)
+        .join("\n")
+        .slice(0, 8_000),
+      expectedOutcome: group
+        .map((test, itemIndex) => `${itemIndex + 1}. ${test.expectedOutcome}`)
+        .join("\n")
+        .slice(0, 4_000),
+    };
+  });
+}
+
 const postReleaseObservationPatterns = [
   /\b(?:final|eventual)\s+(?:assistant|agent|chat)?\s*(?:response|reply|message|output)\b/i,
   /\b(?:assistant|agent|chat)\s+(?:response|reply|message)\s+(?:to|for)\s+(?:the\s+)?user\b/i,

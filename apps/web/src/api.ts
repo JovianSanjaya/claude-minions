@@ -95,6 +95,8 @@ export const orchestrationApi: OrchestrationApi = {
   }),
   start: (id) => request(`/api/orchestrations/${id}/start`, { method: "POST" }),
   cancel: (id) => request(`/api/orchestrations/${id}/cancel`, { method: "POST" }),
+  recover: (id) => request(`/api/orchestrations/${id}/recover`, { method: "POST" }),
+  retryVerification: (id) => request(`/api/orchestrations/${id}/retry-verification`, { method: "POST" }),
   confirmAmendment: (id, amendmentId, response) => request(`/api/orchestrations/${id}/amendments/${amendmentId}/confirm`, {
     method: "POST",
     body: JSON.stringify(response ? { response } : {}),

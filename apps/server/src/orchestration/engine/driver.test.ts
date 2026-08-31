@@ -18,7 +18,11 @@ import type {
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
 import { RunnerExecutionError } from "../../errors.js";
-import { ContextAwareExecutionDriver } from "./driver.js";
+import {
+  ContextAwareExecutionDriver,
+  mergeTasksByBroadWriteScope,
+  selectAdaptiveVerificationProfile,
+} from "./driver.js";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -34,6 +38,7 @@ class Sink implements OrchestrationSink {
   artifacts: SharedArtifact[] = [];
   verifications: VerificationRecord[] = [];
   calls = 0;
+  failArtifactNameOnce: string | null = null;
   async reserveModelCall(_input: ModelCallReservation) { this.calls += 1; return { allowed: true as const, reservationId: `r${this.calls}` }; }
   async commitModelUsage(_id: string, _actual: TokenUsage) {}
   async recordEvent(event: Omit<OrchestrationEvent, "id" | "createdAt">) { this.events.push(event); }
@@ -41,7 +46,13 @@ class Sink implements OrchestrationSink {
   async recordApplicationMap(map: ApplicationMapSummary) { this.maps.push(map); }
   async recordContextPacket(packet: ContextPacketSummary) { this.packets.push(packet); }
   async recordAttempt(attempt: WorkerAttempt) { this.attempts.push(structuredClone(attempt)); }
-  async publishArtifact(artifact: SharedArtifact) { this.artifacts.push(structuredClone(artifact)); }
+  async publishArtifact(artifact: SharedArtifact) {
+    if (this.failArtifactNameOnce === artifact.name) {
+      this.failArtifactNameOnce = null;
+      throw new Error("simulated artifact persistence interruption");
+    }
+    this.artifacts.push(structuredClone(artifact));
+  }
   async recordVerification(record: VerificationRecord) { this.verifications.push(record); }
 }
 
@@ -67,6 +78,10 @@ type RecordedCall = {
   role: string | undefined;
   prompt: string;
   threadId: string | null | undefined;
+  maxArkApiTurns: number | undefined;
+  maxInputTokens: number | undefined;
+  maxToolCalls: number | undefined;
+  timeoutMs: number | undefined;
 };
 
 function orchestration(workspace: string): Orchestration {
@@ -110,6 +125,8 @@ function fakeRunner(
   firstWorkerBudgetBoundary = false,
   firstPlanOversizedTask = false,
   firstWorkerGracefulCheckpoint = false,
+  parallelPlanRoots = false,
+  verificationExecutionError: string | null = null,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   let recoveryApplied = false;
@@ -119,7 +136,18 @@ function fakeRunner(
   let workerGracefulCheckpointRaised = false;
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId });
+      calls.push({
+        taskId: request.taskId,
+        sandboxMode: request.sandboxMode,
+        runtimeProfile: request.runtimeProfile,
+        role: request.role,
+        prompt: request.prompt,
+        threadId: request.threadId,
+        maxArkApiTurns: request.maxArkApiTurns,
+        maxInputTokens: request.maxInputTokens,
+        maxToolCalls: request.maxToolCalls,
+        timeoutMs: request.timeoutMs,
+      });
       let output: string;
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
@@ -156,7 +184,7 @@ function fakeRunner(
             ? [{ title: "Build everything", objective: "Build A and B in one oversized task", dependsOn: [], allowedPaths: ["src/a.ts", "src/b.ts"], acceptanceCriterionIds: ["c1", "c2"], requiredArtifactIds: [], estimatedArkApiTurns: 60, estimatedInputTokens: 3_000_000 }]
             : [
                 { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000, explanatoryNote: "safe unknown field" },
-                { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000 },
+                { title: "Add B", objective: "Add B", dependsOn: parallelPlanRoots ? [] : ["0"], allowedPaths: [parallelPlanRoots ? "frontend/src/App.tsx" : "src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000 },
               ],
           acceptanceTests,
         });
@@ -209,16 +237,19 @@ function fakeRunner(
           workerBudgetBoundaryRaised = true;
           await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
           await writeFile(path.join(request.workspacePath, "src/a.ts"), "export const a = 0;\n");
+          const inputLimit = request.maxInputTokens ?? 120_000;
+          const turnLimit = request.maxArkApiTurns ?? 6;
+          const toolLimit = request.maxToolCalls ?? 6;
           throw new RunnerExecutionError(
-            "Per-execution input-token limit exceeded (250000/250000)",
+            `Per-execution input-token limit exceeded (${inputLimit}/${inputLimit})`,
             {
               threadId: "heavy-worker-thread",
               usage: {
-                inputTokens: 250_000,
-                cachedInputTokens: 220_000,
+                inputTokens: inputLimit,
+                cachedInputTokens: Math.floor(inputLimit * 0.88),
                 outputTokens: 4_000,
-                arkApiTurns: 12,
-                toolCalls: 12,
+                arkApiTurns: turnLimit,
+                toolCalls: toolLimit,
               },
               output: null,
             },
@@ -279,6 +310,19 @@ function fakeRunner(
           : "Direct execution completed";
       } else if (request.prompt.includes("Independently verify the integrated candidate")) {
         acceptanceCalls += 1;
+        if (verificationExecutionError) {
+          throw new RunnerExecutionError(verificationExecutionError, {
+            threadId: "verifier-timeout-thread",
+            output: null,
+            usage: {
+              inputTokens: 20_000,
+              cachedInputTokens: 12_000,
+              outputTokens: 2_000,
+              arkApiTurns: 2,
+              toolCalls: 2,
+            },
+          });
+        }
         const acceptanceShouldFail = failAcceptance && !recoveryApplied && !(
           recoveryAction === "retry-verifier" && acceptanceCalls > 1
         );
@@ -317,6 +361,9 @@ async function setup(
   firstWorkerBudgetBoundary = false,
   firstPlanOversizedTask = false,
   firstWorkerGracefulCheckpoint = false,
+  unrestrictedMode = false,
+  parallelPlanRoots = false,
+  verificationExecutionError: string | null = null,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
@@ -347,11 +394,14 @@ async function setup(
       firstWorkerBudgetBoundary,
       firstPlanOversizedTask,
       firstWorkerGracefulCheckpoint,
+      parallelPlanRoots,
+      verificationExecutionError,
     ),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
     archiveRoot: path.join(root, "archive"), protectedEvaluatorRoot: path.join(root, "protected"),
     cleanupPolicy: "clean",
+    unrestrictedMode,
     verificationChecks: [
       { id: "visible", description: "visible task check", scope: "worker-visible", run: visibleCheck },
       { id: "protected", description: "protected acceptance", scope: "protected", run: async (candidate) => ({ passed: allowNoChangeDirect || await readFile(path.join(candidate, "src", "a.ts"), "utf8").then(() => true).catch(() => false), summary: "protected result" }) },
@@ -362,6 +412,131 @@ async function setup(
 }
 
 describe("ContextAwareExecutionDriver acceptance", () => {
+  it("scales verifier effort with candidate complexity while keeping a hard ceiling", () => {
+    expect(selectAdaptiveVerificationProfile({
+      fileCount: 3,
+      totalBytes: 25_000,
+      taskCount: 1,
+      automatedTestCount: 6,
+      hasBuildOrRuntimeManifest: false,
+      recoveryRound: 0,
+    })).toMatchObject({ name: "fast", maxArkApiTurns: 1, maxInputTokens: 25_000, maxToolCalls: 1, maxShellInvocations: 0 });
+    expect(selectAdaptiveVerificationProfile({
+      fileCount: 80,
+      totalBytes: 4_000_000,
+      taskCount: 4,
+      automatedTestCount: 18,
+      hasBuildOrRuntimeManifest: true,
+      recoveryRound: 0,
+    })).toMatchObject({ name: "standard", maxArkApiTurns: 4, maxInputTokens: 75_000, maxToolCalls: 3, timeoutMs: 150_000 });
+    expect(selectAdaptiveVerificationProfile({
+      fileCount: 600,
+      totalBytes: 40_000_000,
+      taskCount: 12,
+      automatedTestCount: 70,
+      hasBuildOrRuntimeManifest: true,
+      recoveryRound: 0,
+    })).toMatchObject({ name: "complex", maxArkApiTurns: 6, maxInputTokens: 120_000, maxToolCalls: 5, timeoutMs: 240_000 });
+  });
+
+  it("retains an inconclusive candidate without invoking planner recovery after a verifier timeout", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null,
+      false, false, false, false, false, "Runtime timed out after 150000 ms",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const signal = new AbortController().signal;
+    const plan = await driver.plan(
+      { orchestration: item, contract: contract(), workspacePath: workspace },
+      sink,
+      signal,
+    );
+    const outcome = await driver.execute(
+      { orchestration: item, contract: contract(), workspacePath: workspace, plan },
+      sink,
+      signal,
+    );
+
+    expect(outcome).toMatchObject({
+      kind: "verification-failed",
+      candidateRetained: true,
+      reason: expect.stringContaining("Verification inconclusive"),
+    });
+    expect(calls.filter((call) => call.role === "verifier")).toHaveLength(1);
+    expect(calls.some((call) =>
+      call.prompt.includes("Act as the big-model supervisor for the configured execution roles")
+    )).toBe(false);
+    expect(sink.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "verification-inconclusive" }),
+      expect.objectContaining({
+        type: "verification-candidate-retained",
+        metadata: expect.objectContaining({ inconclusive: true }),
+      }),
+    ]));
+  });
+
+  it("merges tasks that would write the same top-level area in unrestricted mode", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null, false, false, false, true,
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const plan = await driver.plan(
+      { orchestration: item, contract: contract(), workspacePath: workspace },
+      sink,
+      new AbortController().signal,
+    );
+    expect(plan.selectedMode).toBe("one-worker");
+    expect(plan.tasks).toHaveLength(1);
+    expect(plan.tasks[0]).toMatchObject({
+      title: "Combined src implementation",
+      allowedPaths: ["src"],
+      dependsOn: [],
+    });
+    expect(calls.find((call) => call.role === "planner")?.prompt).toContain(
+      "Maximize safe parallelism",
+    );
+  });
+
+  it("keeps independent top-level application areas ready for simultaneous workers", async () => {
+    const { workspace, driver } = await setup(
+      false, false, false, false, false, false, "stop", "backend/src/server.ts",
+      false, false, false, true, true,
+    );
+    const plan = await driver.plan(
+      { orchestration: orchestration(workspace), contract: contract(), workspacePath: workspace },
+      new Sink(),
+      new AbortController().signal,
+    );
+
+    expect(plan.selectedMode).toBe("multi-worker");
+    expect(plan.tasks).toHaveLength(2);
+    expect(plan.tasks.map((task) => task.allowedPaths)).toEqual([["backend"], ["frontend"]]);
+    expect(plan.tasks.every((task) => task.status === "ready" && task.dependsOn.length === 0)).toBe(true);
+    expect(plan.routeReason).toContain("concurrently");
+  });
+
+  it("merges only colliding broad scopes and preserves unrelated parallel work", () => {
+    const base = {
+      orchestrationId: "orchestration-1",
+      acceptanceCriterionIds: [],
+      requiredArtifactIds: [],
+      observedArtifactVersions: {},
+      status: "ready" as const,
+      attemptCount: 0,
+    };
+    const merged = mergeTasksByBroadWriteScope([
+      { ...base, id: "backend", title: "Backend", objective: "Build API", dependsOn: [], allowedPaths: ["backend/src/server.ts"] },
+      { ...base, id: "frontend-shell", title: "Frontend shell", objective: "Build shell", dependsOn: [], allowedPaths: ["frontend/src/App.tsx"] },
+      { ...base, id: "frontend-pages", title: "Frontend pages", objective: "Build pages", dependsOn: [], allowedPaths: ["frontend/src/pages"] },
+    ]);
+
+    expect(merged).toHaveLength(2);
+    expect(merged.map((task) => task.allowedPaths)).toEqual([["backend"], ["frontend"]]);
+    expect(merged.map((task) => task.objective)).toEqual(["Build API", "Build shell; Build pages"]);
+  });
+
   it("runs confirmed modular work through maps, preflights, artifacts, integration, verification, and publish", async () => {
     const { workspace, driver, calls } = await setup();
     const sink = new Sink();
@@ -424,9 +599,21 @@ describe("ContextAwareExecutionDriver acceptance", () => {
           sandboxMode: "read-only",
           runtimeProfile: "verification",
           prompt: expect.stringContaining("bundled Chromium"),
+          maxArkApiTurns: 1,
+          maxInputTokens: 25_000,
+          maxToolCalls: 1,
+          timeoutMs: 60_000,
         }),
       ]),
     );
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "verification-profile-selected",
+      metadata: expect.objectContaining({ profile: "fast" }),
+    }));
+    expect(calls.find((call) => call.role === "verifier")?.prompt).toContain(
+      "Do not call tools, open files, start a browser, or run shell commands",
+    );
+    expect(calls.find((call) => call.role === "verifier")?.prompt).toContain("sourcePreviews");
     for (const task of plan.tasks) {
       const taskCalls = calls.filter((call) => call.taskId === task.id);
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
@@ -467,7 +654,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(sink.attempts).toContainEqual(expect.objectContaining({
       taskId: taskA.id,
       status: "checkpointed",
-      usage: expect.objectContaining({ inputTokens: 250_000 }),
+      usage: expect.objectContaining({ inputTokens: 120_000 }),
     }));
     expect(sink.attempts.filter((attempt) => attempt.taskId === taskA.id).map((attempt) => attempt.number))
       .toEqual([1, 1, 1, 1]);
@@ -545,6 +732,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const planningCall = calls.find((call) =>
       call.role === "planner" && call.prompt.includes("Create a bounded coding plan")
     );
+    expect(planningCall?.timeoutMs).toBe(180_000);
     expect(planningCall?.prompt).toContain("Total model-call budget: 100");
     expect(planningCall?.prompt).toContain(
       "Model calls already consumed before this planning response: 3",
@@ -720,8 +908,9 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
     const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
     expect(outcome).toEqual({
-      kind: "failed",
+      kind: "verification-failed",
       reason: "Protected or global verification failed; main workspace was not changed",
+      candidateRetained: true,
     });
     await expect(readFile(path.join(workspace, "src", "a.ts"))).rejects.toThrow();
     await expect(readFile(path.join(workspace, "src", "b.ts"))).rejects.toThrow();
@@ -737,8 +926,9 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
 
     expect(outcome).toEqual({
-      kind: "failed",
+      kind: "verification-failed",
       reason: "Protected or global verification failed; main workspace was not changed",
+      candidateRetained: true,
     });
     expect(sink.verifications.find((record) => record.commandOrCheck === "Module A works")?.status)
       .toBe("failed");
@@ -800,6 +990,61 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       calls.filter((call) => call.role === "verifier").at(-1)?.prompt,
     ).toContain("Big-model supervisor instructions");
     expect(sink.events.filter((event) => event.type === "acceptance-verification-completed")).toHaveLength(2);
+    expect(
+      sink.artifacts
+        .filter((artifact) => artifact.name === "Acceptance verification results")
+        .map((artifact) => ({ id: artifact.id, version: artifact.version })),
+    ).toEqual([
+      { id: `verification-results-${contract().id}`, version: 1 },
+      { id: `verification-results-${contract().id}`, version: 2 },
+    ]);
+    expect(
+      sink.artifacts
+        .filter((artifact) => artifact.name === "Deterministic verification evidence")
+        .map((artifact) => artifact.version),
+    ).toEqual([1, 2]);
+  });
+
+  it("routes verifier execution exceptions through recovery instead of failing the run", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "retry-verifier",
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    const signal = new AbortController().signal;
+    const plan = await driver.plan(
+      { orchestration: item, contract: contract(), workspacePath: workspace },
+      sink,
+      signal,
+    );
+    sink.failArtifactNameOnce = "Deterministic verification evidence";
+
+    const outcome = await driver.execute(
+      { orchestration: item, contract: contract(), workspacePath: workspace, plan },
+      sink,
+      signal,
+    );
+
+    expect(outcome.kind).toBe("completed");
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "verification-execution-failed",
+      metadata: expect.objectContaining({
+        error: "simulated artifact persistence interruption",
+      }),
+    }));
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "supervisor-recovery-decision",
+      metadata: expect.objectContaining({ action: "retry-verifier" }),
+    }));
+    expect(sink.events).toContainEqual(expect.objectContaining({ type: "verified-publish" }));
+    expect(calls.find((call) => call.prompt.includes("Act as the big-model supervisor")))
+      .toEqual(expect.objectContaining({
+        maxArkApiTurns: 2,
+        maxInputTokens: 60_000,
+        maxToolCalls: 1,
+        timeoutMs: 60_000,
+        prompt: expect.stringContaining("Do not call tools"),
+      }));
   });
 
   it("raises permission-dependent recovery to the user with a concrete question", async () => {

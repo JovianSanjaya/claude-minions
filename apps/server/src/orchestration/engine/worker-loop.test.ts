@@ -3,6 +3,7 @@ import {
   compactChangedPathSummary,
   isResumableWorkerTransportFailure,
   isWorkerExecutionBudgetBoundary,
+  selectAdaptiveWorkerProfile,
 } from "./worker-loop.js";
 
 describe("worker retry context", () => {
@@ -38,9 +39,29 @@ describe("worker retry context", () => {
       .toBe(true);
     expect(isWorkerExecutionBudgetBoundary("Ark-turn limit exceeded (15/15)"))
       .toBe(true);
+    expect(isWorkerExecutionBudgetBoundary("Per-execution tool-call limit exceeded (13/12)"))
+      .toBe(true);
     expect(isResumableWorkerTransportFailure("stream disconnected before completion"))
       .toBe(true);
     expect(isResumableWorkerTransportFailure("Per-execution input-token limit exceeded"))
       .toBe(false);
+  });
+
+  it("selects bounded worker budgets from task and repository complexity", () => {
+    expect(selectAdaptiveWorkerProfile({
+      allowedPaths: ["index.html", "styles.css"],
+      criterionCount: 3,
+      repositoryFileCount: 20,
+    })).toEqual({ name: "simple", maximumFailureAttempts: 2, timeoutMs: 180_000 });
+    expect(selectAdaptiveWorkerProfile({
+      allowedPaths: ["apps/web", "apps/server", "packages/shared"],
+      criterionCount: 8,
+      repositoryFileCount: 140,
+    })).toEqual({ name: "standard", maximumFailureAttempts: 3, timeoutMs: 300_000 });
+    expect(selectAdaptiveWorkerProfile({
+      allowedPaths: ["."],
+      criterionCount: 12,
+      repositoryFileCount: 600,
+    })).toEqual({ name: "complex", maximumFailureAttempts: 4, timeoutMs: 480_000 });
   });
 });

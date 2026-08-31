@@ -43,8 +43,8 @@ locals {
     "CODEX_HOME=/app/codex-home",
     "CODEX_BIN=codex",
     "CODEX_SANDBOX_MODE=workspace-write",
-    "CODEX_TIMEOUT_MS=600000",
-    "CODEX_MAX_OUTPUT_BYTES=2097152",
+    "CODEX_TIMEOUT_MS=1200000",
+    "CODEX_MAX_OUTPUT_BYTES=4194304",
     ""
   ])
 }

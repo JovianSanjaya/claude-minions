@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { z } from "zod";
 import type {
   ContractAmendment,
@@ -23,6 +25,7 @@ import {
   type DetailedApplicationMap,
 } from "./application-map.js";
 import {
+  consolidateAcceptanceTests,
   comprehensiveAcceptanceTests,
   plannedAcceptanceTestSchema,
   requiresPostReleaseVerification,
@@ -38,8 +41,16 @@ import {
   recoveryEvidence,
   type RecoveryDecision,
 } from "./recovery.js";
-import { RoleExecutor, type RoleModelConfiguration } from "./role-executor.js";
-import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
+import {
+  isVerificationInfrastructureFailure,
+  RoleExecutor,
+  type RoleModelConfiguration,
+} from "./role-executor.js";
+import {
+  overlappingWriteScopeConflicts,
+  selectRoute,
+  tasksHaveOverlappingWriteScopes,
+} from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
 import {
   BoundedWorkerLoop,
@@ -47,7 +58,11 @@ import {
   WorkerLoopError,
   workerContinuationSegmentLimit,
 } from "./worker-loop.js";
-import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
+import {
+  scopeViolations,
+  scopeViolationSummary,
+  WorkerWorkspaceManager,
+} from "./worker-workspaces.js";
 
 const clarificationQuestionSchema = z.object({
   prompt: z.string().min(1).max(600),
@@ -127,11 +142,18 @@ const planSchema = (
   })).min(1).max(20),
   acceptanceTests: z.array(plannedAcceptanceTestSchema).max(200).default([]),
 }).strict().superRefine((value, context) => {
-  if (value.tasks.length > 1 && tasksHaveOverlappingWriteScopes(value.tasks)) {
+  const writeConflicts = value.tasks.length > 1
+    ? overlappingWriteScopeConflicts(value.tasks)
+    : [];
+  if (writeConflicts.length) {
+    const examples = writeConflicts.slice(0, 8).map((conflict) =>
+      `tasks[${conflict.leftTaskIndex}] ${JSON.stringify(conflict.leftPath)} conflicts with tasks[${conflict.rightTaskIndex}] ${JSON.stringify(conflict.rightPath)}`
+    ).join("; ");
+    const omitted = writeConflicts.length > 8 ? `; +${writeConflicts.length - 8} more conflicts` : "";
     context.addIssue({
       code: "custom",
       path: ["tasks"],
-      message: "Worker allowedPaths overlap. Give every writable path exactly one owner, assign shared root files to a foundation task, and express ordering with dependsOn.",
+      message: `Worker allowedPaths overlap: ${examples}${omitted}. Give every writable path exactly one owner. Remove the parent path from one task, use narrower exclusive paths, or collapse inseparable work into one task. Dependencies do not make overlapping write ownership safe.`,
     });
   }
   const defaultTurns = Math.ceil(value.estimatedArkApiTurns / value.tasks.length);
@@ -172,6 +194,86 @@ const planSchema = (
 
 const MAXIMUM_PLANNER_RESPONSE_CALLS = 2;
 const MAXIMUM_PLANNER_ARK_TURN_RESERVE = 4;
+const MAXIMUM_VERIFIER_TRANSPORT_RETRIES = 1;
+export type VerificationProfileName = "fast" | "standard" | "complex";
+
+export interface AdaptiveVerificationProfile {
+  name: VerificationProfileName;
+  maxArkApiTurns: number;
+  maxInputTokens: number;
+  maxToolCalls: number;
+  timeoutMs: number;
+  maxShellInvocations: number;
+  fileEvidenceLimit: number;
+  fileSummaryCharacters: number;
+  procedureCharacters: number;
+  expectedOutcomeCharacters: number;
+  promptCharacters: number;
+}
+
+const VERIFICATION_PROFILES: Record<VerificationProfileName, AdaptiveVerificationProfile> = {
+  fast: {
+    name: "fast",
+    maxArkApiTurns: 1,
+    maxInputTokens: 25_000,
+    maxToolCalls: 1,
+    timeoutMs: 60_000,
+    maxShellInvocations: 0,
+    fileEvidenceLimit: 40,
+    fileSummaryCharacters: 180,
+    procedureCharacters: 600,
+    expectedOutcomeCharacters: 350,
+    promptCharacters: 28_000,
+  },
+  standard: {
+    name: "standard",
+    maxArkApiTurns: 4,
+    maxInputTokens: 75_000,
+    maxToolCalls: 3,
+    timeoutMs: 150_000,
+    maxShellInvocations: 2,
+    fileEvidenceLimit: 120,
+    fileSummaryCharacters: 300,
+    procedureCharacters: 900,
+    expectedOutcomeCharacters: 500,
+    promptCharacters: 48_000,
+  },
+  complex: {
+    name: "complex",
+    maxArkApiTurns: 6,
+    maxInputTokens: 120_000,
+    maxToolCalls: 5,
+    timeoutMs: 240_000,
+    maxShellInvocations: 3,
+    fileEvidenceLimit: 200,
+    fileSummaryCharacters: 400,
+    procedureCharacters: 1_200,
+    expectedOutcomeCharacters: 700,
+    promptCharacters: 64_000,
+  },
+};
+
+export function selectAdaptiveVerificationProfile(input: {
+  fileCount: number;
+  totalBytes: number;
+  taskCount: number;
+  automatedTestCount: number;
+  hasBuildOrRuntimeManifest: boolean;
+  recoveryRound: number;
+}): AdaptiveVerificationProfile {
+  const fast = input.fileCount <= 20 &&
+    input.totalBytes <= 500_000 &&
+    input.taskCount <= 2 &&
+    input.automatedTestCount <= 20 &&
+    !input.hasBuildOrRuntimeManifest &&
+    input.recoveryRound === 0;
+  if (fast) return VERIFICATION_PROFILES.fast;
+  const standard = input.fileCount <= 200 &&
+    input.totalBytes <= 15_000_000 &&
+    input.taskCount <= 8 &&
+    input.automatedTestCount <= 40;
+  return standard ? VERIFICATION_PROFILES.standard : VERIFICATION_PROFILES.complex;
+}
 
 function consumedModelCalls(orchestration: Orchestration): number {
   return Object.values(orchestration.usage.byRole).reduce(
@@ -193,7 +295,35 @@ const acceptanceVerificationSchema = z.object({
     status: z.enum(["passed", "failed"]),
     evidence: z.string().min(1).max(8_000),
   }).strict()).max(200),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const seen = new Set<string>();
+  value.results.forEach((result, index) => {
+    if (seen.has(result.testId)) {
+      context.addIssue({
+        code: "custom",
+        path: ["results", index, "testId"],
+        message: `Duplicate verification result for testId ${result.testId}`,
+      });
+    }
+    seen.add(result.testId);
+  });
+});
+
+function boundedJson(value: unknown, maximumCharacters: number): string {
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= maximumCharacters) return serialized;
+  let previewLength = Math.max(0, maximumCharacters - 200);
+  while (previewLength > 0) {
+    const bounded = JSON.stringify({
+      truncated: true,
+      originalCharacters: serialized.length,
+      preview: serialized.slice(0, previewLength),
+    });
+    if (bounded.length <= maximumCharacters) return bounded;
+    previewLength = Math.floor(previewLength * 0.8);
+  }
+  return JSON.stringify({ truncated: true, originalCharacters: serialized.length });
+}
 
 const conflictSchema = z.object({ content: z.string().max(200_000) }).strict();
 const diagnosisSchema = z.object({
@@ -231,6 +361,7 @@ export interface EngineDriverOptions {
   clock?: () => Date;
   modelCallTimeoutMs?: number;
   modelTransportMaxRetries?: number;
+  unrestrictedMode?: boolean;
 }
 
 function zeroUsage(): TokenUsage {
@@ -256,6 +387,84 @@ function safeAllowedPath(value: string): string {
   const problem = allowedPathProblem(value);
   if (problem) throw new Error(`Planner produced unsafe allowed path: ${value} (${problem})`);
   return normalizedAllowedPath(value);
+}
+
+function broadWriteScope(value: string): string {
+  const normalized = normalizedAllowedPath(value);
+  if (normalized === ".") return ".";
+  return normalized.split("/")[0]!;
+}
+
+export function mergeTasksByBroadWriteScope(
+  tasks: OrchestrationTask[],
+): OrchestrationTask[] {
+  if (tasks.length < 2) {
+    return tasks.map((task) => ({
+      ...task,
+      allowedPaths: [...new Set(task.allowedPaths.map(broadWriteScope))],
+    }));
+  }
+  const parents = tasks.map((_, index) => index);
+  const find = (index: number): number => {
+    while (parents[index] !== index) {
+      parents[index] = parents[parents[index]!]!;
+      index = parents[index]!;
+    }
+    return index;
+  };
+  const union = (left: number, right: number) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parents[rightRoot] = leftRoot;
+  };
+  const scopes = tasks.map((task) => new Set(task.allowedPaths.map(broadWriteScope)));
+  for (let left = 0; left < tasks.length; left += 1) {
+    for (let right = left + 1; right < tasks.length; right += 1) {
+      if (
+        scopes[left]!.has(".") ||
+        scopes[right]!.has(".") ||
+        [...scopes[left]!].some((scope) => scopes[right]!.has(scope))
+      ) {
+        union(left, right);
+      }
+    }
+  }
+  const grouped = new Map<number, number[]>();
+  tasks.forEach((_, index) => {
+    const root = find(index);
+    grouped.set(root, [...(grouped.get(root) ?? []), index]);
+  });
+  const groupForTaskId = new Map<string, number>();
+  for (const [root, indexes] of grouped) {
+    for (const index of indexes) groupForTaskId.set(tasks[index]!.id, root);
+  }
+  const groupId = new Map<number, string>();
+  for (const [root, indexes] of grouped) groupId.set(root, tasks[indexes[0]!]!.id);
+
+  return [...grouped.entries()]
+    .sort((left, right) => left[1][0]! - right[1][0]!)
+    .map(([root, indexes]) => {
+      const members = indexes.map((index) => tasks[index]!);
+      const allowedPaths = [...new Set(members.flatMap((task) => task.allowedPaths.map(broadWriteScope)))];
+      const dependsOn = [...new Set(members.flatMap((task) => task.dependsOn)
+        .map((dependency) => groupForTaskId.get(dependency))
+        .filter((dependencyRoot): dependencyRoot is number => dependencyRoot !== undefined && dependencyRoot !== root)
+        .map((dependencyRoot) => groupId.get(dependencyRoot)!))];
+      return {
+        ...members[0]!,
+        title: members.length === 1
+          ? members[0]!.title
+          : `Combined ${allowedPaths.join(", ")} implementation`.slice(0, 500),
+        objective: members.map((task) => task.objective).join("; ").slice(0, 12_000),
+        status: dependsOn.length ? "blocked" as const : "ready" as const,
+        dependsOn,
+        allowedPaths,
+        acceptanceCriterionIds: [...new Set(members.flatMap((task) => task.acceptanceCriterionIds))],
+        requiredArtifactIds: [...new Set(members.flatMap((task) => task.requiredArtifactIds))],
+        observedArtifactVersions: {},
+        attemptCount: 0,
+      };
+    });
 }
 
 function resultsForSupervisor(tasks: OrchestrationTask[]) {
@@ -326,6 +535,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         workspacePath: input.workspacePath,
         sandboxMode: "read-only",
         signal,
+        maxArkApiTurns: 2,
+        maxInputTokens: 60_000,
+        maxToolCalls: 1,
+        timeoutMs: 60_000,
         prompt: [
           "Elaborate the user's intent without editing files. Return only JSON.",
           `Requested mode: ${input.requestedMode}`,
@@ -340,6 +553,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           "Each materialQuestions item should be an object with prompt, consequenceIfWrong, and 2-6 options.",
           "Each option needs label, resolutionText, and delegate. Include one delegate=true recommended default.",
           "Only ask when the choice materially changes scope, architecture, safety, public interfaces, acceptance, or cost.",
+          "For a small, reversible local task, make conservative reasonable assumptions and return no material questions instead of creating a long clarification phase.",
           "Keep every returned section mutually consistent. Requirements, assumptions, non-goals, architecture decisions, and manual expectations must not contradict one another.",
           "When the user prompt is a clarification reconciliation pass, apply every resolution throughout the entire intent, remove stale conditional statements, and return no material questions.",
         ].join("\n"),
@@ -421,8 +635,18 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         workspacePath: input.workspacePath,
         sandboxMode: "read-only",
         signal,
+        maxArkApiTurns: 2,
+        maxInputTokens: 100_000,
+        maxToolCalls: 1,
+        timeoutMs: 180_000,
         prompt: [
           "Create a bounded coding plan for the explicitly confirmed contract. Do not edit files.",
+          ...(this.options.unrestrictedMode
+            ? [
+                "Unrestricted full-application mode is active. Maximize safe parallelism: assign independent top-level areas such as frontend/, backend/, infrastructure/, and root documentation/configuration to separate tasks that can run simultaneously. Use broad directory allowedPaths instead of enumerating files. Never create two tasks that write the same top-level directory. Add dependsOn only for a genuine data or interface dependency; do not serialize independent frontend and backend scaffolding.",
+                "Keep acceptance verification compact: cover multiple related criteria in the same end-to-end test where one procedure can prove them together. Return at most 6 meaningful acceptance tests. Do not create one test per criterion; one end-to-end check should cover all criteria it can prove.",
+              ]
+            : []),
           "The complete planning evidence is supplied below. Do not call tools or independently inspect the workspace during planning.",
           `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
@@ -438,8 +662,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           "estimatedCalls counts top-level Codex executions after planning. estimatedArkApiTurns counts the underlying model turns inside those executions, including worker implementation, verification, supervision, retries, and recovery.",
           `Return estimatedCalls no greater than ${availableExecutionModelCalls}. Plan the complete confirmed scope within that allowance by minimizing handoffs, combining tightly coupled work, and preferring deterministic tools and checks where they do not require a model call. Do not drop or weaken confirmed requirements to meet the budget.`,
           `Return estimatedArkApiTurns no greater than ${availableExecutionArkApiTurns}. Prefer several bounded non-overlapping tasks over one oversized worker. Assign shared root configuration files to one foundation task and make dependent tasks consume that result instead of sharing write ownership.`,
+          "Give every package manifest, lockfile, entry scaffold, migration, seed, and generated database path exactly one explicit owner. A task that may run install, build, migration, or seed commands must either own every repository file those commands can legitimately change or use flags that keep those files unchanged. Cache and temporary output are never task deliverables.",
+          "Before returning JSON, compare every allowedPaths entry across every pair of tasks. A path conflicts with an identical path, its parent, or its child. Dependencies do not permit overlap. If clean exclusive ownership is impossible, return one integrated task containing the complete scope instead of multiple conflicting tasks.",
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract. Give each task its own estimatedArkApiTurns and estimatedInputTokens. If a task exceeds its continuation capacity, split it before returning the plan.",
-          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
+          "Also create a compact protected acceptance-test plan with at most 6 tests. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions by grouping related criteria into the same end-to-end procedure. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
           "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
           "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
@@ -456,7 +682,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         maximumTaskInputTokens,
       ),
     );
-    const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
+    const acceptanceTests = consolidateAcceptanceTests(
+      comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract),
+    );
     await this.verification.saveAcceptancePlan({
       orchestrationId: input.orchestration.id,
       contractVersion: input.contract.version,
@@ -529,7 +757,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         attemptCount: 0,
       };
     });
-    if (route.selectedMode === "direct" && tasks.length > 1) {
+    if (this.options.unrestrictedMode) {
+      tasks = mergeTasksByBroadWriteScope(tasks);
+    } else if (route.selectedMode === "direct" && tasks.length > 1) {
       const combinedObjective = tasks
         .map((task) => task.objective.trim())
         .filter((objective, index, values) => values.indexOf(objective) === index)
@@ -550,6 +780,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         attemptCount: 0,
       }];
     }
+    const selectedMode = this.options.unrestrictedMode
+      ? tasks.length > 1 ? "multi-worker" as const : "one-worker" as const
+      : route.selectedMode;
     for (const task of tasks) await sink.upsertTask(task);
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
@@ -560,7 +793,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       modelId: result.actualModelId,
       summary: route.reason,
       metadata: {
-        selectedMode: route.selectedMode,
+        selectedMode,
         taskCount: tasks.length,
         estimatedCalls: result.value.estimatedCalls,
         estimatedArkApiTurns: result.value.estimatedArkApiTurns,
@@ -572,7 +805,16 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         reservedPlanningModelCalls: MAXIMUM_PLANNER_RESPONSE_CALLS,
       },
     });
-    return { selectedMode: route.selectedMode, routeReason: route.reason, tasks, applicationMap: map.summary };
+    return {
+      selectedMode,
+      routeReason: this.options.unrestrictedMode
+        ? tasks.length > 1
+          ? "Unrestricted mode runs independent top-level write scopes concurrently"
+          : "Unrestricted mode merged overlapping write scopes into one safe owner"
+        : route.reason,
+      tasks,
+      applicationMap: map.summary,
+    };
   }
 
   async execute(input: ExecuteInput, sink: OrchestrationSink, signal: AbortSignal): Promise<ExecutionOutcome> {
@@ -636,7 +878,9 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       );
       if (recovered.kind !== "verified") {
         await this.cleanup(results, "archive");
-        await this.workspaces.cleanupOrchestration(input.orchestration.id, "clean");
+        if (recovered.outcome.kind !== "verification-failed") {
+          await this.workspaces.cleanupOrchestration(input.orchestration.id, "clean");
+        }
         return recovered.outcome;
       }
       const candidate = recovered.candidate;
@@ -739,6 +983,106 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
 
   async cancel(orchestrationId: string): Promise<boolean> {
     return (await this.activeRoles.get(orchestrationId)?.cancelOrchestration(orchestrationId)) ?? false;
+  }
+
+  async retryVerification(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    signal: AbortSignal,
+    verificationRound: number,
+  ): Promise<ExecutionOutcome> {
+    const roles = this.roles(input.orchestration.id, sink);
+    try {
+      const candidate = await this.integrator.loadRetained(
+        input.orchestration.id,
+        input.workspacePath,
+      );
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: null,
+        executionId: null,
+        type: "verification-only-retry-started",
+        actorRole: "control-plane",
+        modelId: null,
+        summary: "Retrying verification against the retained integrated candidate",
+        metadata: { verificationRound, retainedFileCount: candidate.changes.changedFiles.length },
+      });
+      const deterministic = await this.verification.run(
+        input.orchestration.id,
+        null,
+        candidate.path,
+        ["protected", "global", "manual"],
+        sink,
+        signal,
+        `manual-retry-${verificationRound}`,
+      );
+      const planned = await this.runPlannedAcceptanceVerification(
+        input,
+        roles,
+        candidate.path,
+        sink,
+        signal,
+        deterministic,
+        verificationRound,
+        { round: verificationRound, instructions: "Retry verification only against the unchanged retained candidate. Use the leanest valid evidence path and do not implement or edit files.", history: [] },
+      );
+      const records = [...deterministic, ...planned];
+      if (!requiredVerificationPassed(records)) {
+        const reason = recoveryEvidence(records);
+        await this.recordRetainedVerificationFailure(input, sink, candidate, reason);
+        return { kind: "verification-failed", reason, candidateRetained: true };
+      }
+      const published = await this.integrator.publish(candidate, input.workspacePath);
+      const refreshed = await buildApplicationMap(
+        input.workspacePath,
+        input.orchestration.id,
+        input.plan.applicationMap.version + 1,
+        this.now(),
+      );
+      this.maps.set(input.orchestration.id, refreshed);
+      await sink.recordApplicationMap(refreshed.summary);
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: null,
+        executionId: null,
+        type: "verified-publish",
+        actorRole: "control-plane",
+        modelId: null,
+        summary: "Verification-only recovery passed and published the retained candidate",
+        metadata: { fileCount: published.length, applicationMapVersion: refreshed.summary.version },
+      });
+      await this.integrator.cleanup(candidate);
+      await this.workspaces.cleanupOrchestration(input.orchestration.id, "clean");
+      return { kind: "completed", finalOutput: `Verification recovery passed and published ${published.length} retained candidate files.` };
+    } catch (error) {
+      if (signal.aborted) return { kind: "cancelled", reason: "Verification retry cancelled" };
+      const reason = error instanceof Error ? error.message : String(error);
+      const infrastructureFailure = isVerificationInfrastructureFailure(error);
+      const retainedReason = infrastructureFailure
+        ? `Verification inconclusive: ${reason}`
+        : reason;
+      await sink.recordEvent({
+        orchestrationId: input.orchestration.id,
+        taskId: null,
+        executionId: null,
+        type: infrastructureFailure
+          ? "verification-only-retry-inconclusive"
+          : "verification-only-retry-failed",
+        actorRole: "control-plane",
+        modelId: null,
+        summary: infrastructureFailure
+          ? "Verification-only retry was inconclusive; the unchanged candidate remains retained"
+          : "Verification-only retry failed; the unchanged candidate remains retained",
+        metadata: {
+          verificationRound,
+          error: reason.slice(0, 2_000),
+          candidateRetained: true,
+        },
+      });
+      return { kind: "verification-failed", reason: retainedReason, candidateRetained: true };
+    } finally {
+      this.activeRoles.delete(input.orchestration.id);
+    }
   }
 
   private roles(orchestrationId: string, sink: OrchestrationSink): RoleExecutor {
@@ -851,40 +1195,109 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           : "Started protected and global verification",
         metadata: { recoveryRound },
       });
-      const verification = await this.verification.run(
-        input.orchestration.id,
-        null,
-        candidate.path,
-        ["protected", "global", "manual"],
-        sink,
-        signal,
-      );
-      const plannedVerification = await this.runPlannedAcceptanceVerification(
-        input,
-        roles,
-        candidate.path,
-        sink,
-        signal,
-        verification,
-        verifierGuidance
-          ? { round: recoveryRound, instructions: verifierGuidance, history: recoveryHistory }
-          : undefined,
-      );
-      const records = [...verification, ...plannedVerification];
+      let records: VerificationRecord[];
+      try {
+        const verification = await this.verification.run(
+          input.orchestration.id,
+          null,
+          candidate.path,
+          ["protected", "global", "manual"],
+          sink,
+          signal,
+          `release-${recoveryRound}`,
+        );
+        const plannedVerification = await this.runPlannedAcceptanceVerification(
+          input,
+          roles,
+          candidate.path,
+          sink,
+          signal,
+          verification,
+          recoveryRound,
+          verifierGuidance
+            ? { round: recoveryRound, instructions: verifierGuidance, history: recoveryHistory }
+            : undefined,
+        );
+        records = [...verification, ...plannedVerification];
+      } catch (verificationError) {
+        if (signal.aborted) throw verificationError;
+        const now = this.now().toISOString();
+        const reason = verificationError instanceof Error
+          ? verificationError.message
+          : String(verificationError);
+        const infrastructureFailure = isVerificationInfrastructureFailure(verificationError);
+        const failureRecord: VerificationRecord = {
+          id: `verification-execution-${input.contract.id}-${recoveryRound}`,
+          orchestrationId: input.orchestration.id,
+          taskId: null,
+          scope: "protected",
+          commandOrCheck: "Verification phase execution",
+          status: "failed",
+          outputSummary: infrastructureFailure
+            ? `Verification inconclusive because the verifier runtime or model connection failed: ${reason}`.slice(0, 8_000)
+            : `Verifier execution error: ${reason}`.slice(0, 8_000),
+          startedAt: now,
+          completedAt: now,
+        };
+        await sink.recordVerification(failureRecord);
+        await sink.recordEvent({
+          orchestrationId: input.orchestration.id,
+          taskId: null,
+          executionId: null,
+          type: infrastructureFailure
+            ? "verification-inconclusive"
+            : "verification-execution-failed",
+          actorRole: "control-plane",
+          modelId: null,
+          summary: infrastructureFailure
+            ? "Verification was inconclusive; the unchanged candidate is available for verification-only retry"
+            : "Verifier execution failed and was routed through bounded recovery",
+          metadata: {
+            recoveryRound,
+            error: reason.slice(0, 2_000),
+            candidateRetained: infrastructureFailure,
+          },
+        });
+        if (infrastructureFailure) {
+          const inconclusiveReason = `Verification inconclusive: ${reason}`;
+          await this.recordRetainedVerificationFailure(
+            input,
+            sink,
+            candidate,
+            inconclusiveReason,
+          );
+          return {
+            kind: "outcome",
+            outcome: {
+              kind: "verification-failed",
+              reason: inconclusiveReason,
+              candidateRetained: true,
+            },
+          };
+        }
+        records = [failureRecord];
+      }
       if (requiredVerificationPassed(records)) return { kind: "verified", candidate };
 
       const evidence = recoveryEvidence(records);
-      const decision = await this.requestRecoveryDecision(
-        input,
-        sink,
-        roles,
-        "verification",
-        evidence,
-        recoveryHistory,
-        candidate.path,
-        recoveryRound,
-        signal,
-      );
+      let decision: RecoveryDecision;
+      try {
+        decision = await this.requestRecoveryDecision(
+          input,
+          sink,
+          roles,
+          "verification",
+          evidence,
+          recoveryHistory,
+          candidate.path,
+          recoveryRound,
+          signal,
+        );
+      } catch (supervisorError) {
+        const reason = supervisorError instanceof Error ? supervisorError.message : String(supervisorError);
+        await this.recordRetainedVerificationFailure(input, sink, candidate, reason);
+        return { kind: "outcome", outcome: { kind: "verification-failed", reason, candidateRetained: true } };
+      }
       const outcome = this.recoveryOutcome(
         input,
         decision,
@@ -892,6 +1305,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         recoveryRound >= maximumRecoveryRounds,
       );
       if (outcome) {
+        if (outcome.kind === "failed") {
+          await this.recordRetainedVerificationFailure(input, sink, candidate, outcome.reason);
+          return { kind: "outcome", outcome: { kind: "verification-failed", reason: outcome.reason, candidateRetained: true } };
+        }
         await this.integrator.cleanup(candidate).catch(() => undefined);
         return { kind: "outcome", outcome };
       }
@@ -958,6 +1375,32 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       }
       recoveryRound += 1;
     }
+  }
+
+  private async recordRetainedVerificationFailure(
+    input: ExecuteInput,
+    sink: OrchestrationSink,
+    candidate: IntegrationCandidate,
+    reason: string,
+  ): Promise<void> {
+    const inconclusive = /verification inconclusive|runtime timed out|stream disconnected|error sending request/i.test(reason);
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: null,
+      type: "verification-candidate-retained",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: inconclusive
+        ? "Verification was inconclusive; the integrated candidate was retained for a verification-only retry"
+        : "Verification failed; the integrated candidate was retained for a verification-only retry",
+      metadata: {
+        changedFiles: candidate.changes.changedFiles.length,
+        deletedFiles: candidate.changes.deletedFiles.length,
+        reason: reason.slice(0, 1_500),
+        inconclusive,
+      },
+    });
   }
 
   private async createIntegrationCandidate(
@@ -1064,6 +1507,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         signal,
         prompt: [
           "Act as the big-model supervisor for the configured execution roles.",
+          "This is an evidence-only control decision. Do not call tools, inspect the workspace, run commands, or attempt implementation. Use only the supplied contract, task summaries, failure evidence, and recovery history, then immediately return the required JSON decision.",
           `The ${phase} phase failed. Diagnose the evidence and choose the next action that is most likely to produce a verified result.`,
           input.plan.selectedMode === "direct"
             ? "This is Direct mode. There are no small workers or small integrator. Use retry-direct for implementation or candidate corrections so the same big Direct executor performs the fix. Never choose retry-worker or retry-integrator."
@@ -1078,8 +1522,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Prior recovery history: ${JSON.stringify(recoveryHistory.slice(-4))}`,
           `Recovery round: ${recoveryRound}`,
         ].join("\n").slice(0, 48_000),
-        maxArkApiTurns: Math.min(8, input.orchestration.budget.maxArkApiTurnsPerExecution ?? 8),
-        maxInputTokens: Math.min(120_000, input.orchestration.budget.maxInputTokensPerExecution ?? 120_000),
+        maxArkApiTurns: Math.min(2, input.orchestration.budget.maxArkApiTurnsPerExecution ?? 2),
+        maxInputTokens: Math.min(60_000, input.orchestration.budget.maxInputTokensPerExecution ?? 60_000),
+        maxToolCalls: 1,
+        timeoutMs: 60_000,
       },
       recoveryDecisionSchema,
     );
@@ -1209,7 +1655,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     });
     const changes = await this.workspaces.changes(result.workspace);
     const violations = scopeViolations(changes, result.task.allowedPaths);
-    if (violations.length) throw new Error(`Direct recovery scope violation: ${violations.join(", ")}`);
+    if (violations.length) throw new Error(`Direct recovery scope violation: ${scopeViolationSummary(violations)}`);
     const visible = await this.verification.run(
       input.orchestration.id,
       result.task.id,
@@ -1281,7 +1727,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       });
       const changes = await this.workspaces.changes(result.workspace);
       const violations = scopeViolations(changes, result.task.allowedPaths);
-      if (violations.length) throw new Error(`Recovery worker scope violation: ${violations.join(", ")}`);
+      if (violations.length) throw new Error(`Recovery worker scope violation: ${scopeViolationSummary(violations)}`);
       const visible = await this.verification.run(
         input.orchestration.id,
         result.task.id,
@@ -1349,7 +1795,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     });
     const refreshed = await this.integrator.refresh(candidate);
     const violations = scopeViolations(refreshed.changes, allowedPaths);
-    if (violations.length) throw new Error(`Recovery integrator scope violation: ${violations.join(", ")}`);
+    if (violations.length) throw new Error(`Recovery integrator scope violation: ${scopeViolationSummary(violations)}`);
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
@@ -1428,7 +1874,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     });
     const changes = await this.workspaces.changes(workspace);
     const violations = scopeViolations(changes, task.allowedPaths);
-    if (violations.length) throw new Error(`Direct execution scope violation: ${violations.join(", ")}`);
+    if (violations.length) throw new Error(`Direct execution scope violation: ${scopeViolationSummary(violations)}`);
     if (!changes.changedFiles.length && !changes.deletedFiles.length) {
       await sink.recordEvent({
         orchestrationId: input.orchestration.id,
@@ -1484,6 +1930,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     sink: OrchestrationSink,
     signal: AbortSignal,
     deterministicRecords: VerificationRecord[],
+    verificationRound: number,
     recovery?: { round: number; instructions: string; history: string[] },
   ) {
     const plan = await this.verification.loadAcceptancePlan(
@@ -1514,14 +1961,65 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       input.plan.applicationMap.version + 1,
       this.now(),
     );
+    const hasBuildOrRuntimeManifest = candidateMap.entries.some((entry) =>
+      /(?:^|\/)(?:package\.json|pnpm-lock\.yaml|yarn\.lock|package-lock\.json|pyproject\.toml|requirements[^/]*\.txt|go\.mod|Cargo\.toml|Dockerfile|compose\.ya?ml)$/i.test(entry.path)
+    );
+    const verificationProfile = selectAdaptiveVerificationProfile({
+      fileCount: candidateMap.entries.length,
+      totalBytes: candidateMap.entries.reduce((total, entry) => total + entry.bytes, 0),
+      taskCount: input.plan.tasks.length,
+      automatedTestCount: automated.length,
+      hasBuildOrRuntimeManifest,
+      recoveryRound: verificationRound,
+    });
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id,
+      taskId: null,
+      executionId: null,
+      type: "verification-profile-selected",
+      actorRole: "control-plane",
+      modelId: null,
+      summary: `Selected the ${verificationProfile.name} adaptive verification profile`,
+      metadata: {
+        profile: verificationProfile.name,
+        fileCount: candidateMap.entries.length,
+        taskCount: input.plan.tasks.length,
+        automatedTestCount: automated.length,
+        hasBuildOrRuntimeManifest,
+        maxArkApiTurns: verificationProfile.maxArkApiTurns,
+        maxInputTokens: verificationProfile.maxInputTokens,
+        maxToolCalls: verificationProfile.maxToolCalls,
+        timeoutMs: verificationProfile.timeoutMs,
+        maximumTransportAttempts: MAXIMUM_VERIFIER_TRANSPORT_RETRIES + 1,
+      },
+    });
+    const sourcePreviewExtensions = new Set([
+      ".html", ".css", ".scss", ".js", ".jsx", ".mjs", ".cjs",
+      ".ts", ".tsx", ".json", ".md", ".txt", ".svg",
+    ]);
+    let remainingSourceCharacters = verificationProfile.name === "fast" ? 24_000 : 0;
+    const sourcePreviews: Array<{ path: string; content: string }> = [];
+    if (remainingSourceCharacters > 0) {
+      for (const entry of candidateMap.entries) {
+        if (remainingSourceCharacters <= 0 || sourcePreviews.length >= 20) break;
+        if (!sourcePreviewExtensions.has(path.extname(entry.path).toLowerCase())) continue;
+        const maximum = Math.min(12_000, remainingSourceCharacters);
+        const content = await readFile(path.join(candidateWorkspacePath, entry.path), "utf8")
+          .then((value) => value.slice(0, maximum))
+          .catch(() => "");
+        if (!content) continue;
+        sourcePreviews.push({ path: entry.path, content });
+        remainingSourceCharacters -= content.length;
+      }
+    }
     const evidenceBundle = {
       workspace: candidateMap.summary,
-      files: candidateMap.entries.slice(0, 250).map((entry) => ({
+      files: candidateMap.entries.slice(0, verificationProfile.fileEvidenceLimit).map((entry) => ({
         path: entry.path,
         bytes: entry.bytes,
         imports: entry.imports.slice(0, 20),
         exports: entry.exports.slice(0, 20),
-        summary: entry.summary.slice(0, 500),
+        summary: entry.summary.slice(0, verificationProfile.fileSummaryCharacters),
       })),
       changedAreas: input.plan.tasks.map((task) => ({
         task: task.title,
@@ -1533,21 +2031,23 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         status: record.status,
         evidence: record.outputSummary.slice(0, 1_500),
       })),
+      ...(sourcePreviews.length ? { sourcePreviews } : {}),
     };
     const compactAutomated = automated.map((test) => ({
       ...test,
-      procedure: test.procedure.slice(0, 1_500),
-      expectedOutcome: test.expectedOutcome.slice(0, 900),
+      procedure: test.procedure.slice(0, verificationProfile.procedureCharacters),
+      expectedOutcome: test.expectedOutcome.slice(0, verificationProfile.expectedOutcomeCharacters),
     }));
-    const evidenceArtifactId = this.newId();
+    const evidenceArtifactId = `verification-evidence-${input.contract.id}`;
+    const artifactVersion = verificationRound + 1;
     await sink.publishArtifact({
       id: evidenceArtifactId,
       orchestrationId: input.orchestration.id,
       producerTaskId: "verifier",
       kind: "test-result",
       name: "Deterministic verification evidence",
-      version: input.contract.version,
-      payload: JSON.stringify(evidenceBundle).slice(0, 40_000),
+      version: artifactVersion,
+      payload: boundedJson(evidenceBundle, 40_000),
       createdAt: this.now().toISOString(),
     });
     const startedAt = this.now().toISOString();
@@ -1564,8 +2064,18 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
             signal,
             prompt: [
               "Independently verify the integrated candidate. Do not edit any files.",
+              `Adaptive verification profile: ${verificationProfile.name}. Finish within ${verificationProfile.maxArkApiTurns} total model turns and ${verificationProfile.maxToolCalls} total tool calls, including any structured-output repair. Stop as soon as every supplied test has concrete evidence.`,
+              ...(verificationProfile.name === "fast"
+                ? [
+                    "This is the deterministic-first fast path. All relevant small source files are already included in sourcePreviews. Do not call tools, open files, start a browser, or run shell commands. Evaluate the supplied evidence once and immediately return the required compact JSON results.",
+                  ]
+                : []),
               "Start from the deterministic evidence bundle. Do not rediscover listed files. Inspect additional file contents only for acceptance tests that the supplied evidence cannot decide.",
-              "Batch related non-destructive tests, type checks, builds, and static checks into at most three shell invocations. Keep successful output summarized and include only relevant failure lines.",
+              "Use a single-pass verification strategy. Do not behave like an implementation worker and do not iteratively debug a custom test framework.",
+              ...(verificationProfile.maxShellInvocations > 0
+                ? [`Use at most ${verificationProfile.maxShellInvocations} shell invocation${verificationProfile.maxShellInvocations === 1 ? "" : "s"}. Combine all necessary checks in one command or composite /tmp harness. Never install packages, and do not rerun a successful check.`]
+                : []),
+              "Batch all related non-destructive tests, type checks, builds, static checks, and browser checks into that composite harness. Keep successful output summarized and include only relevant failure lines.",
               "The candidate workspace is intentionally read-only. Put temporary test scripts, browser profiles, screenshots, caches, and logs under /tmp only.",
               "This verification runtime supports subprocesses, ephemeral loopback servers, and bundled Chromium. Use $CHROME_BIN or /usr/bin/chromium with a fresh --user-data-dir under /tmp; never launch a host GUI browser or use a host browser profile.",
               "The disposable outer container is the security boundary. Chromium may use --no-sandbox inside it when required. Prefer 127.0.0.1 with an ephemeral unprivileged port and shut down every server you start.",
@@ -1582,9 +2092,18 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
               `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria.map(({ id, kind, description }) => ({ id, kind, description: description.slice(0, 800) })) })}`,
               `Deterministic evidence bundle: ${JSON.stringify(evidenceBundle)}`,
               `Unresolved planner-generated acceptance tests: ${JSON.stringify(compactAutomated)}`,
-            ].join("\n").slice(0, 80_000),
-            maxArkApiTurns: input.orchestration.budget.maxArkApiTurnsPerExecution,
-            maxInputTokens: input.orchestration.budget.maxInputTokensPerExecution,
+            ].join("\n").slice(0, verificationProfile.promptCharacters),
+            maxArkApiTurns: Math.min(
+              verificationProfile.maxArkApiTurns,
+              input.orchestration.budget.maxArkApiTurnsPerExecution ?? verificationProfile.maxArkApiTurns,
+            ),
+            maxInputTokens: Math.min(
+              verificationProfile.maxInputTokens,
+              input.orchestration.budget.maxInputTokensPerExecution ?? verificationProfile.maxInputTokens,
+            ),
+            maxToolCalls: verificationProfile.maxToolCalls,
+            timeoutMs: verificationProfile.timeoutMs,
+            maxTransportRetries: MAXIMUM_VERIFIER_TRANSPORT_RETRIES,
           },
           acceptanceVerificationSchema,
         )
@@ -1597,7 +2116,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       const skippedRegression = skippedRegressionIds.has(test.id);
       const postRelease = postReleaseIds.has(test.id);
       const record = {
-        id: this.newId(),
+        id: `acceptance-${input.contract.id}-${artifactVersion}-${test.id}`.slice(0, 500),
         orchestrationId: input.orchestration.id,
         taskId: null,
         scope: manual ? "manual" as const : test.scope,
@@ -1618,19 +2137,19 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       await sink.recordVerification(record);
       records.push(record);
     }
-    const resultArtifactId = this.newId();
+    const resultArtifactId = `verification-results-${input.contract.id}`;
     await sink.publishArtifact({
       id: resultArtifactId,
       orchestrationId: input.orchestration.id,
       producerTaskId: "verifier",
       kind: "test-result",
       name: "Acceptance verification results",
-      version: input.contract.version,
-      payload: JSON.stringify(records.map((record) => ({
+      version: artifactVersion,
+      payload: boundedJson(records.map((record) => ({
         check: record.commandOrCheck,
         status: record.status,
         evidence: record.outputSummary.slice(0, 1_500),
-      }))).slice(0, 40_000),
+      })), 40_000),
       createdAt: this.now().toISOString(),
     });
     await sink.recordEvent({
@@ -1649,7 +2168,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         manual: records.filter((record) => record.scope === "manual").length,
         regressionNotApplicable: skippedRegressionIds.size,
         deferredPostRelease: postReleaseIds.size,
-        recoveryRound: recovery?.round ?? 0,
+        recoveryRound: verificationRound,
         evidenceArtifactId,
         resultArtifactId,
       },

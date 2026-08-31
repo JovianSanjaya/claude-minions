@@ -20,6 +20,8 @@ const AGENT_ID = "11111111-1111-4111-8111-111111111111";
 class FakeDriver implements OrchestrationExecutionDriver {
   cancelled = 0;
   outcome: ExecutionOutcome = { kind: "completed", finalOutput: "published" };
+  verificationRetryOutcome: ExecutionOutcome = { kind: "completed", finalOutput: "published after verification retry" };
+  verificationRetryCalls = 0;
   materialQuestions: string[] = [];
   reconciliationPrompts: string[] = [];
   initialIntent: Partial<Pick<
@@ -89,7 +91,29 @@ class FakeDriver implements OrchestrationExecutionDriver {
       type: "worker-step", actorRole: "worker", modelId: "worker-model",
       summary: "Worker completed visible checks", metadata: { safe: true },
     });
+    if (this.outcome.kind === "verification-failed") {
+      await sink.recordEvent({
+        orchestrationId: _input.orchestration.id, taskId: null, executionId: "verify-1",
+        type: "verification-candidate-retained", actorRole: "control-plane", modelId: null,
+        summary: "Integrated candidate retained for verification-only retry", metadata: {},
+      });
+    }
     return this.outcome;
+  }
+
+  async retryVerification(
+    input: Parameters<NonNullable<OrchestrationExecutionDriver["retryVerification"]>>[0],
+    sink: OrchestrationSink,
+    _signal: AbortSignal,
+    verificationRound: number,
+  ): Promise<ExecutionOutcome> {
+    this.verificationRetryCalls += 1;
+    await sink.recordEvent({
+      orchestrationId: input.orchestration.id, taskId: null, executionId: `verify-${verificationRound + 1}`,
+      type: "verification-only-retry-started", actorRole: "verifier", modelId: "verifier-model",
+      summary: "Retried verification without rerunning workers", metadata: { verificationRound },
+    });
+    return this.verificationRetryOutcome;
   }
 
   async cancel(): Promise<boolean> {
@@ -359,5 +383,117 @@ describe("OrchestrationControlService", () => {
     expect(reconciled.orchestration.status).toBe("cancelled");
     expect(reconciled.events.at(-1)?.type).toBe("restart-reconciled");
     expect(reconciled.usage).toEqual(first.service.getOrchestration(id).usage);
+  });
+
+  it("creates a linked fresh recovery run after a terminal failure", async () => {
+    const driver = new FakeDriver();
+    driver.outcome = { kind: "failed", reason: "verification transport disconnected" };
+    const { service } = await fixture(driver);
+    const failedId = await createReady(service);
+    await service.start(failedId);
+    await service.waitForIdle(failedId);
+    expect(service.getOrchestration(failedId).orchestration.status).toBe("failed");
+
+    const recovered = await service.recoverAsNew(failedId);
+    expect(recovered.id).not.toBe(failedId);
+    expect(recovered).toMatchObject({
+      prompt: "Build the feature",
+      requestedMode: "auto",
+      budget: {
+        maxModelCalls: 250,
+        maxSteps: 750,
+        maxArkApiTurns: 500,
+      },
+    });
+    await service.waitForIdle(recovered.id);
+    expect(service.getOrchestration(recovered.id).orchestration.status).toBe(
+      "awaiting-confirmation",
+    );
+    expect(service.getOrchestration(failedId).events).toContainEqual(
+      expect.objectContaining({
+        type: "recovery-run-created",
+        metadata: expect.objectContaining({ recoveredAsOrchestrationId: recovered.id }),
+      }),
+    );
+    expect(service.getOrchestration(recovered.id).events).toContainEqual(
+      expect.objectContaining({
+        type: "recovery-run-started",
+        metadata: expect.objectContaining({ recoveredFromOrchestrationId: failedId }),
+      }),
+    );
+  });
+
+  it("retries only verification against the retained candidate", async () => {
+    const driver = new FakeDriver();
+    driver.outcome = {
+      kind: "verification-failed",
+      reason: "Verifier connection interrupted",
+      candidateRetained: true,
+    };
+    const { service } = await fixture(driver);
+    const id = await createReady(service);
+    await service.start(id);
+    await service.waitForIdle(id);
+    expect(service.getOrchestration(id).orchestration.status).toBe("failed");
+
+    await service.retryVerification(id);
+    await service.waitForIdle(id);
+
+    const retried = service.getOrchestration(id);
+    expect(driver.verificationRetryCalls).toBe(1);
+    expect(retried.orchestration).toMatchObject({
+      id,
+      status: "completed",
+      finalOutput: "published after verification retry",
+    });
+    expect(retried.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "verification-only-retry-requested" }),
+      expect.objectContaining({ type: "verification-only-retry-started" }),
+    ]));
+  });
+
+  it("truncates oversized artifact summaries without failing the run", async () => {
+    const { service, store } = await fixture();
+    const created = await service.createOrchestration(AGENT_ID, {
+      prompt: "Collect verification evidence",
+      requestedMode: "auto",
+    });
+    await service.publishArtifact({
+      id: randomUUID(),
+      orchestrationId: created.id,
+      producerTaskId: "verifier",
+      kind: "test-result",
+      name: "Large evidence bundle",
+      version: 1,
+      payload: "e".repeat(80_000),
+      createdAt: new Date().toISOString(),
+    });
+    const storedPayload = store.snapshot().artifacts[0]?.payload ?? "";
+    expect(storedPayload).toContain("[truncated]");
+    expect(storedPayload.length).toBeLessThan(65_000);
+  });
+
+  it("allows independent verification passes to reuse an artifact display name", async () => {
+    const { service, store } = await fixture();
+    const created = await service.createOrchestration(AGENT_ID, {
+      prompt: "Verify with recovery",
+      requestedMode: "auto",
+    });
+    const shared = {
+      orchestrationId: created.id,
+      producerTaskId: "verifier",
+      kind: "test-result" as const,
+      name: "Acceptance verification results",
+      version: 1,
+      createdAt: new Date().toISOString(),
+    };
+    await service.publishArtifact({ ...shared, id: randomUUID(), payload: "first pass" });
+    await service.publishArtifact({ ...shared, id: randomUUID(), payload: "recovery pass" });
+    expect(
+      store.snapshot().artifacts.filter((artifact) =>
+        artifact.orchestrationId === created.id &&
+        artifact.name === "Acceptance verification results"
+      ),
+    ).toHaveLength(2);
   });
 });

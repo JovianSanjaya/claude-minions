@@ -25,12 +25,25 @@ export class ArtifactRegistry {
   ): Promise<string[]> {
     const versions = this.artifacts.get(artifact.id) ?? [];
     const expected = (versions.at(-1)?.version ?? 0) + 1;
+    const existing = versions.find((entry) => entry.version === artifact.version);
+    if (existing) {
+      if (
+        existing.orchestrationId === artifact.orchestrationId &&
+        existing.producerTaskId === artifact.producerTaskId &&
+        existing.kind === artifact.kind &&
+        existing.name === artifact.name &&
+        existing.payload === artifact.payload
+      ) {
+        return [];
+      }
+      throw new Error(`Artifact ${artifact.id} version ${artifact.version} conflicts with existing content`);
+    }
     if (artifact.version !== expected) {
       throw new Error(`Artifact ${artifact.id} must publish version ${expected}`);
     }
+    await this.sink.publishArtifact(artifact);
     versions.push(structuredClone(artifact));
     this.artifacts.set(artifact.id, versions);
-    await this.sink.publishArtifact(artifact);
     await this.sink.recordEvent({
       orchestrationId: artifact.orchestrationId,
       taskId: artifact.producerTaskId,

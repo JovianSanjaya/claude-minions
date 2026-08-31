@@ -219,10 +219,23 @@ export function orchestrationProgress(
       ? "Resolving conflicts between worker changes"
       : "Combining worker changes into one result";
   }
+  const verifierAttempt = activeStart?.actorRole === "verifier" &&
+    typeof activeStart.metadata.transportAttempt === "number"
+    ? Math.max(1, Math.floor(activeStart.metadata.transportAttempt))
+    : null;
+  const verifierMaximumAttempts = activeStart?.actorRole === "verifier" &&
+    typeof activeStart.metadata.maximumTransportAttempts === "number"
+    ? Math.max(1, Math.floor(activeStart.metadata.maximumTransportAttempts))
+    : null;
   if (effectiveStatus === "verifying") {
     activity = activeStart?.actorRole === "verifier"
-      ? "The verification model is checking unresolved requirements"
+      ? verifierAttempt && verifierMaximumAttempts
+        ? `Verifier attempt ${verifierAttempt} of ${verifierMaximumAttempts} is checking unresolved requirements`
+        : "The verification model is checking unresolved requirements"
       : "Running deterministic checks on the integrated result";
+    detail = activeStart?.actorRole === "verifier"
+      ? "The integrated candidate is retained. If the verifier connection or runtime fails, you can retry verification without rerunning workers."
+      : "Deterministic protected and global checks run before the model evaluates unresolved requirements.";
   }
   if (!activeStart && actionEvent?.type === "role-call-transport-retry") {
     activity = "Connection interrupted — reconnecting automatically";
@@ -258,7 +271,15 @@ export function orchestrationProgress(
       : 40;
   }
   if (effectiveStatus === "integrating") percent = 82;
-  if (effectiveStatus === "verifying") percent = 92;
+  if (effectiveStatus === "verifying") {
+    const boundedAttemptProgress = timeoutMs && verifierAttempt && verifierMaximumAttempts
+      ? (
+          (Math.min(verifierAttempt, verifierMaximumAttempts) - 1) +
+          Math.min(0.9, elapsedMs / timeoutMs)
+        ) / verifierMaximumAttempts
+      : 0;
+    percent = Math.min(96, 86 + Math.round(boundedAttemptProgress * 10));
+  }
   if (effectiveStatus === "completed") percent = 100;
   if (["failed", "cancelled", "budget-exhausted"].includes(effectiveStatus)) {
     percent = Math.max(15, workflowState(view).reachedIndex * 20);

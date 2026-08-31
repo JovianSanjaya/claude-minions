@@ -1,7 +1,10 @@
 import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import { CodexSessionTelemetryTracker } from "./codex-session-telemetry.js";
+import {
+  CodexSessionTelemetryTracker,
+  executionBudgetExceeded,
+} from "./codex-session-telemetry.js";
 import type { AppConfig } from "./config.js";
 import { writeCodexConfig } from "./config.js";
 import { RunCancelledError, RunnerExecutionError } from "./errors.js";
@@ -223,22 +226,22 @@ export class CodexRunner implements AgentRunner {
     child.stdin.on("error", () => undefined);
     child.stdin.end(request.prompt);
 
+    const timeoutMs = request.timeoutMs ?? this.config.codexTimeoutMs;
     const timeout = setTimeout(() => {
       active.timedOut = true;
       this.terminate(active);
-    }, this.config.codexTimeoutMs);
+    }, timeoutMs);
     timeout.unref();
     let telemetryPolling = false;
-    const telemetryInterval = telemetryTracker && (request.maxArkApiTurns || request.maxInputTokens)
+    const telemetryInterval = telemetryTracker &&
+      (request.maxArkApiTurns || request.maxInputTokens || request.maxToolCalls)
       ? setInterval(() => {
           if (telemetryPolling || active.budgetExceeded) return;
           telemetryPolling = true;
           void telemetryTracker.poll().then((telemetry) => {
-            if (request.maxArkApiTurns && telemetry.arkApiTurns >= request.maxArkApiTurns) {
-              active.budgetExceeded = `Ark-turn limit exceeded (${telemetry.arkApiTurns}/${request.maxArkApiTurns})`;
-              this.terminate(active);
-            } else if (request.maxInputTokens && telemetry.inputTokens >= request.maxInputTokens) {
-              active.budgetExceeded = `Per-execution input-token limit exceeded (${telemetry.inputTokens}/${request.maxInputTokens})`;
+            const exceeded = executionBudgetExceeded(request, telemetry);
+            if (exceeded) {
+              active.budgetExceeded = exceeded;
               this.terminate(active);
             }
           }).finally(() => { telemetryPolling = false; });
@@ -273,7 +276,7 @@ export class CodexRunner implements AgentRunner {
       };
       if (active.cancelled) throw new RunCancelledError(partial);
       if (active.timedOut) {
-        throw new RunnerExecutionError("Codex timed out after " + this.config.codexTimeoutMs + " ms", partial);
+        throw new RunnerExecutionError("Codex timed out after " + timeoutMs + " ms", partial);
       }
       if (active.outputExceeded) {
         throw new RunnerExecutionError("Codex output exceeded CODEX_MAX_OUTPUT_BYTES", partial);

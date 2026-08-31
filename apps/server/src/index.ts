@@ -12,13 +12,31 @@ import { OrchestrationControlService } from "./orchestration/control/service.js"
 import { ContextAwareExecutionDriver } from "./orchestration/engine/driver.js";
 import { BenchmarkService, BenchmarkStore, type BenchmarkSnapshot } from "./orchestration/benchmark/service.js";
 import { createLiveBenchmarkExecutor } from "./orchestration/benchmark/live-executor.js";
+import { AuditLog, AuditedAgentRunner, createOrchestrationAuditObserver } from "./audit-log.js";
 
 const config = loadConfig();
 await writeCodexConfig(config);
+const auditLog = new AuditLog({
+  directory: config.auditLogDirectory,
+  enabled: config.auditLogEnabled,
+  maximumBytes: config.auditLogMaximumBytes,
+  maximumFiles: config.auditLogMaximumFiles,
+});
+await auditLog.initialize();
+await auditLog.write({
+  category: "system", action: "server", outcome: "started",
+  orchestrationId: null, taskId: null, executionId: null, agentId: null, durationMs: null,
+  data: {
+    nodeEnv: config.nodeEnv,
+    runtimeProvider: config.runtimeProvider,
+    auditLogPath: auditLog.globalPath,
+    pid: process.pid,
+  },
+});
 
 const store = new JsonStore(path.join(config.dataDirectory, "launchpad.json"));
 const workspaces = new WorkspaceManager(config.workspaceRoot);
-const runner = createRunner(config);
+const runner = new AuditedAgentRunner(createRunner(config), auditLog);
 let orchestration: OrchestrationControlService | null = null;
 const service = new AgentService(config, store, workspaces, runner, {
   assertAgentAvailableForDirect: (agentId) => orchestration?.assertAgentAvailableForDirect(agentId) ?? Promise.resolve(),
@@ -35,7 +53,8 @@ const executionDriver = new ContextAwareExecutionDriver({
   archiveRoot: config.orchestrationArchiveRoot,
   protectedEvaluatorRoot: config.orchestrationProtectedEvaluatorRoot,
   modelCallTimeoutMs: config.codexTimeoutMs,
-  modelTransportMaxRetries: Math.max(config.arkRequestMaxRetries, config.arkStreamMaxRetries),
+  modelTransportMaxRetries: config.orchestrationModelTransportMaxRetries,
+  unrestrictedMode: config.orchestrationUnrestrictedMode,
   verificationChecks: [
     { id: "workspace-readable", description: "Candidate workspace is readable", scope: "worker-visible", run: async (candidate) => { const info = await stat(candidate); return { passed: info.isDirectory(), summary: info.isDirectory() ? "Candidate workspace is readable" : "Candidate workspace is not a directory" }; } },
     { id: "protected-boundary", description: "Protected evaluator remains outside the candidate", scope: "protected", run: async (candidate) => ({ passed: !path.resolve(config.orchestrationProtectedEvaluatorRoot).startsWith(path.resolve(candidate) + path.sep), summary: "Protected evaluator boundary remained separate" }) },
@@ -43,11 +62,16 @@ const executionDriver = new ContextAwareExecutionDriver({
   ],
 });
 orchestration = new OrchestrationControlService({
-  store: new OrchestrationStore(path.join(config.dataDirectory, "orchestrations.json")),
+  store: new OrchestrationStore(
+    path.join(config.dataDirectory, "orchestrations.json"),
+    undefined,
+    createOrchestrationAuditObserver(auditLog),
+  ),
   driver: executionDriver,
   agentAccess: { getAgent: (agentId) => { try { return service.getAgent(agentId); } catch { return null; } } },
   defaultBudget: config.orchestrationDefaultBudget,
   pricing: config.orchestrationPricing,
+  auditLog,
 });
 await orchestration.initialize();
 
@@ -82,10 +106,16 @@ const benchmark = new BenchmarkService(
 );
 await benchmark.initialize();
 
-const app = await createApp(config, service, { orchestration, benchmark });
+const app = await createApp(config, service, { orchestration, benchmark, auditLog });
 
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, "Shutting down");
+  await auditLog.write({
+    category: "system", action: "server", outcome: "completed",
+    orchestrationId: null, taskId: null, executionId: null, agentId: null, durationMs: null,
+    data: { signal, pid: process.pid },
+  });
+  await auditLog.flush();
   await app.close();
   process.exit(0);
 };

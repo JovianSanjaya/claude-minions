@@ -28,10 +28,18 @@ import { classifyFailure, createFailurePacket } from "./failure-packet.js";
 import { DeterministicIntegrator } from "./integrator.js";
 import { reviewPreflight } from "./preflight.js";
 import { RoleExecutor } from "./role-executor.js";
-import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
+import {
+  overlappingWriteScopeConflicts,
+  selectRoute,
+  tasksHaveOverlappingWriteScopes,
+} from "./router.js";
 import { parseStructured, StructuredOutputError } from "./structured-output.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
-import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
+import {
+  scopeViolations,
+  scopeViolationSummary,
+  WorkerWorkspaceManager,
+} from "./worker-workspaces.js";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -100,6 +108,23 @@ describe("engine primitives", () => {
       { allowedPaths: ["src/app.ts"] },
       { allowedPaths: ["tests/app.test.ts"] },
     ])).toBe(false);
+    expect(overlappingWriteScopeConflicts([
+      { allowedPaths: ["./frontend/", "backend/package.json"] },
+      { allowedPaths: ["frontend/src", "backend/package.json"] },
+    ])).toEqual([
+      {
+        leftTaskIndex: 0,
+        leftPath: "frontend",
+        rightTaskIndex: 1,
+        rightPath: "frontend/src",
+      },
+      {
+        leftTaskIndex: 0,
+        leftPath: "backend/package.json",
+        rightTaskIndex: 1,
+        rightPath: "backend/package.json",
+      },
+    ]);
   });
 
   it("builds a deterministic map, minimizes context, and denies traversal/symlinks", async () => {
@@ -165,7 +190,16 @@ describe("engine primitives", () => {
     expect(isApplicationMapExcluded("tsconfig.tsbuildinfo")).toBe(true);
     expect(isApplicationMapExcluded("apps/web/tsconfig.app.tsbuildinfo")).toBe(true);
     expect(isApplicationMapExcluded(".eslintcache")).toBe(true);
+    expect(isApplicationMapExcluded(".npm-tmp/node-compile-cache/v22/cache-entry")).toBe(true);
+    expect(isApplicationMapExcluded("apps/web/.node-compile-cache/cache-entry")).toBe(true);
     expect(isApplicationMapExcluded("src/application.ts")).toBe(false);
+  });
+
+  it("keeps scope violation evidence bounded without hiding the total", () => {
+    const violations = Array.from({ length: 20 }, (_, index) => `outside/${index}.txt`);
+    const summary = scopeViolationSummary(violations, 3);
+    expect(summary).toBe("outside/0.txt, outside/1.txt, outside/2.txt (+17 more)");
+    expect(summary).not.toContain("outside/19.txt");
   });
 
   it("isolates worker changes, detects scope violations, and cleans only task paths", async () => {
@@ -179,9 +213,15 @@ describe("engine primitives", () => {
     await writeFile(path.join(worker.path, "src", "a.ts"), "changed\n");
     await writeFile(path.join(worker.path, "src", "b.ts"), "outside\n");
     await writeFile(path.join(worker.path, "tsconfig.tsbuildinfo"), "generated compiler cache\n");
+    await mkdir(path.join(worker.path, ".npm-tmp", "node-compile-cache"), { recursive: true });
+    await writeFile(path.join(worker.path, ".npm-tmp", "node-compile-cache", "entry"), "cache\n");
     const changes = await manager.changes(worker);
     expect(changes.changedFiles).not.toContain("tsconfig.tsbuildinfo");
+    expect(changes.changedFiles).not.toContain(".npm-tmp/node-compile-cache/entry");
     expect(scopeViolations(changes, worker.allowedPaths)).toEqual(["src/b.ts"]);
+    expect(scopeViolations(changes, ["."])).toEqual([]);
+    expect(scopeViolations({ changedFiles: ["frontend/app.ts", ".env"], deletedFiles: [], hashes: {} }, ["."]))
+      .toEqual([".env"]);
     expect(await readFile(path.join(source, "src", "a.ts"), "utf8")).toBe("a\n");
     expect(await manager.cleanup(worker, "clean")).toEqual({ status: "cleaned", path: null });
   });
@@ -244,6 +284,8 @@ describe("engine primitives", () => {
     const consumer = { id: "consumer", orchestrationId: "o1", title: "C", objective: "C", status: "ready" as const, dependsOn: [], allowedPaths: ["src"], acceptanceCriterionIds: [], requiredArtifactIds: ["api"], observedArtifactVersions: { api: 1 }, applicationMapVersion: 1, attemptCount: 0 };
     const unaffected = { ...consumer, id: "other", requiredArtifactIds: [] };
     await registry.publish({ id: "api", orchestrationId: "o1", producerTaskId: "producer", kind: "api", name: "API", version: 1, payload: "v1", createdAt: "now" }, []);
+    expect(await registry.publish({ id: "api", orchestrationId: "o1", producerTaskId: "producer", kind: "api", name: "API", version: 1, payload: "v1", createdAt: "later" }, [])).toEqual([]);
+    expect(sink.artifacts.filter((artifact) => artifact.id === "api" && artifact.version === 1)).toHaveLength(1);
     expect(await registry.publish({ id: "api", orchestrationId: "o1", producerTaskId: "producer", kind: "api", name: "API", version: 2, payload: "v2", createdAt: "now" }, [consumer, unaffected])).toEqual(["consumer"]);
     expect(consumer.status).toBe("stale");
     expect(unaffected.status).toBe("ready");
@@ -261,6 +303,7 @@ describe("engine primitives", () => {
     ], new Set());
     const records = await service.run("o1", null, root, ["protected", "manual"], sink, new AbortController().signal);
     expect(requiredVerificationPassed(records)).toBe(true);
+    expect(requiredVerificationPassed([])).toBe(false);
     expect(requiredVerificationPassed([{
       id: "regression-not-applicable", orchestrationId: "o1", taskId: null,
       scope: "global", commandOrCheck: "Existing regression suite",
@@ -268,6 +311,25 @@ describe("engine primitives", () => {
       startedAt: "now", completedAt: "now",
     }])).toBe(true);
     expect(JSON.stringify(records)).not.toContain(path.join(root, "protected"));
+    const throwing = new VerificationService(path.join(root, "protected-errors"), [
+      { id: "throws", description: "throwing check", scope: "protected", run: async () => { throw new Error("test harness crashed"); } },
+    ], new Set());
+    const failedRecord = await throwing.run(
+      "o1",
+      null,
+      root,
+      ["protected"],
+      sink,
+      new AbortController().signal,
+      "release-0",
+    );
+    expect(failedRecord).toEqual([
+      expect.objectContaining({
+        id: "o1-global-release-0-throws",
+        status: "failed",
+        outputSummary: "Verification check error: test harness crashed",
+      }),
+    ]);
     const packet = createFailurePacket({ taskId: "t1", contractVersion: 1, attemptCount: 2, error: "token budget exhausted", verifications: [], changes: { changedFiles: [], deletedFiles: [], hashes: {} }, relevantInterfaces: [], diagnosis: "budget", usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 } });
     expect(classifyFailure(packet)).toBe("budget-exhaustion");
     const infrastructurePacket = createFailurePacket({ taskId: "t1", contractVersion: 1, attemptCount: 2, error: "spawn /sbin/docker-init E2BIG: argument list too long", verifications: [], changes: { changedFiles: [], deletedFiles: [], hashes: {} }, relevantInterfaces: [], diagnosis: "container launch failed", usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 } });
@@ -341,5 +403,11 @@ describe("engine primitives", () => {
     expect(decision.approved).toBe(false);
     const invalidContext = reviewPreflight({ understanding: "x", expectedFiles: ["src/a.ts"], consumedArtifacts: [], publishedArtifacts: [], approach: ["edit"], missingContext: [{ path: "/workspace", reason: "need root" }], plannedChecks: ["test"] }, task, { id: "contract", orchestrationId: "o", version: 1, intent: { id: "i", orchestrationId: "o", revision: 1, goal: "g", requirements: ["r"], assumptions: [], nonGoals: [], architectureDecisions: [], materialQuestions: [], manualExpectations: [], createdAt: "now" }, criteria: [{ id: "c", kind: "functional", description: "works", verification: "visible-test" }], confirmedBy: "user", confirmedAt: "now", supersedesContractId: null }, ["src/a.ts"]);
     expect(invalidContext.reason).toContain("invalid or unavailable context paths: /workspace");
+    const unrestricted = reviewPreflight(
+      { understanding: "x", expectedFiles: ["frontend/package.json", "backend/src/index.ts"], consumedArtifacts: [], publishedArtifacts: [], approach: ["build"], missingContext: [], plannedChecks: ["test"] },
+      { ...task, allowedPaths: ["."] },
+      { id: "contract", orchestrationId: "o", version: 1, intent: { id: "i", orchestrationId: "o", revision: 1, goal: "g", requirements: ["r"], assumptions: [], nonGoals: [], architectureDecisions: [], materialQuestions: [], manualExpectations: [], createdAt: "now" }, criteria: [{ id: "c", kind: "functional", description: "works", verification: "visible-test" }], confirmedBy: "user", confirmedAt: "now", supersedesContractId: null },
+    );
+    expect(unrestricted.approved).toBe(true);
   });
 });

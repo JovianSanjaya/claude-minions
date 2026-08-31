@@ -71,7 +71,7 @@ export class ContextBroker {
     const allowed = task.allowedPaths.map((entry) => entry.replaceAll("\\", "/").replace(/\/$/, ""));
     const terms = searchTerms(`${task.title} ${task.objective} ${task.allowedPaths.join(" ")}`);
     const paths = map.entries
-      .filter((entry) => allowed.some((prefix) => entry.path === prefix || entry.path.startsWith(`${prefix}/`)))
+      .filter((entry) => allowed.includes(".") || allowed.some((prefix) => entry.path === prefix || entry.path.startsWith(`${prefix}/`)))
       .map((entry) => {
         const searchable = `${entry.path} ${entry.summary} ${entry.imports.join(" ")} ${entry.exports.join(" ")}`.toLowerCase();
         const matches = [...terms].filter((term) => searchable.includes(term)).length;

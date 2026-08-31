@@ -68,9 +68,11 @@ describe("Container Codex runner", () => {
     expect(args).toContain("danger-full-access");
     expect(args).not.toContain("read-only");
     expect(args).toContain("--read-only");
-    expect(args).toContain("/tmp:rw,nosuid,nodev,size=512m,mode=1777");
-    expect(args).toContain("256m");
+    expect(args).toContain("/tmp:rw,nosuid,nodev,size=1g,mode=1777");
+    expect(args).toContain("512m");
     expect(args).toContain("TMPDIR=/tmp");
+    expect(args).toContain("NPM_CONFIG_CACHE=/codex-home/npm-cache");
+    expect(args).toContain("NODE_COMPILE_CACHE=/codex-home/node-compile-cache");
     expect(args).toContain("XDG_RUNTIME_DIR=/tmp/runtime");
     expect(args).toContain("CHROME_BIN=/usr/bin/chromium");
     expect(args).toContain("/workspace");

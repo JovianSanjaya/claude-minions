@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
-import { isApplicationMapExcluded } from "./application-map.js";
+import { isApplicationMapExcluded, isProtectedEnvironmentPath } from "./application-map.js";
 
 export interface WorkspaceManifest {
   rootHash: string;
@@ -87,8 +87,17 @@ export function diffManifest(base: WorkspaceManifest, current: WorkspaceManifest
 export function scopeViolations(changes: WorkspaceChanges, allowedPaths: string[]): string[] {
   const allowed = allowedPaths.map((entry) => entry.replaceAll("\\", "/").replace(/\/$/, ""));
   return [...changes.changedFiles, ...changes.deletedFiles].filter(
-    (file) => !allowed.some((prefix) => file === prefix || file.startsWith(`${prefix}/`)),
+    (file) =>
+      isProtectedEnvironmentPath(file) ||
+      (!allowed.includes(".") &&
+        !allowed.some((prefix) => file === prefix || file.startsWith(`${prefix}/`))),
   );
+}
+
+export function scopeViolationSummary(violations: string[], maximumPaths = 12): string {
+  const visible = violations.slice(0, maximumPaths);
+  const omitted = Math.max(0, violations.length - visible.length);
+  return `${visible.join(", ")}${omitted ? ` (+${omitted} more)` : ""}`;
 }
 
 export class WorkerWorkspaceManager {

@@ -2,7 +2,10 @@ import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CodexSessionTelemetryTracker } from "./codex-session-telemetry.js";
+import {
+  CodexSessionTelemetryTracker,
+  executionBudgetExceeded,
+} from "./codex-session-telemetry.js";
 
 function tokenEvent(total: number, input: number, cached: number, output: number) {
   return JSON.stringify({
@@ -29,6 +32,16 @@ function tokenEvent(total: number, input: number, cached: number, output: number
 }
 
 describe("Codex session telemetry", () => {
+  it("enforces the first bounded execution limit reached, including tool calls", () => {
+    expect(executionBudgetExceeded(
+      { maxArkApiTurns: 8, maxInputTokens: 200_000, maxToolCalls: 8 },
+      { arkApiTurns: 2, inputTokens: 50_000, toolCalls: 9 },
+    )).toBe("Per-execution tool-call limit exceeded (9/8)");
+    expect(executionBudgetExceeded(
+      { maxArkApiTurns: 8, maxInputTokens: 200_000, maxToolCalls: 8 },
+      { arkApiTurns: 8, inputTokens: 200_000, toolCalls: 8 },
+    )).toBeNull();
+  });
   it("counts completed Ark turns once and preserves partial usage", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-telemetry-"));
     try {

@@ -270,6 +270,10 @@ export const emptyOrchestrationDatabase = (): OrchestrationDatabase => ({
 });
 
 export type AtomicWriter = (filePath: string, data: string) => Promise<void>;
+export type OrchestrationMutationObserver = (
+  previous: OrchestrationDatabase,
+  next: OrchestrationDatabase,
+) => void | Promise<void>;
 
 const atomicWriter: AtomicWriter = async (filePath, data) => {
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
@@ -288,6 +292,7 @@ export class OrchestrationStore {
   constructor(
     private readonly filePath: string,
     private readonly writeAtomically: AtomicWriter = atomicWriter,
+    private readonly observeMutation?: OrchestrationMutationObserver,
   ) {}
 
   async initialize(): Promise<void> {
@@ -326,6 +331,7 @@ export class OrchestrationStore {
       const safe = redactClone(next);
       databaseSchema.parse(safe);
       await this.persist(safe);
+      await this.observeMutation?.(this.data, safe);
       this.data = safe;
     });
     this.queue = operation.then(

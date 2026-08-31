@@ -22,6 +22,9 @@ const parse = <T>(schema: z.ZodType<T>, value: unknown): T => {
 
 const agentParams = z.object({ agentId: z.string().uuid() });
 const orchestrationParams = z.object({ orchestrationId: z.string().uuid() });
+const auditQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(5_000).default(500),
+});
 const amendmentParams = orchestrationParams.extend({
   amendmentId: z.string().uuid(),
 });
@@ -36,6 +39,9 @@ const budgetSchema = z
     maxSteps: z.number().int().nonnegative().max(100_000).optional(),
     maxWorkerAttempts: z.number().int().nonnegative().max(100).optional(),
     maxContextExpansionsPerTask: z.number().int().nonnegative().max(100).optional(),
+    maxArkApiTurns: z.number().int().nonnegative().max(100_000).optional(),
+    maxArkApiTurnsPerExecution: z.number().int().nonnegative().max(1_000).optional(),
+    maxInputTokensPerExecution: z.number().int().nonnegative().max(10_000_000).optional(),
   })
   .strict();
 const createBody = z
@@ -102,6 +108,12 @@ export function registerOrchestrationRoutes(
     return service.getOrchestration(orchestrationId);
   });
 
+  app.get("/api/orchestrations/:orchestrationId/audit-log", async (request) => {
+    const { orchestrationId } = parse(orchestrationParams, request.params);
+    const { limit } = parse(auditQuery, request.query);
+    return service.getAuditLog(orchestrationId, limit);
+  });
+
   app.patch("/api/orchestrations/:orchestrationId/intent", async (request, reply) => {
     const { orchestrationId } = parse(orchestrationParams, request.params);
     const body = parse(revisionBody, request.body);
@@ -133,6 +145,18 @@ export function registerOrchestrationRoutes(
     const { orchestrationId } = parse(orchestrationParams, request.params);
     const cancelled = await service.cancel(orchestrationId);
     return reply.code(202).send({ cancelled });
+  });
+
+  app.post("/api/orchestrations/:orchestrationId/recover", async (request, reply) => {
+    const { orchestrationId } = parse(orchestrationParams, request.params);
+    const orchestration = await service.recoverAsNew(orchestrationId);
+    return reply.code(202).send({ orchestration });
+  });
+
+  app.post("/api/orchestrations/:orchestrationId/retry-verification", async (request, reply) => {
+    const { orchestrationId } = parse(orchestrationParams, request.params);
+    const orchestration = await service.retryVerification(orchestrationId);
+    return reply.code(202).send({ orchestration });
   });
 
   app.get("/api/orchestrations/:orchestrationId/events", async (request) => {

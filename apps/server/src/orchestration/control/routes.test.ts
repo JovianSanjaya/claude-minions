@@ -82,11 +82,23 @@ describe("orchestration routes", () => {
 
     const accepted = await app.inject({
       method: "POST", url: `/api/agents/${AGENT_ID}/orchestrations`,
-      payload: { prompt: "Do work" },
+      payload: {
+        prompt: "Do work",
+        budget: {
+          maxArkApiTurns: 900,
+          maxArkApiTurnsPerExecution: 40,
+          maxInputTokensPerExecution: 750_000,
+        },
+      },
     });
     expect(accepted.statusCode).toBe(202);
     const id = accepted.json().orchestration.id as string;
     expect(accepted.json().orchestration.requestedMode).toBe("auto");
+    expect(accepted.json().orchestration.budget).toMatchObject({
+      maxArkApiTurns: 900,
+      maxArkApiTurnsPerExecution: 40,
+      maxInputTokensPerExecution: 750_000,
+    });
     await service.waitForIdle(id);
 
     const revised = await app.inject({
@@ -113,6 +125,17 @@ describe("orchestration routes", () => {
     expect((await app.inject({ method: "GET", url: `/api/orchestrations/${id}/tasks` })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: `/api/orchestrations/${id}/artifacts` })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: `/api/orchestrations/${id}/verifications` })).statusCode).toBe(200);
+    const audit = await app.inject({
+      method: "GET",
+      url: `/api/orchestrations/${id}/audit-log?limit=25`,
+    });
+    expect(audit.statusCode).toBe(200);
+    expect(audit.json()).toEqual({ entries: [], filePath: null });
+    const cannotRecoverCompleted = await app.inject({
+      method: "POST",
+      url: `/api/orchestrations/${id}/recover`,
+    });
+    expect(cannotRecoverCompleted.statusCode).toBe(422);
     await app.close();
   });
 

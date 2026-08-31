@@ -436,6 +436,20 @@
   border-left-color: #c55353;
 }
 
+.orch-terminal-recovery {
+  align-items: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.orch-terminal-recovery small {
+  color: var(--muted);
+  line-height: 1.45;
+  max-width: 58ch;
+}
+
 /* Five-page execution overlay */
 .orch-page-backdrop {
   position: fixed;

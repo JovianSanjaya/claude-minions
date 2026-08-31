@@ -11,6 +11,10 @@ const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   LOG_LEVEL: z.string().default("info"),
+  AUDIT_LOG_ENABLED: z.enum(["true", "false"]).default("true").transform((value) => value === "true"),
+  AUDIT_LOG_DIR: z.string().optional(),
+  AUDIT_LOG_MAX_BYTES: z.coerce.number().int().min(65_536).default(26_214_400),
+  AUDIT_LOG_MAX_FILES: z.coerce.number().int().min(1).max(20).default(5),
   APP_DATA_DIR: z.string().default(path.resolve(".data")),
   AGENT_WORKSPACE_ROOT: z.string().default(path.resolve("workspaces")),
   CODEX_HOME: z.string().default(path.resolve("codex-home")),
@@ -28,25 +32,25 @@ const envSchema = z.object({
   CODEX_SANDBOX_MODE: z
     .enum(["read-only", "workspace-write", "danger-full-access"])
     .default("workspace-write"),
-  CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
-  CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
+  CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(1_200_000),
+  CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(4_194_304),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
   CONTAINER_RUNTIME_IMAGE: z.string().min(1).default("volc-agent-runtime:local"),
-  CONTAINER_CPU_LIMIT: z.coerce.number().positive().default(2),
+  CONTAINER_CPU_LIMIT: z.coerce.number().positive().default(4),
   CONTAINER_MEMORY_LIMIT: z
     .string()
     .regex(/^\d+(?:\.\d+)?[bkmg]$/i)
-    .default("2g"),
-  CONTAINER_PIDS_LIMIT: z.coerce.number().int().positive().default(256),
+    .default("4g"),
+  CONTAINER_PIDS_LIMIT: z.coerce.number().int().positive().default(512),
   CONTAINER_TMPFS_SIZE: z
     .string()
     .regex(/^\d+(?:\.\d+)?[bkmg]$/i)
-    .default("512m"),
+    .default("1g"),
   CONTAINER_SHM_SIZE: z
     .string()
     .regex(/^\d+(?:\.\d+)?[bkmg]$/i)
-    .default("256m"),
+    .default("512m"),
   CONTAINER_USER: z.string().optional(),
   RUNTIME_INSTANCE_ID: z
     .string()
@@ -83,13 +87,17 @@ const envSchema = z.object({
   ORCHESTRATION_MAX_ARK_API_TURNS: optionalNonNegativeNumber,
   ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION: optionalNonNegativeNumber,
   ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION: optionalNonNegativeNumber,
+  ORCHESTRATION_UNRESTRICTED_MODE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   ARK_REQUEST_MAX_RETRIES: optionalNonNegativeNumber,
   ARK_STREAM_MAX_RETRIES: optionalNonNegativeNumber,
   ARK_STREAM_IDLE_TIMEOUT_MS: optionalNonNegativeNumber,
+  ORCHESTRATION_MODEL_TRANSPORT_MAX_RETRIES: optionalNonNegativeNumber,
   ARK_INPUT_USD_PER_MILLION: optionalNonNegativeNumber,
   ARK_CACHED_INPUT_USD_PER_MILLION: optionalNonNegativeNumber,
   ARK_OUTPUT_USD_PER_MILLION: optionalNonNegativeNumber,
-  ORCHESTRATION_DEMO_FIXTURE: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   ARK_BASE_URL: z
     .string()
     .url()
@@ -109,9 +117,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
         "APP_AUTH_TOKEN must contain at least 24 characters for a non-loopback production server",
       );
     }
-  }
-  if (env.NODE_ENV === "production" && env.ORCHESTRATION_DEMO_FIXTURE) {
-    throw new Error("ORCHESTRATION_DEMO_FIXTURE cannot be enabled in production");
   }
   const defaultContainerUser =
     typeof process.getuid === "function" && typeof process.getgid === "function"
@@ -133,6 +138,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     port: env.PORT,
     logLevel: env.LOG_LEVEL,
     dataDirectory,
+    auditLogEnabled: env.AUDIT_LOG_ENABLED,
+    auditLogDirectory: path.resolve(env.AUDIT_LOG_DIR?.trim() || path.join(dataDirectory, "logs")),
+    auditLogMaximumBytes: env.AUDIT_LOG_MAX_BYTES,
+    auditLogMaximumFiles: env.AUDIT_LOG_MAX_FILES,
     workspaceRoot: path.resolve(env.AGENT_WORKSPACE_ROOT),
     codexHome: path.resolve(env.CODEX_HOME),
     codexBin: env.CODEX_BIN,
@@ -168,26 +177,40 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     orchestrationProtectedEvaluatorRoot: path.resolve(
       env.ORCHESTRATION_PROTECTED_EVALUATOR_ROOT?.trim() || path.join(dataDirectory, "protected-evaluators"),
     ),
-    orchestrationDefaultBudget: {
+    orchestrationUnrestrictedMode: env.ORCHESTRATION_UNRESTRICTED_MODE,
+    orchestrationDefaultBudget: env.ORCHESTRATION_UNRESTRICTED_MODE ? {
+      maxInputTokens: null,
+      maxOutputTokens: null,
+      maxEstimatedUsd: null,
+      maxModelCalls: 10_000,
+      maxSteps: 100_000,
+      maxWorkerAttempts: 100,
+      maxContextExpansionsPerTask: 100,
+      maxArkApiTurns: 100_000,
+      maxArkApiTurnsPerExecution: 50,
+      maxInputTokensPerExecution: 1_000_000,
+    } : {
       maxInputTokens: env.ORCHESTRATION_MAX_INPUT_TOKENS ?? null,
       maxOutputTokens: env.ORCHESTRATION_MAX_OUTPUT_TOKENS ?? null,
       maxEstimatedUsd: env.ORCHESTRATION_MAX_ESTIMATED_USD ?? null,
-      maxModelCalls: env.ORCHESTRATION_MAX_MODEL_CALLS ?? 100,
-      maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 250,
-      maxWorkerAttempts: env.ORCHESTRATION_MAX_WORKER_ATTEMPTS ?? 3,
-      maxContextExpansionsPerTask: env.ORCHESTRATION_MAX_CONTEXT_EXPANSIONS ?? 3,
-      maxArkApiTurns: env.ORCHESTRATION_MAX_ARK_API_TURNS ?? 150,
-      maxArkApiTurnsPerExecution: env.ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION ?? 15,
-      maxInputTokensPerExecution: env.ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION ?? 250_000,
+      maxModelCalls: env.ORCHESTRATION_MAX_MODEL_CALLS ?? 250,
+      maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 750,
+      maxWorkerAttempts: env.ORCHESTRATION_MAX_WORKER_ATTEMPTS ?? 5,
+      maxContextExpansionsPerTask: env.ORCHESTRATION_MAX_CONTEXT_EXPANSIONS ?? 6,
+      maxArkApiTurns: env.ORCHESTRATION_MAX_ARK_API_TURNS ?? 500,
+      maxArkApiTurnsPerExecution: env.ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION ?? 25,
+      maxInputTokensPerExecution: env.ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION ?? 500_000,
     },
     orchestrationPricing: env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined
       ? (["planner", "worker", "verifier", "integrator"] as const).map((role) => ({ role, modelId: orchestrationModels[role], inputUsdPerMillion: env.ARK_INPUT_USD_PER_MILLION!, cachedInputUsdPerMillion: env.ARK_CACHED_INPUT_USD_PER_MILLION!, outputUsdPerMillion: env.ARK_OUTPUT_USD_PER_MILLION! }))
       : [],
-    orchestrationDemoFixture: env.ORCHESTRATION_DEMO_FIXTURE,
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
     arkRequestMaxRetries: Math.floor(env.ARK_REQUEST_MAX_RETRIES ?? 3),
     arkStreamMaxRetries: Math.floor(env.ARK_STREAM_MAX_RETRIES ?? 3),
     arkStreamIdleTimeoutMs: Math.floor(env.ARK_STREAM_IDLE_TIMEOUT_MS ?? 180_000),
+    orchestrationModelTransportMaxRetries: Math.floor(
+      env.ORCHESTRATION_MODEL_TRANSPORT_MAX_RETRIES ?? 6,
+    ),
     nodeEnv: env.NODE_ENV,
   };
 }
