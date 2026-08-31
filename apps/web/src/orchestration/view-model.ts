@@ -41,6 +41,8 @@ export interface OrchestrationProgress {
   stage: string;
   phase: string;
   detail: string;
+  activity: string;
+  loading: boolean;
   activeRole: string | null;
   elapsedMs: number;
   timeoutRemainingMs: number | null;
@@ -55,13 +57,22 @@ export function orchestrationProgress(
   const status = view.orchestration.status;
   const lastEvent = view.events.at(-1);
   const latestEngineStage = [...view.events].reverse().find((event) =>
-    ["integration-step", "verification-step"].includes(event.type),
+    [
+      "direct-step",
+      "preflight-step",
+      "worker-step",
+      "worker-compact-continuation",
+      "integration-step",
+      "verification-step",
+    ].includes(event.type),
   );
   const effectiveStatus: OrchestrationStatus =
     status === "running" && latestEngineStage
       ? latestEngineStage.type === "verification-step"
         ? "verifying"
-        : "integrating"
+        : latestEngineStage.type === "integration-step"
+          ? "integrating"
+          : "running"
       : status;
   const phases: Partial<Record<OrchestrationStatus, [string, string, string]>> = {
     "drafting-intent": [
@@ -123,6 +134,105 @@ export function orchestrationProgress(
   const runningAttempt = [...view.attempts]
     .reverse()
     .find((attempt) => attempt.status === "running");
+  const actionEvent = [...view.events].reverse().find((event) =>
+    [
+      "route-decision",
+      "direct-step",
+      "preflight-step",
+      "preflight-reviewed",
+      "context-expansion",
+      "worker-step",
+      "worker-checkpoint-saved",
+      "worker-compact-continuation",
+      "worker-retry-wait",
+      "role-call-transport-retry",
+      "worker-transport-retries-exhausted",
+      "worker-supervisor-escalation",
+      "worker-supervisor-decision",
+      "dependency-refreshed",
+      "integration-step",
+      "integration-candidate",
+      "verification-step",
+      "acceptance-verification-completed",
+      "supervisor-recovery-escalation",
+      "supervisor-recovery-decision",
+      "verified-publish",
+    ].includes(event.type),
+  );
+  const activeTaskId = activeStart?.taskId ?? runningAttempt?.taskId ?? actionEvent?.taskId;
+  const activeTask = activeTaskId
+    ? view.tasks.find((task) => task.id === activeTaskId)
+    : null;
+  const taskName = activeTask?.title ? ` “${activeTask.title}”` : "";
+  let detail = phase[2];
+  let activity = phase[1];
+  if (effectiveStatus === "drafting-intent") activity = "Understanding your request";
+  if (effectiveStatus === "awaiting-confirmation") activity = "Waiting for your decision";
+  if (effectiveStatus === "planning") {
+    activity = "Choosing an execution path and planning tasks";
+  }
+  if (effectiveStatus === "ready") {
+    activity = view.plan?.selectedMode === "direct"
+      ? "Preparing the big model to implement the request"
+      : "Preparing tasks for smaller workers";
+  }
+  if (effectiveStatus === "running") {
+    detail = view.plan?.selectedMode === "direct"
+      ? "The big model is implementing and checking the confirmed task."
+      : "Workers are implementing and checking bounded tasks.";
+    if (activeStart?.actorRole === "worker") {
+      activity = `A smaller worker is implementing${taskName}`;
+    } else if (activeStart?.actorRole === "integrator") {
+      activity = "Resolving an integration conflict";
+    } else if (activeStart?.actorRole === "verifier") {
+      activity = "Verifying the integrated result";
+    } else if (activeStart?.actorRole === "planner") {
+      activity = actionEvent && /supervisor|recovery/.test(actionEvent.type)
+        ? "The supervisor is diagnosing a problem"
+        : view.plan?.selectedMode === "direct"
+          ? "The big model is implementing the request"
+          : "The supervisor is coordinating the workers";
+    } else if (actionEvent?.type === "preflight-step") {
+      activity = `Preparing focused context for${taskName || " a smaller worker"}`;
+    } else if (actionEvent?.type === "context-expansion") {
+      activity = `Retrieving additional context for${taskName || " a worker"}`;
+    } else if (actionEvent?.type === "worker-checkpoint-saved") {
+      activity = `Saving a recovery checkpoint for${taskName || " a worker"}`;
+    } else if (actionEvent?.type === "worker-compact-continuation") {
+      activity = `Resuming${taskName || " a worker"} from its checkpoint`;
+    } else if (actionEvent?.type === "worker-retry-wait") {
+      activity = `Waiting briefly before retrying${taskName || " a worker"}`;
+    } else if (actionEvent?.type === "dependency-refreshed") {
+      activity = `Refreshing context for${taskName || " a dependent worker"}`;
+    } else if (actionEvent?.type === "route-decision") {
+      activity = view.plan?.selectedMode === "direct"
+        ? "Starting the big-model execution"
+        : "Starting the smaller worker tasks";
+    } else {
+      activity = view.plan?.selectedMode === "direct"
+        ? "The big model is implementing the request"
+        : "Smaller workers are implementing the planned tasks";
+    }
+  }
+  if (effectiveStatus === "integrating") {
+    activity = activeStart?.actorRole === "integrator"
+      ? "Resolving conflicts between worker changes"
+      : "Combining worker changes into one result";
+  }
+  if (effectiveStatus === "verifying") {
+    activity = activeStart?.actorRole === "verifier"
+      ? "The verification model is checking unresolved requirements"
+      : "Running deterministic checks on the integrated result";
+  }
+  if (!activeStart && actionEvent?.type === "role-call-transport-retry") {
+    activity = "Connection interrupted — reconnecting automatically";
+    detail = "Completed workspace changes and checkpoints are preserved while the model connection is restored.";
+  }
+  if (effectiveStatus === "completed") activity = "Verified result ready";
+  if (effectiveStatus === "failed") activity = "Execution stopped";
+  if (effectiveStatus === "budget-exhausted") activity = "Execution stopped at a usage limit";
+  if (effectiveStatus === "cancelled") activity = "Execution cancelled";
+  if (effectiveStatus === "needs-user") activity = "Waiting for your input";
   const startedAt =
     activeStart?.createdAt ??
     runningAttempt?.createdAt ??
@@ -165,7 +275,9 @@ export function orchestrationProgress(
     percent: Math.min(100, percent),
     stage: phase[0],
     phase: phase[1],
-    detail: phase[2],
+    detail,
+    activity,
+    loading: !["completed", "failed", "budget-exhausted", "cancelled", "needs-user", "awaiting-confirmation"].includes(effectiveStatus),
     activeRole: activeStart?.actorRole ?? null,
     elapsedMs,
     timeoutRemainingMs: timeoutMs === null ? null : Math.max(0, timeoutMs - elapsedMs),
@@ -430,6 +542,10 @@ export function summarizeUsage(usage: UsageLedger) {
     totalCachedInputTokens: usage.totalCachedInputTokens,
     totalOutputTokens: usage.totalOutputTokens,
     totalModelCalls: rows.reduce((total, row) => total + row.modelCalls, 0),
+    totalArkApiTurns: usage.totalArkApiTurns ?? rows.reduce((total, row) => total + (row.arkApiTurns ?? 0), 0),
+    totalToolCalls: usage.totalToolCalls ?? rows.reduce((total, row) => total + (row.toolCalls ?? 0), 0),
+    totalStreamRetries: usage.totalStreamRetries ?? rows.reduce((total, row) => total + (row.streamRetries ?? 0), 0),
+    peakContextTokens: usage.peakContextTokens ?? rows.reduce((peak, row) => Math.max(peak, row.peakContextTokens ?? 0), 0),
     totalEstimatedUsd:
       usage.pricingStatus === "configured" ? usage.totalEstimatedUsd : null,
   };
@@ -439,7 +555,6 @@ export function budgetGauges(
   usage: UsageLedger,
   budget: BudgetPolicy,
   modelCalls: number,
-  elapsedMs: number,
 ) {
   const gauge = (label: string, used: number, limit: number | null, suffix = "") => ({
     label,
@@ -453,13 +568,8 @@ export function budgetGauges(
   const gauges = [
     gauge("Input tokens", usage.totalInputTokens, budget.maxInputTokens),
     gauge("Output tokens", usage.totalOutputTokens, budget.maxOutputTokens),
-    gauge("Model calls", modelCalls, budget.maxModelCalls || null),
-    gauge(
-      "Wall clock",
-      Math.round(elapsedMs / 1_000),
-      Math.round(budget.maxWallClockMs / 1_000) || null,
-      "s",
-    ),
+    gauge("Codex executions", modelCalls, budget.maxModelCalls || null),
+    gauge("Ark turns", usage.totalArkApiTurns ?? 0, budget.maxArkApiTurns ?? null),
   ];
   if (usage.pricingStatus === "configured" && budget.maxEstimatedUsd != null) {
     gauges.push({

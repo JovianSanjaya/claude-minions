@@ -69,7 +69,7 @@ class MemorySink implements OrchestrationSink {
 const budget = {
   maxInputTokens: 100_000, maxOutputTokens: 100_000, maxEstimatedUsd: null,
   maxModelCalls: 50, maxSteps: 100, maxWorkerAttempts: 3,
-  maxContextExpansionsPerTask: 1, maxWallClockMs: 60_000,
+  maxContextExpansionsPerTask: 1,
 };
 
 describe("engine primitives", () => {
@@ -81,12 +81,13 @@ describe("engine primitives", () => {
 
   it("routes tiny, coupled, and modular work adaptively within budget", () => {
     expect(selectRoute({ requestedMode: "auto", taskCount: 1, changedAreaCount: 1, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 2, estimatedContextTokens: 100, budget }).selectedMode).toBe("direct");
-    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 2, changedAreaCount: 2, hasOverlappingWriteScopes: false, coupling: "high", estimatedCalls: 4, estimatedContextTokens: 100, budget }).selectedMode).toBe("one-worker");
-    expect(selectRoute({ requestedMode: "auto", taskCount: 3, changedAreaCount: 3, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("multi-worker");
-    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 8, changedAreaCount: 1, hasOverlappingWriteScopes: true, coupling: "low", estimatedCalls: 20, estimatedContextTokens: 100, budget })).toEqual({
-      selectedMode: "one-worker",
-      reason: "Planned tasks share writable paths, so one coordinated worker avoids conflicting edits",
+    expect(selectRoute({ requestedMode: "orchestrated", taskCount: 2, changedAreaCount: 2, hasOverlappingWriteScopes: false, coupling: "high", estimatedCalls: 4, estimatedContextTokens: 100, budget })).toEqual({
+      selectedMode: "multi-worker",
+      reason: "Coupled work is split into dependency-ordered workers with exclusive file ownership",
     });
+    expect(selectRoute({ requestedMode: "auto", taskCount: 3, changedAreaCount: 3, hasOverlappingWriteScopes: false, coupling: "low", estimatedCalls: 8, estimatedContextTokens: 100, budget }).selectedMode).toBe("multi-worker");
+    expect(() => selectRoute({ requestedMode: "orchestrated", taskCount: 8, changedAreaCount: 1, hasOverlappingWriteScopes: true, coupling: "low", estimatedCalls: 20, estimatedContextTokens: 100, budget }))
+      .toThrow("must have exclusive writable paths");
     expect(tasksHaveOverlappingWriteScopes([
       { allowedPaths: ["index.html"] },
       { allowedPaths: ["index.html"] },
@@ -106,11 +107,15 @@ describe("engine primitives", () => {
     temporary.push(root);
     await mkdir(path.join(root, "src"));
     await mkdir(path.join(root, "node_modules"));
+    await mkdir(path.join(root, ".npm-cache", "_cacache"), { recursive: true });
     await writeFile(path.join(root, "src", "api.ts"), "export interface Api { ok: boolean }\n");
     await writeFile(path.join(root, "src", "other.ts"), "export const other = 1\n");
     await writeFile(path.join(root, ".env"), "ARK_API_KEY=secret\n");
     await writeFile(path.join(root, ".env.example"), "ARK_API_KEY=replace-me\n");
+    await writeFile(path.join(root, "tsconfig.tsbuildinfo"), "generated compiler cache\n");
+    await writeFile(path.join(root, ".eslintcache"), "generated lint cache\n");
     await writeFile(path.join(root, "node_modules", "ignored.js"), "ignored");
+    await writeFile(path.join(root, ".npm-cache", "_cacache", "ignored"), "cache");
     await symlink(path.join(root, ".env"), path.join(root, "src", "escape.ts"));
     const map = await buildApplicationMap(root, "o1");
     expect(map.entries.map((entry) => entry.path)).toEqual([".env.example", "src/api.ts", "src/other.ts"]);
@@ -156,6 +161,13 @@ describe("engine primitives", () => {
     }
   });
 
+  it("excludes generated compiler and lint artifacts from maps and scope accounting", () => {
+    expect(isApplicationMapExcluded("tsconfig.tsbuildinfo")).toBe(true);
+    expect(isApplicationMapExcluded("apps/web/tsconfig.app.tsbuildinfo")).toBe(true);
+    expect(isApplicationMapExcluded(".eslintcache")).toBe(true);
+    expect(isApplicationMapExcluded("src/application.ts")).toBe(false);
+  });
+
   it("isolates worker changes, detects scope violations, and cleans only task paths", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "engine-workspace-"));
     temporary.push(root);
@@ -166,7 +178,9 @@ describe("engine primitives", () => {
     const worker = await manager.create(source, "o1", "t1", ["src/a.ts"]);
     await writeFile(path.join(worker.path, "src", "a.ts"), "changed\n");
     await writeFile(path.join(worker.path, "src", "b.ts"), "outside\n");
+    await writeFile(path.join(worker.path, "tsconfig.tsbuildinfo"), "generated compiler cache\n");
     const changes = await manager.changes(worker);
+    expect(changes.changedFiles).not.toContain("tsconfig.tsbuildinfo");
     expect(scopeViolations(changes, worker.allowedPaths)).toEqual(["src/b.ts"]);
     expect(await readFile(path.join(source, "src", "a.ts"), "utf8")).toBe("a\n");
     expect(await manager.cleanup(worker, "clean")).toEqual({ status: "cleaned", path: null });
@@ -256,6 +270,8 @@ describe("engine primitives", () => {
     expect(JSON.stringify(records)).not.toContain(path.join(root, "protected"));
     const packet = createFailurePacket({ taskId: "t1", contractVersion: 1, attemptCount: 2, error: "token budget exhausted", verifications: [], changes: { changedFiles: [], deletedFiles: [], hashes: {} }, relevantInterfaces: [], diagnosis: "budget", usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 } });
     expect(classifyFailure(packet)).toBe("budget-exhaustion");
+    const infrastructurePacket = createFailurePacket({ taskId: "t1", contractVersion: 1, attemptCount: 2, error: "spawn /sbin/docker-init E2BIG: argument list too long", verifications: [], changes: { changedFiles: [], deletedFiles: [], hashes: {} }, relevantInterfaces: [], diagnosis: "container launch failed", usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 } });
+    expect(classifyFailure(infrastructurePacket)).toBe("infrastructure-failure");
   });
 
   it("integrates non-conflicting files and detects main-workspace drift before publish", async () => {

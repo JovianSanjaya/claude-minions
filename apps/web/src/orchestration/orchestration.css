@@ -58,7 +58,15 @@
 .orch-result small{display:block;margin-top:8px}
 .orch-progress{margin-bottom:12px}
 .orch-progress-track{height:10px;margin:12px 0 8px;border-radius:999px;background:#e8e5dc;overflow:hidden}
-.orch-progress-track span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#6954d9,#8d7bea);transition:width .35s ease}
+.orch-progress-track span{position:relative;display:block;height:100%;overflow:hidden;border-radius:inherit;background:linear-gradient(90deg,#6954d9,#8d7bea,#6954d9);background-size:200% 100%;transition:width .35s ease}
+.orch-progress-track[data-loading="true"] span{animation:orch-progress-flow 1.35s linear infinite}
+.orch-progress-track[data-loading="true"] span::after{content:"";position:absolute;inset:0;transform:translateX(-120%);background:linear-gradient(105deg,transparent 25%,rgba(255,255,255,.65) 48%,transparent 70%);animation:orch-progress-sheen 1.6s ease-in-out infinite}
+.orch-current-activity{margin:9px 0 3px;color:#3b3b38;font-size:12px;font-weight:760;letter-spacing:.005em}
+.orch-current-activity[data-loading="true"],.orch-loading-text{color:#777770;background:linear-gradient(90deg,#777770 10%,#252527 42%,#777770 70%);background-size:240% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:orch-text-scan 1.65s linear infinite}
+@keyframes orch-progress-flow{to{background-position:-200% 0}}
+@keyframes orch-progress-sheen{0%{transform:translateX(-120%)}65%,100%{transform:translateX(120%)}}
+@keyframes orch-text-scan{0%{background-position:130% 0}100%{background-position:-110% 0}}
+@media(prefers-reduced-motion:reduce){.orch-progress-track[data-loading="true"] span,.orch-progress-track[data-loading="true"] span::after,.orch-current-activity[data-loading="true"],.orch-loading-text{animation:none}.orch-current-activity[data-loading="true"],.orch-loading-text{color:#3b3b38;background:none;-webkit-text-fill-color:currentColor}}
 .orch-progress-facts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
 .orch-progress-facts span{padding:9px;border-radius:8px;background:#f5f3ef}
 .orch-progress-facts b,.orch-progress-facts small{display:block}

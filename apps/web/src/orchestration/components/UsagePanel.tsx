@@ -27,7 +27,7 @@ export function UsagePanel({
   budgetStopReason: string | null;
 }) {
   const summary = summarizeUsage(usage);
-  const gauges = budgetGauges(usage, budget, summary.totalModelCalls, elapsedMs);
+  const gauges = budgetGauges(usage, budget, summary.totalModelCalls);
   const comparison = compareEstimateToActual(estimate, usage);
 
   return (
@@ -62,14 +62,16 @@ export function UsagePanel({
               <th scope="col">Input</th>
               <th scope="col">Cached</th>
               <th scope="col">Output</th>
-              <th scope="col">Calls</th>
+              <th scope="col">Codex runs</th>
+              <th scope="col">Ark turns</th>
+              <th scope="col">Tools</th>
               <th scope="col">Estimated cost</th>
             </tr>
           </thead>
           <tbody>
             {summary.rows.length === 0 ? (
               <tr>
-                <td colSpan={7}>No model usage recorded yet.</td>
+                <td colSpan={9}>No model usage recorded yet.</td>
               </tr>
             ) : (
               summary.rows.map((row) => (
@@ -80,6 +82,8 @@ export function UsagePanel({
                   <td>{formatTokens(row.cachedInputTokens)}</td>
                   <td>{formatTokens(row.outputTokens)}</td>
                   <td>{formatTokens(row.modelCalls)}</td>
+                  <td>{formatTokens(row.arkApiTurns ?? 0)}</td>
+                  <td>{formatTokens(row.toolCalls ?? 0)}</td>
                   <td>
                     {row.estimatedUsd === null
                       ? PRICING_NOT_CONFIGURED
@@ -97,6 +101,8 @@ export function UsagePanel({
               <td>{formatTokens(summary.totalCachedInputTokens)}</td>
               <td>{formatTokens(summary.totalOutputTokens)}</td>
               <td>{formatTokens(summary.totalModelCalls)}</td>
+              <td>{formatTokens(summary.totalArkApiTurns)}</td>
+              <td>{formatTokens(summary.totalToolCalls)}</td>
               <td>
                 {summary.totalEstimatedUsd === null
                   ? PRICING_NOT_CONFIGURED
@@ -164,8 +170,13 @@ export function UsagePanel({
           {counters.verifications} ({counters.failedVerifications} failed)
         </Fact>
         <Fact term="Artifacts">{counters.artifacts}</Fact>
+        <Fact term="Codex executions">{summary.totalModelCalls}</Fact>
+        <Fact term="Completed Ark turns">{summary.totalArkApiTurns}</Fact>
+        <Fact term="Tool calls">{summary.totalToolCalls}</Fact>
+        <Fact term="Stream retries observed">{summary.totalStreamRetries}</Fact>
+        <Fact term="Peak request context">{formatTokens(summary.peakContextTokens)} tokens</Fact>
         <Fact term="Stale refreshes">{counters.staleRefreshes}</Fact>
-        <Fact term="Wall clock">{formatDuration(elapsedMs)}</Fact>
+        <Fact term="Elapsed time">{formatDuration(elapsedMs)} · informational only</Fact>
       </dl>
     </section>
   );

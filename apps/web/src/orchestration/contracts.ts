@@ -41,7 +41,9 @@ export interface BudgetPolicy {
   maxSteps: number;
   maxWorkerAttempts: number;
   maxContextExpansionsPerTask: number;
-  maxWallClockMs: number;
+  maxArkApiTurns?: number;
+  maxArkApiTurnsPerExecution?: number;
+  maxInputTokensPerExecution?: number;
 }
 
 export interface CostEstimate {
@@ -75,6 +77,10 @@ export interface UsageRole {
   outputTokens: number;
   estimatedUsd: number | null;
   modelCalls: number;
+  arkApiTurns?: number;
+  toolCalls?: number;
+  streamRetries?: number;
+  peakContextTokens?: number;
 }
 
 export interface UsageLedger {
@@ -84,6 +90,10 @@ export interface UsageLedger {
   totalOutputTokens: number;
   totalEstimatedUsd: number | null;
   pricingStatus: "configured" | "unknown";
+  totalArkApiTurns?: number;
+  totalToolCalls?: number;
+  totalStreamRetries?: number;
+  peakContextTokens?: number;
 }
 
 export interface OrchestrationSummary {
@@ -184,10 +194,12 @@ export interface WorkerAttempt {
   contextFileHashes: string[];
   status: string;
   changedFiles: string[];
-  usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number };
+  usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number; arkApiTurns?: number; toolCalls?: number; streamRetries?: number; peakContextTokens?: number };
   errorSummary: string | null;
   createdAt: string;
   completedAt: string | null;
+  threadId?: string | null;
+  checkpointed?: boolean;
 }
 
 export interface ApplicationMapSummary {

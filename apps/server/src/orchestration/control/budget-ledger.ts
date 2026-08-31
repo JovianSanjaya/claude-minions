@@ -61,7 +61,7 @@ export function actualUsageCost(
   const rate = findPricing(pricing, role, modelId);
   if (!rate) return null;
   return (
-    (usage.inputTokens * rate.inputUsdPerMillion +
+    ((usage.inputTokens - usage.cachedInputTokens) * rate.inputUsdPerMillion +
       usage.cachedInputTokens * rate.cachedInputUsdPerMillion +
       usage.outputTokens * rate.outputUsdPerMillion) /
     1_000_000
@@ -115,7 +115,6 @@ export function decideReservation(
   reservations: readonly StoredReservation[],
   input: ModelCallReservation,
   pricing: readonly ModelPricing[],
-  nowMs: number,
 ): { decision: BudgetDecision; estimatedUsd: number | null } {
   assertCount(input.estimatedInputTokens, "estimatedInputTokens");
   assertCount(input.estimatedOutputTokens, "estimatedOutputTokens");
@@ -141,16 +140,18 @@ export function decideReservation(
     estimatedUsd,
   });
 
-  if (nowMs - Date.parse(orchestration.createdAt) >= orchestration.budget.maxWallClockMs) {
-    return deny("Wall-clock budget exhausted");
-  }
   if (modelCallCount(orchestration) + active.length + 1 > orchestration.budget.maxModelCalls) {
     return deny("Model-call budget exhausted");
   }
   if (
+    orchestration.budget.maxArkApiTurns !== undefined &&
+    (orchestration.usage.totalArkApiTurns ?? 0) >= orchestration.budget.maxArkApiTurns
+  ) {
+    return deny("Ark-turn budget exhausted");
+  }
+  if (
     orchestration.budget.maxInputTokens !== null &&
     orchestration.usage.totalInputTokens +
-      orchestration.usage.totalCachedInputTokens +
       reservedInput +
       input.estimatedInputTokens >
       orchestration.budget.maxInputTokens
@@ -191,6 +192,10 @@ export function commitUsageToDatabase(
   assertCount(actual.inputTokens, "inputTokens");
   assertCount(actual.cachedInputTokens, "cachedInputTokens");
   assertCount(actual.outputTokens, "outputTokens");
+  assertCount(actual.arkApiTurns ?? 0, "arkApiTurns");
+  assertCount(actual.toolCalls ?? 0, "toolCalls");
+  assertCount(actual.streamRetries ?? 0, "streamRetries");
+  assertCount(actual.peakContextTokens ?? 0, "peakContextTokens");
   const reservationIndex = database.reservations.findIndex(
     (entry) => entry.id === reservationId,
   );
@@ -225,11 +230,25 @@ export function commitUsageToDatabase(
         ? null
         : (prior?.estimatedUsd ?? 0) + cost,
     modelCalls: (prior?.modelCalls ?? 0) + 1,
+    arkApiTurns: (prior?.arkApiTurns ?? 0) + (actual.arkApiTurns ?? 0),
+    toolCalls: (prior?.toolCalls ?? 0) + (actual.toolCalls ?? 0),
+    streamRetries: (prior?.streamRetries ?? 0) + (actual.streamRetries ?? 0),
+    peakContextTokens: Math.max(prior?.peakContextTokens ?? 0, actual.peakContextTokens ?? 0),
   };
   orchestration.usage.byRole[reservation.role] = roleUsage;
   orchestration.usage.totalInputTokens += actual.inputTokens;
   orchestration.usage.totalCachedInputTokens += actual.cachedInputTokens;
   orchestration.usage.totalOutputTokens += actual.outputTokens;
+  orchestration.usage.totalArkApiTurns =
+    (orchestration.usage.totalArkApiTurns ?? 0) + (actual.arkApiTurns ?? 0);
+  orchestration.usage.totalToolCalls =
+    (orchestration.usage.totalToolCalls ?? 0) + (actual.toolCalls ?? 0);
+  orchestration.usage.totalStreamRetries =
+    (orchestration.usage.totalStreamRetries ?? 0) + (actual.streamRetries ?? 0);
+  orchestration.usage.peakContextTokens = Math.max(
+    orchestration.usage.peakContextTokens ?? 0,
+    actual.peakContextTokens ?? 0,
+  );
   if (orchestration.usage.totalEstimatedUsd === null || cost === null) {
     orchestration.usage.totalEstimatedUsd = null;
     orchestration.usage.pricingStatus = "unknown";

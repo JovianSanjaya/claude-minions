@@ -17,6 +17,7 @@ import type {
   WorkerAttempt,
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
+import { RunnerExecutionError } from "../../errors.js";
 import { ContextAwareExecutionDriver } from "./driver.js";
 
 const temporary: string[] = [];
@@ -59,6 +60,15 @@ const intent = {
   },
 };
 
+type RecordedCall = {
+  taskId: string | undefined;
+  sandboxMode: string | undefined;
+  runtimeProfile: string | undefined;
+  role: string | undefined;
+  prompt: string;
+  threadId: string | null | undefined;
+};
+
 function orchestration(workspace: string): Orchestration {
   return {
     id: "orchestration-1", agentId: "agent-1", prompt: "Add A and B",
@@ -68,7 +78,7 @@ function orchestration(workspace: string): Orchestration {
     budget: {
       maxInputTokens: 1_000_000, maxOutputTokens: 100_000, maxEstimatedUsd: null,
       maxModelCalls: 100, maxSteps: 100, maxWorkerAttempts: 2,
-      maxContextExpansionsPerTask: 2, maxWallClockMs: 60_000,
+      maxContextExpansionsPerTask: 2,
     },
     usage: { byRole: {}, totalInputTokens: 0, totalCachedInputTokens: 0, totalOutputTokens: 0, totalEstimatedUsd: null, pricingStatus: "unknown" },
     finalOutput: null, error: null, createdAt: new Date().toISOString(),
@@ -90,31 +100,37 @@ function contract(): ExecutionContract {
 
 function fakeRunner(
   failWorkers = false,
-  calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; runtimeProfile: string | undefined; role: string | undefined; prompt: string }> = [],
+  calls: RecordedCall[] = [],
   badPreflightOnce = false,
   failAcceptance = false,
   includePostReleaseAcceptance = false,
   allowNoChangeDirect = false,
   recoveryAction: "retry-direct" | "retry-worker" | "retry-integrator" | "retry-verifier" | "needs-user" | "stop" = "stop",
   firstPlanAllowedPath: string | null = null,
+  firstWorkerBudgetBoundary = false,
+  firstPlanOversizedTask = false,
+  firstWorkerGracefulCheckpoint = false,
 ): AgentRunner {
   const rejectedPreflights = new Set<string>();
   let recoveryApplied = false;
   let acceptanceCalls = 0;
   let planningResponses = 0;
+  let workerBudgetBoundaryRaised = false;
+  let workerGracefulCheckpointRaised = false;
   return {
     async run(request) {
-      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt });
+      calls.push({ taskId: request.taskId, sandboxMode: request.sandboxMode, runtimeProfile: request.runtimeProfile, role: request.role, prompt: request.prompt, threadId: request.threadId });
       let output: string;
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
       } else if (
         request.prompt.includes("Create a bounded coding plan") ||
-        (firstPlanAllowedPath !== null && request.prompt.includes("Invalid output to repair"))
+        ((firstPlanAllowedPath !== null || firstPlanOversizedTask) && request.prompt.includes("Invalid output to repair"))
       ) {
         const firstTaskAllowedPath = planningResponses === 0 && firstPlanAllowedPath
           ? firstPlanAllowedPath
           : "src/a.ts";
+        const returnOversizedTask = firstPlanOversizedTask && planningResponses === 0;
         planningResponses += 1;
         const acceptanceTests = [
           { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
@@ -133,11 +149,15 @@ function fakeRunner(
           });
         }
         output = JSON.stringify({
-          coupling: "LOW", estimatedCalls: "8", estimatedContextTokens: "1000",
-          tasks: [
-            { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
-            { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"] },
-          ],
+          coupling: "LOW", estimatedCalls: "8",
+          estimatedArkApiTurns: returnOversizedTask ? 60 : 10,
+          estimatedContextTokens: "1000",
+          tasks: returnOversizedTask
+            ? [{ title: "Build everything", objective: "Build A and B in one oversized task", dependsOn: [], allowedPaths: ["src/a.ts", "src/b.ts"], acceptanceCriterionIds: ["c1", "c2"], requiredArtifactIds: [], estimatedArkApiTurns: 60, estimatedInputTokens: 3_000_000 }]
+            : [
+                { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: [firstTaskAllowedPath], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000, explanatoryNote: "safe unknown field" },
+                { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"], estimatedArkApiTurns: 5, estimatedInputTokens: 40_000 },
+              ],
           acceptanceTests,
         });
       } else if (request.prompt.includes("Produce a read-only worker preflight")) {
@@ -172,23 +192,56 @@ function fakeRunner(
         output = "Applied big-model Direct recovery";
       } else if (request.prompt.includes("Implement only this confirmed task")) {
         const isA = request.prompt.includes("Task: Add A");
-        if (!failWorkers) {
+        let gracefulCheckpointThisCall = false;
+        if (firstWorkerGracefulCheckpoint && isA && !workerGracefulCheckpointRaised) {
+          workerGracefulCheckpointRaised = true;
+          gracefulCheckpointThisCall = true;
+          await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
+          await writeFile(path.join(request.workspacePath, "src/a.ts"), "export const a = 0;\n");
+          output = JSON.stringify({
+            summary: "Saved the first coherent implementation milestone",
+            diagnosis: "",
+            completed: false,
+            remainingWork: "Finish module A and return the final artifact",
+            artifacts: [],
+          });
+        } else if (firstWorkerBudgetBoundary && isA && !workerBudgetBoundaryRaised) {
+          workerBudgetBoundaryRaised = true;
+          await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
+          await writeFile(path.join(request.workspacePath, "src/a.ts"), "export const a = 0;\n");
+          throw new RunnerExecutionError(
+            "Per-execution input-token limit exceeded (250000/250000)",
+            {
+              threadId: "heavy-worker-thread",
+              usage: {
+                inputTokens: 250_000,
+                cachedInputTokens: 220_000,
+                outputTokens: 4_000,
+                arkApiTurns: 12,
+                toolCalls: 12,
+              },
+              output: null,
+            },
+          );
+        } else if (!failWorkers) {
           await mkdir(path.join(request.workspacePath, "src"), { recursive: true });
           await writeFile(
             path.join(request.workspacePath, isA ? "src/a.ts" : "src/b.ts"),
             isA ? "export const a = 1;\n" : "export const b = 2;\n",
           );
         }
-        output = JSON.stringify({
-          summary: isA ? "Added A" : "Added B",
-          diagnosis: failWorkers ? "implementation incomplete" : "",
-          artifacts: isA
-            ? [
-                { id: "api-contract", kind: "api", name: "API contract", payload: "v1" },
-                { id: "api-contract", kind: "api", name: "API contract", payload: "v2" },
-              ]
-            : [],
-        });
+        if (!gracefulCheckpointThisCall) {
+          output = JSON.stringify({
+            summary: isA ? "Added A" : "Added B",
+            diagnosis: failWorkers ? "implementation incomplete" : "",
+            artifacts: isA
+              ? [
+                  { id: "api-contract", kind: "api", name: "API contract", payload: "v1" },
+                  { id: "api-contract", kind: "api", name: "API contract", payload: "v2" },
+                ]
+              : [],
+          });
+        }
       } else if (request.prompt.includes("Diagnose this compact failure packet")) {
         output = JSON.stringify({ classification: "implementation-bug", outcome: "stop", reason: "Worker failed after bounded retries" });
       } else if (request.prompt.includes("Act as the big-model supervisor for a smaller implementation worker")) {
@@ -261,6 +314,9 @@ async function setup(
   allowNoChangeDirect = false,
   recoveryAction: "retry-direct" | "retry-worker" | "retry-integrator" | "retry-verifier" | "needs-user" | "stop" = "stop",
   firstPlanAllowedPath: string | null = null,
+  firstWorkerBudgetBoundary = false,
+  firstPlanOversizedTask = false,
+  firstWorkerGracefulCheckpoint = false,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "engine-driver-"));
   temporary.push(root);
@@ -277,7 +333,7 @@ async function setup(
         : "expected task file missing",
     };
   };
-  const calls: Array<{ taskId: string | undefined; sandboxMode: string | undefined; runtimeProfile: string | undefined; role: string | undefined; prompt: string }> = [];
+  const calls: RecordedCall[] = [];
   const driver = new ContextAwareExecutionDriver({
     runner: fakeRunner(
       failWorkers,
@@ -288,6 +344,9 @@ async function setup(
       allowNoChangeDirect,
       recoveryAction,
       firstPlanAllowedPath,
+      firstWorkerBudgetBoundary,
+      firstPlanOversizedTask,
+      firstWorkerGracefulCheckpoint,
     ),
     models: { planner: "strong", worker: "cheap", verifier: "verify", integrator: "strong" },
     runtimeHomeRoot: path.join(root, "homes"), tempRoot: path.join(root, "temp"),
@@ -331,7 +390,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     });
     expect(
       sink.artifacts
-        .filter((artifact) => !artifact.name.startsWith("Planner acceptance test:"))
+        .filter((artifact) => artifact.id === "api-contract")
         .map((artifact) => artifact.version),
     ).toEqual([1, 2]);
     expect(sink.events.map((event) => event.type)).toEqual(
@@ -373,6 +432,95 @@ describe("ContextAwareExecutionDriver acceptance", () => {
       expect(taskCalls.findIndex((call) => call.sandboxMode === "read-only"))
         .toBeLessThan(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write"));
     }
+  });
+
+  it("continues a token-limited worker from its checkpoint in a fresh Codex thread", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null, true,
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    item.budget.maxWorkerAttempts = 1;
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, signal);
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    const taskA = plan.tasks.find((task) => task.title === "Add A")!;
+    const workerCalls = calls.filter((call) =>
+      call.taskId === taskA.id && call.prompt.includes("Implement only this confirmed task")
+    );
+    expect(workerCalls).toHaveLength(2);
+    expect(workerCalls[0]?.threadId ?? null).toBeNull();
+    expect(workerCalls[1]?.threadId ?? null).toBeNull();
+    expect(workerCalls[1]?.prompt).toContain("Checkpointed workspace summary");
+    expect(workerCalls[1]?.prompt).toContain("Task: Add A");
+    expect(sink.attempts).toContainEqual(expect.objectContaining({
+      taskId: taskA.id,
+      status: "checkpointed",
+      usage: expect.objectContaining({ inputTokens: 250_000 }),
+    }));
+    expect(sink.attempts.filter((attempt) => attempt.taskId === taskA.id).map((attempt) => attempt.number))
+      .toEqual([1, 1, 1, 1]);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "worker-compact-continuation",
+      metadata: expect.objectContaining({
+        resumesThread: false,
+        budgetBoundary: true,
+      }),
+    }));
+  });
+
+  it("accepts a graceful worker checkpoint as a continuation segment instead of a failed retry", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null, false, false, true,
+    );
+    const sink = new Sink();
+    const item = orchestration(workspace);
+    item.budget.maxWorkerAttempts = 1;
+    const signal = new AbortController().signal;
+    const plan = await driver.plan({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, signal);
+    const outcome = await driver.execute({
+      orchestration: item,
+      contract: contract(),
+      workspacePath: workspace,
+      plan,
+    }, sink, signal);
+
+    expect(outcome.kind).toBe("completed");
+    const taskA = plan.tasks.find((task) => task.title === "Add A")!;
+    const workerCalls = calls.filter((call) =>
+      call.taskId === taskA.id && call.prompt.includes("Implement only this confirmed task")
+    );
+    expect(workerCalls).toHaveLength(2);
+    expect(workerCalls[1]?.threadId ?? null).toBeNull();
+    expect(sink.attempts).toContainEqual(expect.objectContaining({
+      taskId: taskA.id,
+      status: "checkpointed",
+      errorSummary: null,
+    }));
+    expect(sink.attempts.filter((attempt) => attempt.taskId === taskA.id).map((attempt) => attempt.number))
+      .toEqual([1, 1, 1, 1]);
+    expect(sink.events).toContainEqual(expect.objectContaining({
+      type: "worker-compact-continuation",
+      metadata: expect.objectContaining({
+        resumesThread: false,
+        graceful: true,
+      }),
+    }));
   });
 
   it("plans against the model calls remaining after prior planning usage", async () => {
@@ -453,6 +601,46 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(plannerCalls[1]?.prompt).toContain("Invalid output to repair");
   });
 
+  it("repairs overlapping worker ownership instead of combining the plan into one oversized worker", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", "src",
+    );
+    const sink = new Sink();
+    const plan = await driver.plan({
+      orchestration: orchestration(workspace),
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    expect(plan.selectedMode).toBe("multi-worker");
+    expect(plan.tasks).toHaveLength(2);
+    expect(plan.tasks.map((task) => task.title)).toEqual(["Add A", "Add B"]);
+    expect(plan.tasks.some((task) => task.title === "Focused combined worker")).toBe(false);
+    const plannerCalls = calls.filter((call) => call.role === "planner");
+    expect(plannerCalls).toHaveLength(2);
+    expect(plannerCalls[1]?.prompt).toContain("Worker allowedPaths overlap");
+    expect(plannerCalls[1]?.prompt).toContain("Give every writable path exactly one owner");
+  });
+
+  it("repairs a task that cannot fit within its bounded continuation capacity", async () => {
+    const { workspace, driver, calls } = await setup(
+      false, false, false, false, false, false, "stop", null, false, true,
+    );
+    const sink = new Sink();
+    const plan = await driver.plan({
+      orchestration: orchestration(workspace),
+      contract: contract(),
+      workspacePath: workspace,
+    }, sink, new AbortController().signal);
+
+    expect(plan.selectedMode).toBe("multi-worker");
+    expect(plan.tasks.map((task) => task.title)).toEqual(["Add A", "Add B"]);
+    const plannerCalls = calls.filter((call) => call.role === "planner");
+    expect(plannerCalls).toHaveLength(2);
+    expect(plannerCalls[1]?.prompt).toContain("Split it into bounded tasks");
+    expect(plannerCalls[1]?.prompt).toContain("3000000 cumulative input tokens");
+  });
+
   it("defers post-release effects without sending them to the release verifier", async () => {
     const { workspace, driver, calls } = await setup(false, false, false, false, true);
     const sink = new Sink();
@@ -510,7 +698,7 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     expect(sink.events.some((event) => event.type === "verified-publish")).toBe(false);
   });
 
-  it("corrects one out-of-scope preflight before any writable worker call", async () => {
+  it("uses deterministic bounded preflight without spending worker model calls", async () => {
     const { workspace, driver, calls } = await setup(false, false, true);
     const sink = new Sink();
     const item = orchestration(workspace);
@@ -518,12 +706,10 @@ describe("ContextAwareExecutionDriver acceptance", () => {
     const plan = await driver.plan({ orchestration: item, contract: contract(), workspacePath: workspace }, sink, signal);
     const outcome = await driver.execute({ orchestration: item, contract: contract(), workspacePath: workspace, plan }, sink, signal);
     expect(outcome.kind).toBe("completed");
-    expect(sink.events.some((event) => event.type === "preflight-correction-requested")).toBe(true);
-    for (const task of plan.tasks) {
-      const taskCalls = calls.filter((call) => call.taskId === task.id);
-      expect(taskCalls.filter((call) => call.sandboxMode === "read-only").length).toBeGreaterThanOrEqual(2);
-      expect(taskCalls.findIndex((call) => call.sandboxMode === "workspace-write")).toBeGreaterThan(1);
-    }
+    expect(sink.events.some((event) => event.type === "preflight-reviewed" && event.metadata.deterministic === true)).toBe(true);
+    const modelPreflights = calls.filter((call) => call.prompt.includes("Produce a read-only worker preflight"));
+    expect(modelPreflights).toHaveLength(2);
+    expect(calls.filter((call) => call.sandboxMode === "workspace-write").length).toBeGreaterThanOrEqual(plan.tasks.length);
   });
 
   it("blocks publication when trusted global verification fails", async () => {

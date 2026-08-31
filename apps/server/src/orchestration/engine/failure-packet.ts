@@ -13,6 +13,7 @@ export type FailureClassification =
   | "invalid-plan"
   | "ambiguous-contract"
   | "suspected-bad-check"
+  | "infrastructure-failure"
   | "budget-exhaustion";
 
 export function createFailurePacket(input: {
@@ -30,21 +31,22 @@ export function createFailurePacket(input: {
     taskId: input.taskId,
     contractVersion: input.contractVersion,
     attemptCount: input.attemptCount,
-    lastError: input.error.slice(0, 2_000),
+    lastError: input.error.slice(0, 1_200),
     failingChecks: input.verifications
       .filter((record) => record.status === "failed")
-      .map((record) => `${record.commandOrCheck}: ${record.outputSummary.slice(0, 500)}`)
-      .slice(0, 20),
-    changedFiles: [...input.changes.changedFiles, ...input.changes.deletedFiles].slice(0, 200),
+      .map((record) => `${record.commandOrCheck}: ${record.outputSummary.slice(0, 300)}`)
+      .slice(0, 12),
+    changedFiles: [...input.changes.changedFiles, ...input.changes.deletedFiles].slice(0, 100),
     diffSummary: `${input.changes.changedFiles.length} changed, ${input.changes.deletedFiles.length} deleted`,
-    relevantInterfaces: input.relevantInterfaces.slice(0, 100),
-    workerDiagnosis: input.diagnosis.slice(0, 2_000),
+    relevantInterfaces: input.relevantInterfaces.slice(0, 50),
+    workerDiagnosis: input.diagnosis.slice(0, 1_000),
     usage: input.usage,
   };
 }
 
 export function classifyFailure(packet: FailurePacket): FailureClassification {
   const text = `${packet.lastError} ${packet.workerDiagnosis} ${packet.failingChecks.join(" ")}`.toLowerCase();
+  if (/argument list too long|\be2big\b|\/sbin\/docker-init/.test(text)) return "infrastructure-failure";
   if (/budget|token|cost|call limit|time limit/.test(text)) return "budget-exhaustion";
   if (/missing context|not found|cannot find module/.test(text)) return "missing-context";
   if (/stale|version|schema mismatch/.test(text)) return "stale-dependency";

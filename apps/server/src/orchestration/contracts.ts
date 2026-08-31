@@ -31,6 +31,10 @@ export interface TokenUsage {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+  arkApiTurns?: number;
+  toolCalls?: number;
+  streamRetries?: number;
+  peakContextTokens?: number;
 }
 
 export interface RoleUsage extends TokenUsage {
@@ -46,6 +50,10 @@ export interface UsageLedger {
   totalOutputTokens: number;
   totalEstimatedUsd: number | null;
   pricingStatus: "configured" | "unknown";
+  totalArkApiTurns?: number;
+  totalToolCalls?: number;
+  totalStreamRetries?: number;
+  peakContextTokens?: number;
 }
 
 export interface BudgetPolicy {
@@ -56,7 +64,9 @@ export interface BudgetPolicy {
   maxSteps: number;
   maxWorkerAttempts: number;
   maxContextExpansionsPerTask: number;
-  maxWallClockMs: number;
+  maxArkApiTurns?: number;
+  maxArkApiTurnsPerExecution?: number;
+  maxInputTokensPerExecution?: number;
 }
 
 export interface CostEstimate {
@@ -188,11 +198,13 @@ export interface WorkerAttempt {
   modelId: string;
   contextFileHashes: string[];
   changedFiles: string[];
-  status: "running" | "passed" | "failed" | "cancelled";
+  status: "running" | "checkpointed" | "passed" | "failed" | "cancelled";
   usage: TokenUsage;
   errorSummary: string | null;
   createdAt: string;
   completedAt: string | null;
+  threadId?: string | null;
+  checkpointed?: boolean;
 }
 
 export interface FailurePacket {

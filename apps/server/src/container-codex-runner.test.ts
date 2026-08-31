@@ -22,6 +22,9 @@ describe("Container Codex runner", () => {
       expect(contents).toContain('model_reasoning_effort = "low"');
       expect(contents).toContain('model_reasoning_summary = "none"');
       expect(contents).toContain("model_supports_reasoning_summaries = false");
+      expect(contents).toContain("request_max_retries = 3");
+      expect(contents).toContain("stream_max_retries = 3");
+      expect(contents).toContain("stream_idle_timeout_ms = 180000");
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -58,6 +61,7 @@ describe("Container Codex runner", () => {
       "launchpad-test-instance-execution-unsafe",
     );
     expect(args).toContain("runtime:test");
+    expect(args).toContain("--interactive");
     expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace,readonly");
     expect(args).toContain("type=bind,src=/tmp/role-home,dst=/codex-home");
     expect(args).toContain("501:20");
@@ -141,7 +145,8 @@ describe("Container Codex runner", () => {
       },
       config,
     );
-    expect(args.slice(-3)).toEqual(["resume", "thread-123", "continue"]);
+    expect(args.slice(-3)).toEqual(["resume", "thread-123", "-"]);
+    expect(args).not.toContain("continue");
     expect(args).not.toContain("keep-id");
   });
 });

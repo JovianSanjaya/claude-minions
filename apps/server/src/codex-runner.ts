@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
+import { CodexSessionTelemetryTracker } from "./codex-session-telemetry.js";
 import type { AppConfig } from "./config.js";
 import { writeCodexConfig } from "./config.js";
-import { RunCancelledError } from "./errors.js";
+import { RunCancelledError, RunnerExecutionError } from "./errors.js";
 import type {
   AgentRunner,
   RunUsage,
@@ -73,9 +74,9 @@ export function buildCodexArgs(
   ];
   if (request.modelId && modelOverrideSupported) args.push("--model", request.modelId);
   if (request.threadId) {
-    args.push("resume", request.threadId, request.prompt);
+    args.push("resume", request.threadId, "-");
   } else {
-    args.push(request.prompt);
+    args.push("-");
   }
   return args;
 }
@@ -133,6 +134,7 @@ export class CodexRunner implements AgentRunner {
       cancelled: boolean;
       timedOut: boolean;
       outputExceeded: boolean;
+      budgetExceeded: string | null;
       settled: Promise<void>;
       forceKillTimer: NodeJS.Timeout | null;
     }
@@ -181,7 +183,7 @@ export class CodexRunner implements AgentRunner {
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
       env: this.childEnvironment(request.runtimeHomePath),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     const settled = new Promise<void>((resolve) => {
       child.once("close", () => resolve());
@@ -192,6 +194,7 @@ export class CodexRunner implements AgentRunner {
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
+      budgetExceeded: null as string | null,
       settled,
       forceKillTimer: null as NodeJS.Timeout | null,
     };
@@ -203,6 +206,9 @@ export class CodexRunner implements AgentRunner {
       usage: null,
       errors: [],
     };
+    const telemetryTracker = request.runtimeHomePath
+      ? await CodexSessionTelemetryTracker.create(request.runtimeHomePath)
+      : null;
     const streams = { stdoutBuffer: "", stderrTail: "", stdoutBytes: 0 };
 
     const consume = (chunk: Buffer, target: "stdout" | "stderr") => {
@@ -214,12 +220,31 @@ export class CodexRunner implements AgentRunner {
 
     child.stdout.on("data", (chunk: Buffer) => consume(chunk, "stdout"));
     child.stderr.on("data", (chunk: Buffer) => consume(chunk, "stderr"));
+    child.stdin.on("error", () => undefined);
+    child.stdin.end(request.prompt);
 
     const timeout = setTimeout(() => {
       active.timedOut = true;
       this.terminate(active);
     }, this.config.codexTimeoutMs);
     timeout.unref();
+    let telemetryPolling = false;
+    const telemetryInterval = telemetryTracker && (request.maxArkApiTurns || request.maxInputTokens)
+      ? setInterval(() => {
+          if (telemetryPolling || active.budgetExceeded) return;
+          telemetryPolling = true;
+          void telemetryTracker.poll().then((telemetry) => {
+            if (request.maxArkApiTurns && telemetry.arkApiTurns >= request.maxArkApiTurns) {
+              active.budgetExceeded = `Ark-turn limit exceeded (${telemetry.arkApiTurns}/${request.maxArkApiTurns})`;
+              this.terminate(active);
+            } else if (request.maxInputTokens && telemetry.inputTokens >= request.maxInputTokens) {
+              active.budgetExceeded = `Per-execution input-token limit exceeded (${telemetry.inputTokens}/${request.maxInputTokens})`;
+              this.terminate(active);
+            }
+          }).finally(() => { telemetryPolling = false; });
+        }, 1_000)
+      : null;
+    telemetryInterval?.unref();
 
     try {
       const exitCode = await new Promise<number>((resolve, reject) => {
@@ -229,27 +254,45 @@ export class CodexRunner implements AgentRunner {
       if (streams.stdoutBuffer.trim()) {
         parseCodexEventLine(streams.stdoutBuffer.trim(), parsed);
       }
-      if (active.cancelled) {
-        throw new RunCancelledError();
-      }
+      const telemetry = telemetryTracker ? await telemetryTracker.poll(true) : null;
+      const usage = telemetry && telemetry.arkApiTurns > 0
+        ? {
+            inputTokens: telemetry.inputTokens,
+            cachedInputTokens: telemetry.cachedInputTokens,
+            outputTokens: telemetry.outputTokens,
+            arkApiTurns: telemetry.arkApiTurns,
+            toolCalls: telemetry.toolCalls,
+            streamRetries: telemetry.streamRetries,
+            peakContextTokens: telemetry.peakContextTokens,
+          }
+        : parsed.usage;
+      const partial = {
+        threadId: parsed.threadId,
+        usage,
+        output: parsed.messages.at(-1)?.trim() || null,
+      };
+      if (active.cancelled) throw new RunCancelledError(partial);
       if (active.timedOut) {
-        throw new Error("Codex timed out after " + this.config.codexTimeoutMs + " ms");
+        throw new RunnerExecutionError("Codex timed out after " + this.config.codexTimeoutMs + " ms", partial);
       }
       if (active.outputExceeded) {
-        throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
+        throw new RunnerExecutionError("Codex output exceeded CODEX_MAX_OUTPUT_BYTES", partial);
+      }
+      if (active.budgetExceeded) {
+        throw new RunnerExecutionError(active.budgetExceeded, partial);
       }
       if (exitCode !== 0) {
         const detail = parsed.errors.at(-1) ?? streams.stderrTail.trim() ?? "No error detail";
-        throw new Error("Codex exited with code " + exitCode + ": " + detail);
+        throw new RunnerExecutionError("Codex exited with code " + exitCode + ": " + detail, partial);
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) {
-        throw new Error("Codex completed without an agent message");
+        throw new RunnerExecutionError("Codex completed without an agent message", partial);
       }
       return {
         output,
         threadId: parsed.threadId,
-        usage: parsed.usage,
+        usage,
         modelId:
           request.modelId && this.config.codexModelOverrideSupported
             ? request.modelId
@@ -261,6 +304,7 @@ export class CodexRunner implements AgentRunner {
       };
     } finally {
       clearTimeout(timeout);
+      if (telemetryInterval) clearInterval(telemetryInterval);
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
       this.active.delete(request.executionId);
     }

@@ -80,7 +80,12 @@ const envSchema = z.object({
   ORCHESTRATION_MAX_STEPS: optionalNonNegativeNumber,
   ORCHESTRATION_MAX_WORKER_ATTEMPTS: optionalNonNegativeNumber,
   ORCHESTRATION_MAX_CONTEXT_EXPANSIONS: optionalNonNegativeNumber,
-  ORCHESTRATION_MAX_WALL_CLOCK_MS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_ARK_API_TURNS: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION: optionalNonNegativeNumber,
+  ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION: optionalNonNegativeNumber,
+  ARK_REQUEST_MAX_RETRIES: optionalNonNegativeNumber,
+  ARK_STREAM_MAX_RETRIES: optionalNonNegativeNumber,
+  ARK_STREAM_IDLE_TIMEOUT_MS: optionalNonNegativeNumber,
   ARK_INPUT_USD_PER_MILLION: optionalNonNegativeNumber,
   ARK_CACHED_INPUT_USD_PER_MILLION: optionalNonNegativeNumber,
   ARK_OUTPUT_USD_PER_MILLION: optionalNonNegativeNumber,
@@ -171,13 +176,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       maxSteps: env.ORCHESTRATION_MAX_STEPS ?? 250,
       maxWorkerAttempts: env.ORCHESTRATION_MAX_WORKER_ATTEMPTS ?? 3,
       maxContextExpansionsPerTask: env.ORCHESTRATION_MAX_CONTEXT_EXPANSIONS ?? 3,
-      maxWallClockMs: env.ORCHESTRATION_MAX_WALL_CLOCK_MS ?? 1_800_000,
+      maxArkApiTurns: env.ORCHESTRATION_MAX_ARK_API_TURNS ?? 150,
+      maxArkApiTurnsPerExecution: env.ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION ?? 15,
+      maxInputTokensPerExecution: env.ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION ?? 250_000,
     },
     orchestrationPricing: env.ARK_INPUT_USD_PER_MILLION !== undefined && env.ARK_CACHED_INPUT_USD_PER_MILLION !== undefined && env.ARK_OUTPUT_USD_PER_MILLION !== undefined
       ? (["planner", "worker", "verifier", "integrator"] as const).map((role) => ({ role, modelId: orchestrationModels[role], inputUsdPerMillion: env.ARK_INPUT_USD_PER_MILLION!, cachedInputUsdPerMillion: env.ARK_CACHED_INPUT_USD_PER_MILLION!, outputUsdPerMillion: env.ARK_OUTPUT_USD_PER_MILLION! }))
       : [],
     orchestrationDemoFixture: env.ORCHESTRATION_DEMO_FIXTURE,
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
+    arkRequestMaxRetries: Math.floor(env.ARK_REQUEST_MAX_RETRIES ?? 3),
+    arkStreamMaxRetries: Math.floor(env.ARK_STREAM_MAX_RETRIES ?? 3),
+    arkStreamIdleTimeoutMs: Math.floor(env.ARK_STREAM_IDLE_TIMEOUT_MS ?? 180_000),
     nodeEnv: env.NODE_ENV,
   };
 }
@@ -210,6 +220,9 @@ export async function writeCodexConfig(
     'env_key = "ARK_API_KEY"',
     'wire_api = "responses"',
     "requires_openai_auth = false",
+    "request_max_retries = " + String(config.arkRequestMaxRetries),
+    "stream_max_retries = " + String(config.arkStreamMaxRetries),
+    "stream_idle_timeout_ms = " + String(config.arkStreamIdleTimeoutMs),
     "",
   ].join("\n");
   await writeFile(path.join(targetHome, "config.toml"), toml, {

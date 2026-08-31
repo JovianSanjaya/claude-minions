@@ -259,7 +259,7 @@ describe("OrchestrationControlService", () => {
     expect(service.getOrchestration(created.id).usage.byRole.planner).toMatchObject({ modelCalls: 1 });
     const denied = await service.reserveModelCall({
       orchestrationId: created.id, taskId: null, executionId: "e2", role: "planner",
-      modelId: "planner", estimatedInputTokens: 60, estimatedOutputTokens: 1,
+      modelId: "planner", estimatedInputTokens: 61, estimatedOutputTokens: 1,
     });
     expect(denied).toMatchObject({ allowed: false, reason: "Input-token budget exhausted" });
     expect(service.getOrchestration(created.id).orchestration.status).toBe("budget-exhausted");

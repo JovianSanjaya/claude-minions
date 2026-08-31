@@ -468,7 +468,6 @@ export interface BudgetPolicy {
   maxEstimatedUsd: number | null;
   maxWorkerAttempts: number;
   maxContextExpansionsPerTask: number;
-  maxWallClockMs: number;
 }
 
 export interface CostEstimate {

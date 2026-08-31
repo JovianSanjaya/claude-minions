@@ -7,6 +7,9 @@ describe("orchestration model configuration", () => {
     expect(defaults.orchestrationDefaultBudget).toMatchObject({
       maxInputTokens: null,
       maxOutputTokens: null,
+      maxArkApiTurns: 150,
+      maxArkApiTurnsPerExecution: 15,
+      maxInputTokensPerExecution: 250_000,
     });
 
     const configured = loadConfig({
@@ -17,6 +20,29 @@ describe("orchestration model configuration", () => {
     expect(configured.orchestrationDefaultBudget).toMatchObject({
       maxInputTokens: 2_000_000,
       maxOutputTokens: 500_000,
+    });
+  });
+
+  it("configures bounded Ark transport retries and per-execution limits", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      ARK_REQUEST_MAX_RETRIES: "5",
+      ARK_STREAM_MAX_RETRIES: "7",
+      ARK_STREAM_IDLE_TIMEOUT_MS: "240000",
+      ORCHESTRATION_MAX_ARK_API_TURNS: "300",
+      ORCHESTRATION_MAX_ARK_TURNS_PER_EXECUTION: "12",
+      ORCHESTRATION_MAX_INPUT_TOKENS_PER_EXECUTION: "175000",
+    });
+
+    expect(config).toMatchObject({
+      arkRequestMaxRetries: 5,
+      arkStreamMaxRetries: 7,
+      arkStreamIdleTimeoutMs: 240_000,
+      orchestrationDefaultBudget: {
+        maxArkApiTurns: 300,
+        maxArkApiTurnsPerExecution: 12,
+        maxInputTokensPerExecution: 175_000,
+      },
     });
   });
 

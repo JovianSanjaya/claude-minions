@@ -5,11 +5,13 @@ import type { ApplicationMapSummary } from "../contracts.js";
 
 const excludedNames = new Set([
   ".git", "node_modules", "dist", "build", "coverage", ".next", ".cache",
+  ".npm", ".npm-cache", ".pnpm-store", ".yarn-cache", ".parcel-cache", ".turbo",
   ".codex", ".orchestration", "orchestration-work", "protected-evaluators",
 ]);
 const protectedSecretName = /(?:^|\/)[^/]*(?:private[-_]?key|credential|secret)[^/]*$/i;
 const environmentName = /(?:^|\/)\.env(?:\..*)?$/i;
 const safeEnvironmentTemplateName = /(?:^|\/)\.env\.(?:example|sample|template)$/i;
+const generatedBuildArtifactName = /(?:^|\/)(?:[^/]+\.tsbuildinfo|\.eslintcache)$/i;
 const textExtensions = new Set([
   ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".py",
   ".go", ".rs", ".java", ".kt", ".css", ".scss", ".html", ".yaml", ".yml",
@@ -43,6 +45,7 @@ export function isProtectedEnvironmentPath(relativePath: string): boolean {
 export function isApplicationMapExcluded(relativePath: string): boolean {
   const normalized = relativePath.replaceAll(path.sep, "/");
   return normalized.split("/").some((part) => excludedNames.has(part)) ||
+    generatedBuildArtifactName.test(normalized) ||
     isProtectedEnvironmentPath(normalized) ||
     protectedSecretName.test(normalized);
 }

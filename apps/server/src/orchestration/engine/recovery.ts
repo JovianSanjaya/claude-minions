@@ -44,11 +44,15 @@ export function recoveryEvidence(
       .filter((record) => record.status === "failed")
       .map((record) => ({
         check: record.commandOrCheck,
-        evidence: record.outputSummary.slice(0, 8_000),
+        evidence: record.outputSummary.slice(0, 1_500),
       })),
-  ).slice(0, 80_000);
+  ).slice(0, 24_000);
 }
 
 export function looksUserActionableFailure(value: string): boolean {
   return /permission|operation not permitted|access denied|credential|authentication|authorization|sandbox|user approval|user action|sign[ -]?in/i.test(value);
+}
+
+export function isInternalInfrastructureFailure(value: string): boolean {
+  return /argument list too long|\bE2BIG\b|\/sbin\/docker-init/i.test(value);
 }

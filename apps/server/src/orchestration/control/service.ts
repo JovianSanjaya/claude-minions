@@ -161,7 +161,9 @@ const DEFAULT_BUDGET: BudgetPolicy = {
   maxSteps: 250,
   maxWorkerAttempts: 3,
   maxContextExpansionsPerTask: 3,
-  maxWallClockMs: 30 * 60_000,
+  maxArkApiTurns: 150,
+  maxArkApiTurnsPerExecution: 15,
+  maxInputTokensPerExecution: 250_000,
 };
 
 const MAX_BUDGET: Record<keyof BudgetPolicy, number> = {
@@ -172,7 +174,9 @@ const MAX_BUDGET: Record<keyof BudgetPolicy, number> = {
   maxSteps: 100_000,
   maxWorkerAttempts: 100,
   maxContextExpansionsPerTask: 100,
-  maxWallClockMs: 7 * 24 * 60 * 60_000,
+  maxArkApiTurns: 100_000,
+  maxArkApiTurnsPerExecution: 1_000,
+  maxInputTokensPerExecution: 10_000_000,
 };
 
 const emptyUsage = (pricingConfigured: boolean): Orchestration["usage"] => ({
@@ -182,6 +186,10 @@ const emptyUsage = (pricingConfigured: boolean): Orchestration["usage"] => ({
   totalOutputTokens: 0,
   totalEstimatedUsd: pricingConfigured ? 0 : null,
   pricingStatus: pricingConfigured ? "configured" : "unknown",
+  totalArkApiTurns: 0,
+  totalToolCalls: 0,
+  totalStreamRetries: 0,
+  peakContextTokens: 0,
 });
 
 function boundedBudget(
@@ -728,7 +736,6 @@ export class OrchestrationControlService implements OrchestrationSink {
         database.reservations,
         input,
         this.pricing,
-        this.now().getTime(),
       );
       if (!decision.allowed) {
         this.markBudgetExhausted(orchestration, decision.reason);
@@ -767,8 +774,11 @@ export class OrchestrationControlService implements OrchestrationSink {
       const orchestration = findOrchestration(database, reservation.orchestrationId);
       const budgetReason =
         orchestration.budget.maxInputTokens !== null &&
-        orchestration.usage.totalInputTokens + orchestration.usage.totalCachedInputTokens > orchestration.budget.maxInputTokens
+        orchestration.usage.totalInputTokens > orchestration.budget.maxInputTokens
           ? "Actual input-token usage exceeded the hard budget"
+          : orchestration.budget.maxArkApiTurns !== undefined &&
+              (orchestration.usage.totalArkApiTurns ?? 0) > orchestration.budget.maxArkApiTurns
+            ? "Actual Ark-turn usage exceeded the hard budget"
           : orchestration.budget.maxOutputTokens !== null && orchestration.usage.totalOutputTokens > orchestration.budget.maxOutputTokens
             ? "Actual output-token usage exceeded the hard budget"
             : orchestration.budget.maxEstimatedUsd !== null &&
@@ -784,6 +794,10 @@ export class OrchestrationControlService implements OrchestrationSink {
           inputTokens: actual.inputTokens,
           cachedInputTokens: actual.cachedInputTokens,
           outputTokens: actual.outputTokens,
+          arkApiTurns: actual.arkApiTurns ?? 0,
+          toolCalls: actual.toolCalls ?? 0,
+          streamRetries: actual.streamRetries ?? 0,
+          peakContextTokens: actual.peakContextTokens ?? 0,
         }, reservation.taskId, reservation.executionId, reservation.role, reservation.modelId),
       );
     });

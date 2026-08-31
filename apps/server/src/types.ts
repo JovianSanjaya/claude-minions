@@ -28,6 +28,10 @@ export interface RunUsage {
   inputTokens?: number;
   cachedInputTokens?: number;
   outputTokens?: number;
+  arkApiTurns?: number;
+  toolCalls?: number;
+  streamRetries?: number;
+  peakContextTokens?: number;
 }
 
 export interface AgentRun {
@@ -83,6 +87,8 @@ export interface RunnerRequest {
   runtimeHomePath?: string | undefined;
   sandboxMode?: "read-only" | "workspace-write" | undefined;
   runtimeProfile?: "default" | "verification" | undefined;
+  maxArkApiTurns?: number | undefined;
+  maxInputTokens?: number | undefined;
 }
 
 export interface AgentRunner {

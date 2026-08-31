@@ -66,6 +66,10 @@ const tokenUsageSchema = z.object({
   inputTokens: finiteNonNegative,
   cachedInputTokens: finiteNonNegative,
   outputTokens: finiteNonNegative,
+  arkApiTurns: finiteNonNegative.optional(),
+  toolCalls: finiteNonNegative.optional(),
+  streamRetries: finiteNonNegative.optional(),
+  peakContextTokens: finiteNonNegative.optional(),
 });
 const roleUsageSchema = tokenUsageSchema.extend({
   modelId: z.string(),
@@ -79,6 +83,10 @@ const usageSchema = z.object({
   totalOutputTokens: finiteNonNegative,
   totalEstimatedUsd: nullableLimit,
   pricingStatus: z.enum(["configured", "unknown"]),
+  totalArkApiTurns: finiteNonNegative.optional(),
+  totalToolCalls: finiteNonNegative.optional(),
+  totalStreamRetries: finiteNonNegative.optional(),
+  peakContextTokens: finiteNonNegative.optional(),
 });
 const orchestrationSchema = z.object({
   id: z.string().min(1),
@@ -120,7 +128,9 @@ const orchestrationSchema = z.object({
     maxSteps: finiteNonNegative,
     maxWorkerAttempts: finiteNonNegative,
     maxContextExpansionsPerTask: finiteNonNegative,
-    maxWallClockMs: finiteNonNegative,
+    maxArkApiTurns: finiteNonNegative.optional(),
+    maxArkApiTurnsPerExecution: finiteNonNegative.optional(),
+    maxInputTokensPerExecution: finiteNonNegative.optional(),
   }),
   usage: usageSchema,
   finalOutput: z.string().nullable(),
@@ -181,8 +191,9 @@ const attemptSchema = z.object({
   id: z.string().min(1), orchestrationId: z.string().min(1), taskId: z.string(),
   number: finiteNonNegative, executionId: z.string(), modelId: z.string(),
   contextFileHashes: z.array(z.string()), changedFiles: z.array(z.string()),
-  status: z.enum(["running", "passed", "failed", "cancelled"]), usage: tokenUsageSchema,
+  status: z.enum(["running", "checkpointed", "passed", "failed", "cancelled"]), usage: tokenUsageSchema,
   errorSummary: z.string().nullable(), createdAt: z.string(), completedAt: z.string().nullable(),
+  threadId: z.string().nullable().optional(), checkpointed: z.boolean().optional(),
 });
 const artifactSchema = z.object({
   id: z.string().min(1), orchestrationId: z.string().min(1), producerTaskId: z.string(),

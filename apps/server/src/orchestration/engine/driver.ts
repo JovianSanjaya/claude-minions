@@ -14,6 +14,7 @@ import type {
   PlanInput,
   PlanResult,
   TokenUsage,
+  VerificationRecord,
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
 import {
@@ -31,6 +32,7 @@ import { ContextBroker } from "./context-broker.js";
 import { classifyFailure } from "./failure-packet.js";
 import { DeterministicIntegrator, type IntegrationCandidate } from "./integrator.js";
 import {
+  isInternalInfrastructureFailure,
   looksUserActionableFailure,
   recoveryDecisionSchema,
   recoveryEvidence,
@@ -39,7 +41,12 @@ import {
 import { RoleExecutor, type RoleModelConfiguration } from "./role-executor.js";
 import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
-import { BoundedWorkerLoop, type WorkerLoopResult, WorkerLoopError } from "./worker-loop.js";
+import {
+  BoundedWorkerLoop,
+  type WorkerLoopResult,
+  WorkerLoopError,
+  workerContinuationSegmentLimit,
+} from "./worker-loop.js";
 import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
 
 const clarificationQuestionSchema = z.object({
@@ -97,9 +104,16 @@ const allowedPathSchema = z.string().min(1).max(500).superRefine((value, context
   if (problem) context.addIssue({ code: "custom", message: problem });
 });
 
-const planSchema = (maximumEstimatedCalls: number) => z.object({
+const planSchema = (
+  maximumEstimatedCalls: number,
+  maximumEstimatedArkTurns: number,
+  maximumTaskArkTurns: number,
+  maximumTaskInputTokens: number,
+) => z.object({
   coupling: z.preprocess((value) => typeof value === "string" ? value.toLowerCase() : value, z.enum(["low", "medium", "high"])),
   estimatedCalls: z.coerce.number().int().positive().max(maximumEstimatedCalls),
+  estimatedArkApiTurns: z.coerce.number().int().positive().max(maximumEstimatedArkTurns)
+    .default(Math.min(10, maximumEstimatedArkTurns)),
   estimatedContextTokens: z.coerce.number().int().nonnegative(),
   tasks: z.array(z.object({
     title: z.string().min(1).max(500),
@@ -108,15 +122,67 @@ const planSchema = (maximumEstimatedCalls: number) => z.object({
     allowedPaths: z.array(allowedPathSchema).min(1).max(100),
     acceptanceCriterionIds: z.array(z.string().max(200)).max(100).default([]),
     requiredArtifactIds: z.array(z.string().max(200)).max(100).default([]),
+    estimatedArkApiTurns: z.coerce.number().int().positive().optional(),
+    estimatedInputTokens: z.coerce.number().int().positive().optional(),
   })).min(1).max(20),
   acceptanceTests: z.array(plannedAcceptanceTestSchema).max(200).default([]),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.tasks.length > 1 && tasksHaveOverlappingWriteScopes(value.tasks)) {
+    context.addIssue({
+      code: "custom",
+      path: ["tasks"],
+      message: "Worker allowedPaths overlap. Give every writable path exactly one owner, assign shared root files to a foundation task, and express ordering with dependsOn.",
+    });
+  }
+  const defaultTurns = Math.ceil(value.estimatedArkApiTurns / value.tasks.length);
+  const contextPerTask = Math.max(1, Math.ceil(value.estimatedContextTokens / value.tasks.length));
+  value.tasks.forEach((task, index) => {
+    const estimatedTurns = task.estimatedArkApiTurns ?? defaultTurns;
+    const estimatedInput = task.estimatedInputTokens ?? contextPerTask * estimatedTurns;
+    if (estimatedTurns > maximumTaskArkTurns) {
+      context.addIssue({
+        code: "custom",
+        path: ["tasks", index, "estimatedArkApiTurns"],
+        message: `Task requires about ${estimatedTurns} Ark turns but its ${maximumTaskArkTurns}-turn continuation capacity is smaller. Split it into dependency-ordered tasks with exclusive paths.`,
+      });
+    }
+    if (estimatedInput > maximumTaskInputTokens) {
+      context.addIssue({
+        code: "custom",
+        path: ["tasks", index, "estimatedInputTokens"],
+        message: `Task requires about ${estimatedInput} cumulative input tokens but its ${maximumTaskInputTokens}-token continuation capacity is smaller. Split it into bounded tasks.`,
+      });
+    }
+  });
+  const explicitTaskTurns = value.tasks.reduce(
+    (total, task) => total + (task.estimatedArkApiTurns ?? 0),
+    0,
+  );
+  if (
+    value.tasks.every((task) => task.estimatedArkApiTurns !== undefined) &&
+    explicitTaskTurns > value.estimatedArkApiTurns
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["estimatedArkApiTurns"],
+      message: "Top-level estimatedArkApiTurns must cover the sum of all task estimates plus verification and recovery.",
+    });
+  }
+});
 
 const MAXIMUM_PLANNER_RESPONSE_CALLS = 2;
+const MAXIMUM_PLANNER_ARK_TURN_RESERVE = 4;
 
 function consumedModelCalls(orchestration: Orchestration): number {
   return Object.values(orchestration.usage.byRole).reduce(
     (total, usage) => total + (usage?.modelCalls ?? 0),
+    0,
+  );
+}
+
+function consumedArkApiTurns(orchestration: Orchestration): number {
+  return orchestration.usage.totalArkApiTurns ?? Object.values(orchestration.usage.byRole).reduce(
+    (total, usage) => total + (usage?.arkApiTurns ?? 0),
     0,
   );
 }
@@ -164,6 +230,7 @@ export interface EngineDriverOptions {
   id?: () => string;
   clock?: () => Date;
   modelCallTimeoutMs?: number;
+  modelTransportMaxRetries?: number;
 }
 
 function zeroUsage(): TokenUsage {
@@ -174,6 +241,10 @@ const addUsage = (left: TokenUsage, right: TokenUsage): TokenUsage => ({
   inputTokens: left.inputTokens + right.inputTokens,
   cachedInputTokens: left.cachedInputTokens + right.cachedInputTokens,
   outputTokens: left.outputTokens + right.outputTokens,
+  arkApiTurns: (left.arkApiTurns ?? 0) + (right.arkApiTurns ?? 0),
+  toolCalls: (left.toolCalls ?? 0) + (right.toolCalls ?? 0),
+  streamRetries: (left.streamRetries ?? 0) + (right.streamRetries ?? 0),
+  peakContextTokens: Math.max(left.peakContextTokens ?? 0, right.peakContextTokens ?? 0),
 });
 
 type IncompleteExecutionOutcome = Exclude<ExecutionOutcome, { kind: "completed" }>;
@@ -240,6 +311,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     signal: AbortSignal,
   ): Promise<{ draft: IntentDraft; estimate: CostEstimate }> {
     const roles = this.roles(input.orchestrationId, sink);
+    const intentMap = await buildApplicationMap(
+      input.workspacePath,
+      input.orchestrationId,
+      0,
+      this.now(),
+    );
     const result = await roles.structured(
       {
         orchestrationId: input.orchestrationId,
@@ -254,6 +331,11 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Requested mode: ${input.requestedMode}`,
           `Hard budget: ${JSON.stringify(input.budget)}`,
           `User prompt: ${input.prompt}`,
+          `Deterministic workspace summary: ${JSON.stringify({
+            summary: intentMap.summary.summary,
+            files: intentMap.entries.slice(0, 120).map((entry) => ({ path: entry.path, summary: entry.summary })),
+          })}`,
+          "Use only the supplied request and deterministic workspace summary. Do not call tools or inspect files during intent elaboration.",
           "Return goal, requirements, assumptions, nonGoals, architectureDecisions, materialQuestions, manualExpectations, and estimate.",
           "Each materialQuestions item should be an object with prompt, consequenceIfWrong, and 2-6 options.",
           "Each option needs label, resolutionText, and delegate. Include one delegate=true recommended default.",
@@ -293,11 +375,26 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           - MAXIMUM_PLANNER_RESPONSE_CALLS,
       ),
     );
+    const alreadyConsumedArkApiTurns = consumedArkApiTurns(input.orchestration);
+    const availableExecutionArkApiTurns = Math.max(
+      0,
+      (input.orchestration.budget.maxArkApiTurns ?? 150) -
+        alreadyConsumedArkApiTurns -
+        MAXIMUM_PLANNER_ARK_TURN_RESERVE,
+    );
     if (availableExecutionModelCalls < 1) {
       throw new Error(
         "No model-call budget remains for execution after reserving the bounded planning call",
       );
     }
+    if (availableExecutionArkApiTurns < 1) {
+      throw new Error("No Ark-turn budget remains for execution after reserving the bounded planning pass");
+    }
+    const maximumWorkerSegments = workerContinuationSegmentLimit(input.orchestration.budget);
+    const maximumTaskArkTurns =
+      (input.orchestration.budget.maxArkApiTurnsPerExecution ?? 15) * maximumWorkerSegments;
+    const maximumTaskInputTokens =
+      (input.orchestration.budget.maxInputTokensPerExecution ?? 250_000) * maximumWorkerSegments;
     const map = await buildApplicationMap(input.workspacePath, input.orchestration.id, 1, this.now());
     this.maps.set(input.orchestration.id, map);
     await sink.recordApplicationMap(map.summary);
@@ -326,26 +423,38 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         signal,
         prompt: [
           "Create a bounded coding plan for the explicitly confirmed contract. Do not edit files.",
+          "The complete planning evidence is supplied below. Do not call tools or independently inspect the workspace during planning.",
           `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
           `Total model-call budget: ${input.orchestration.budget.maxModelCalls}`,
           `Model calls already consumed before this planning response: ${alreadyConsumedModelCalls}`,
           `Model calls reserved for this response and one possible format-repair response: ${MAXIMUM_PLANNER_RESPONSE_CALLS}`,
           `Maximum future model calls this plan may estimate: ${availableExecutionModelCalls}`,
-          "The estimatedCalls value counts every model call after this planning response, including worker preflight and implementation calls, integration, verification, supervision, retries, and recovery.",
+          `Completed Ark turns already consumed: ${alreadyConsumedArkApiTurns}`,
+          `Maximum future Ark turns this plan may estimate: ${availableExecutionArkApiTurns}`,
+          `Maximum continuation segments per worker task: ${maximumWorkerSegments}`,
+          `Maximum cumulative Ark turns one worker task may require across its fresh checkpoint segments: ${maximumTaskArkTurns}`,
+          `Maximum cumulative input tokens one worker task may require across its fresh checkpoint segments: ${maximumTaskInputTokens}`,
+          "estimatedCalls counts top-level Codex executions after planning. estimatedArkApiTurns counts the underlying model turns inside those executions, including worker implementation, verification, supervision, retries, and recovery.",
           `Return estimatedCalls no greater than ${availableExecutionModelCalls}. Plan the complete confirmed scope within that allowance by minimizing handoffs, combining tightly coupled work, and preferring deterministic tools and checks where they do not require a model call. Do not drop or weaken confirmed requirements to meet the budget.`,
-          "Keep task objectives concise and implementation-focused. Do not repeat the full contract.",
+          `Return estimatedArkApiTurns no greater than ${availableExecutionArkApiTurns}. Prefer several bounded non-overlapping tasks over one oversized worker. Assign shared root configuration files to one foundation task and make dependent tasks consume that result instead of sharing write ownership.`,
+          "Keep task objectives concise and implementation-focused. Do not repeat the full contract. Give each task its own estimatedArkApiTurns and estimatedInputTokens. If a task exceeds its continuation capacity, split it before returning the plan.",
           "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
           "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
           "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
           "Protect configuration secrets: allowedPaths must never include .env, .env.local, .env.production, or any other real environment file at any directory depth. Non-secret templates named exactly .env.example, .env.sample, or .env.template are allowed.",
           "Return this exact JSON shape with no additional task fields:",
-          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
+          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedArkApiTurns":40,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[],"estimatedArkApiTurns":12,"estimatedInputTokens":120000}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
           "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative, must never begin with /workspace or contain '..', and must follow the environment-file rule above. Use exact criterion IDs from the confirmed contract.",
         ].join("\n").slice(0, 150_000),
       },
-      planSchema(availableExecutionModelCalls),
+      planSchema(
+        availableExecutionModelCalls,
+        availableExecutionArkApiTurns,
+        maximumTaskArkTurns,
+        maximumTaskInputTokens,
+      ),
     );
     const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
     await this.verification.saveAcceptancePlan({
@@ -420,7 +529,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         attemptCount: 0,
       };
     });
-    if (route.selectedMode !== "multi-worker" && tasks.length > 1) {
+    if (route.selectedMode === "direct" && tasks.length > 1) {
       const combinedObjective = tasks
         .map((task) => task.objective.trim())
         .filter((objective, index, values) => values.indexOf(objective) === index)
@@ -429,7 +538,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       tasks = [{
         id: this.newId(),
         orchestrationId: input.orchestration.id,
-        title: route.selectedMode === "direct" ? "Direct confirmed execution" : "Focused combined worker",
+        title: "Direct confirmed execution",
         objective: combinedObjective || input.contract.intent.goal,
         status: "ready",
         dependsOn: [],
@@ -454,7 +563,11 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         selectedMode: route.selectedMode,
         taskCount: tasks.length,
         estimatedCalls: result.value.estimatedCalls,
+        estimatedArkApiTurns: result.value.estimatedArkApiTurns,
         availableExecutionModelCalls,
+        availableExecutionArkApiTurns,
+        maximumTaskArkTurns,
+        maximumTaskInputTokens,
         alreadyConsumedModelCalls,
         reservedPlanningModelCalls: MAXIMUM_PLANNER_RESPONSE_CALLS,
       },
@@ -505,7 +618,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
                 map,
                 mainWorkspacePath: input.workspacePath,
                 signal,
-                deterministicPreflight: input.plan.selectedMode === "one-worker",
+                deterministicPreflight: true,
               }),
             ),
           );
@@ -581,6 +694,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           }
           return { kind: "failed", reason: error.supervisorDecision.reason };
         }
+        if (isInternalInfrastructureFailure(error.packet.lastError)) {
+          return {
+            kind: "failed",
+            reason: `Automatic recovery from an internal Runtime launch failure was exhausted: ${error.packet.lastError}`,
+          };
+        }
         try {
           const diagnosis = await roles.structured(
             {
@@ -632,6 +751,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       this.options.runtimeHomeRoot,
       this.newId,
       this.options.modelCallTimeoutMs,
+      this.options.modelTransportMaxRetries,
     );
     this.activeRoles.set(orchestrationId, roles);
     return roles;
@@ -745,6 +865,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         candidate.path,
         sink,
         signal,
+        verification,
         verifierGuidance
           ? { round: recoveryRound, instructions: verifierGuidance, history: recoveryHistory }
           : undefined,
@@ -883,9 +1004,11 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
               ...(supervisorInstructions
                 ? [`Big-model supervisor guidance: ${supervisorInstructions}`]
                 : []),
-              ...conflict.variants.map((variant) => `Task ${variant.taskId}:\n${variant.content.toString("utf8").slice(0, 30_000)}`),
+              ...conflict.variants.map((variant) => `Task ${variant.taskId}:\n${variant.content.toString("utf8").slice(0, 12_000)}`),
               "Return JSON with content only.",
             ].join("\n"),
+            maxArkApiTurns: Math.min(8, input.orchestration.budget.maxArkApiTurnsPerExecution ?? 8),
+            maxInputTokens: Math.min(120_000, input.orchestration.budget.maxInputTokensPerExecution ?? 120_000),
           },
           conflictSchema,
         );
@@ -949,23 +1072,41 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           "Choose needs-user only when a permission, credential, material choice, or external action is genuinely required from the user. Include one precise userQuestion in that case.",
           "Choose stop only for a demonstrated non-recoverable contradiction. Never waive a confirmed acceptance criterion, fabricate evidence, or mark an uncertain check as passed.",
           "For any retry, provide concrete instructions for the selected smaller model. For retry-worker, include the exact target task IDs.",
-          `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
+          `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria.map(({ id, kind, description }) => ({ id, kind, description: description.slice(0, 800) })) })}`,
           `Available tasks: ${JSON.stringify(resultsForSupervisor(input.plan.tasks))}`,
-          `Failure evidence: ${failureEvidence}`,
-          `Prior recovery history: ${JSON.stringify(recoveryHistory.slice(-8))}`,
+          `Failure evidence: ${failureEvidence.slice(0, 24_000)}`,
+          `Prior recovery history: ${JSON.stringify(recoveryHistory.slice(-4))}`,
           `Recovery round: ${recoveryRound}`,
-        ].join("\n").slice(0, 150_000),
+        ].join("\n").slice(0, 48_000),
+        maxArkApiTurns: Math.min(8, input.orchestration.budget.maxArkApiTurnsPerExecution ?? 8),
+        maxInputTokens: Math.min(120_000, input.orchestration.budget.maxInputTokensPerExecution ?? 120_000),
       },
       recoveryDecisionSchema,
     );
     const requestedAction = call.value.action;
-    const decision: RecoveryDecision = input.plan.selectedMode === "direct"
+    const modelDecision: RecoveryDecision = input.plan.selectedMode === "direct"
       ? requestedAction === "retry-worker" || requestedAction === "retry-integrator"
         ? { ...call.value, action: "retry-direct" }
         : call.value
       : requestedAction === "retry-direct"
         ? { ...call.value, action: "retry-worker" }
         : call.value;
+    const decision: RecoveryDecision = isInternalInfrastructureFailure(failureEvidence) &&
+      (modelDecision.action === "needs-user" || modelDecision.action === "stop")
+      ? {
+          ...modelDecision,
+          classification: "transient-failure",
+          action: phase === "verification"
+            ? "retry-verifier"
+            : input.plan.selectedMode === "direct"
+              ? "retry-direct"
+              : "retry-integrator",
+          reason: "The Runtime launcher failed internally and should be retried without involving the user.",
+          instructions: "Retry from the last checkpoint using compact evidence. Do not serialize generated cache paths into the prompt.",
+          targetTaskIds: [],
+          userQuestion: null,
+        }
+      : modelDecision;
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
@@ -995,6 +1136,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     const userActionable =
       decision.classification === "permission-required" ||
       looksUserActionableFailure(`${decision.reason}\n${failureEvidence}`);
+    if (exhausted && isInternalInfrastructureFailure(failureEvidence)) {
+      return {
+        kind: "failed",
+        reason: `Automatic recovery from an internal Runtime launch failure was exhausted: ${decision.reason}`,
+      };
+    }
     if (decision.action === "needs-user" || (decision.action === "stop" && userActionable)) {
       const question = decision.userQuestion ??
         "What permission, credential, or external action should be used to unblock verification?";
@@ -1054,9 +1201,11 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         "Do not delegate to smaller workers or an integration model, and do not merely explain the failure.",
         `Allowed edit paths: ${JSON.stringify(result.task.allowedPaths)}`,
         `Confirmed contract: ${JSON.stringify({ goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
-        `Failed verification evidence: ${failureEvidence}`,
+        `Failed verification evidence: ${failureEvidence.slice(0, 24_000)}`,
         `Supervisor instructions: ${decision.instructions || decision.reason}`,
-      ].join("\n").slice(0, 140_000),
+      ].join("\n").slice(0, 48_000),
+      maxArkApiTurns: input.orchestration.budget.maxArkApiTurnsPerExecution,
+      maxInputTokens: input.orchestration.budget.maxInputTokensPerExecution,
     });
     const changes = await this.workspaces.changes(result.workspace);
     const violations = scopeViolations(changes, result.task.allowedPaths);
@@ -1123,10 +1272,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           "Inspect the current task workspace and implement the supervisor instructions. Do not merely explain the issue.",
           `Task: ${JSON.stringify({ id: result.task.id, objective: result.task.objective, allowedPaths: result.task.allowedPaths })}`,
           `Confirmed criteria: ${JSON.stringify(input.contract.criteria.filter((criterion) => result.task.acceptanceCriterionIds.includes(criterion.id)))}`,
-          `Failed verification evidence: ${failureEvidence}`,
+          `Failed verification evidence: ${failureEvidence.slice(0, 24_000)}`,
           `Supervisor instructions: ${decision.instructions || decision.reason}`,
           "Edit only the allowed paths, run relevant checks, and summarize what you changed.",
-        ].join("\n").slice(0, 140_000),
+        ].join("\n").slice(0, 48_000),
+        maxArkApiTurns: input.orchestration.budget.maxArkApiTurnsPerExecution,
+        maxInputTokens: input.orchestration.budget.maxInputTokensPerExecution,
       });
       const changes = await this.workspaces.changes(result.workspace);
       const violations = scopeViolations(changes, result.task.allowedPaths);
@@ -1189,10 +1340,12 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         "Inspect the candidate and make only integration/composition corrections. Do not weaken tests or confirmed criteria.",
         `Allowed edit paths across confirmed tasks: ${JSON.stringify(allowedPaths)}`,
         `Confirmed contract: ${JSON.stringify({ goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
-        `Failed verification evidence: ${failureEvidence}`,
+        `Failed verification evidence: ${failureEvidence.slice(0, 24_000)}`,
         `Supervisor instructions: ${decision.instructions || decision.reason}`,
         "Edit the candidate directly, run relevant non-destructive checks, and summarize the correction.",
-      ].join("\n").slice(0, 140_000),
+      ].join("\n").slice(0, 48_000),
+      maxArkApiTurns: input.orchestration.budget.maxArkApiTurnsPerExecution,
+      maxInputTokens: input.orchestration.budget.maxInputTokensPerExecution,
     });
     const refreshed = await this.integrator.refresh(candidate);
     const violations = scopeViolations(refreshed.changes, allowedPaths);
@@ -1262,7 +1415,16 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       workspacePath: workspace.path,
       sandboxMode: "workspace-write",
       signal,
-      prompt: `Execute the confirmed direct task in the workspace. Edit only ${task.allowedPaths.join(", ")}. Contract: ${JSON.stringify(input.contract)}`,
+      prompt: [
+        "Execute the confirmed direct task in the workspace as the single big-model implementer.",
+        `Task: ${task.objective}`,
+        `Edit only: ${JSON.stringify(task.allowedPaths)}`,
+        `Confirmed goal: ${input.contract.intent.goal}`,
+        `Relevant criteria: ${JSON.stringify(input.contract.criteria.filter((criterion) => task.acceptanceCriterionIds.includes(criterion.id)).map(({ id, kind, description }) => ({ id, kind, description: description.slice(0, 800) })))}`,
+        "Batch related inspection and checks. Keep tool output compact and leave completed edits in the workspace as checkpoints.",
+      ].join("\n").slice(0, 48_000),
+      maxArkApiTurns: input.orchestration.budget.maxArkApiTurnsPerExecution,
+      maxInputTokens: input.orchestration.budget.maxInputTokensPerExecution,
     });
     const changes = await this.workspaces.changes(workspace);
     const violations = scopeViolations(changes, task.allowedPaths);
@@ -1321,6 +1483,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     candidateWorkspacePath: string,
     sink: OrchestrationSink,
     signal: AbortSignal,
+    deterministicRecords: VerificationRecord[],
     recovery?: { round: number; instructions: string; history: string[] },
   ) {
     const plan = await this.verification.loadAcceptancePlan(
@@ -1345,6 +1508,48 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         !skippedRegressionIds.has(test.id) &&
         !postReleaseIds.has(test.id),
     );
+    const candidateMap = await buildApplicationMap(
+      candidateWorkspacePath,
+      input.orchestration.id,
+      input.plan.applicationMap.version + 1,
+      this.now(),
+    );
+    const evidenceBundle = {
+      workspace: candidateMap.summary,
+      files: candidateMap.entries.slice(0, 250).map((entry) => ({
+        path: entry.path,
+        bytes: entry.bytes,
+        imports: entry.imports.slice(0, 20),
+        exports: entry.exports.slice(0, 20),
+        summary: entry.summary.slice(0, 500),
+      })),
+      changedAreas: input.plan.tasks.map((task) => ({
+        task: task.title,
+        allowedPaths: task.allowedPaths,
+        criteria: task.acceptanceCriterionIds,
+      })),
+      deterministicChecks: deterministicRecords.map((record) => ({
+        check: record.commandOrCheck,
+        status: record.status,
+        evidence: record.outputSummary.slice(0, 1_500),
+      })),
+    };
+    const compactAutomated = automated.map((test) => ({
+      ...test,
+      procedure: test.procedure.slice(0, 1_500),
+      expectedOutcome: test.expectedOutcome.slice(0, 900),
+    }));
+    const evidenceArtifactId = this.newId();
+    await sink.publishArtifact({
+      id: evidenceArtifactId,
+      orchestrationId: input.orchestration.id,
+      producerTaskId: "verifier",
+      kind: "test-result",
+      name: "Deterministic verification evidence",
+      version: input.contract.version,
+      payload: JSON.stringify(evidenceBundle).slice(0, 40_000),
+      createdAt: this.now().toISOString(),
+    });
     const startedAt = this.now().toISOString();
     const result = automated.length
       ? await roles.structured(
@@ -1359,7 +1564,8 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
             signal,
             prompt: [
               "Independently verify the integrated candidate. Do not edit any files.",
-              "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
+              "Start from the deterministic evidence bundle. Do not rediscover listed files. Inspect additional file contents only for acceptance tests that the supplied evidence cannot decide.",
+              "Batch related non-destructive tests, type checks, builds, and static checks into at most three shell invocations. Keep successful output summarized and include only relevant failure lines.",
               "The candidate workspace is intentionally read-only. Put temporary test scripts, browser profiles, screenshots, caches, and logs under /tmp only.",
               "This verification runtime supports subprocesses, ephemeral loopback servers, and bundled Chromium. Use $CHROME_BIN or /usr/bin/chromium with a fresh --user-data-dir under /tmp; never launch a host GUI browser or use a host browser profile.",
               "The disposable outer container is the security boundary. Chromium may use --no-sandbox inside it when required. Prefer 127.0.0.1 with an ephemeral unprivileged port and shut down every server you start.",
@@ -1368,13 +1574,17 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
                 ? [
                     `This is verification recovery round ${recovery.round}.`,
                     `Big-model supervisor instructions: ${recovery.instructions}`,
-                    `Prior recovery history: ${JSON.stringify(recovery.history.slice(-8))}`,
+                    `Prior recovery history: ${JSON.stringify(recovery.history.slice(-4))}`,
                     "Use a different valid verification strategy where instructed, but do not waive criteria or fabricate evidence.",
                   ]
                 : []),
-              `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
-              `Protected planner-generated acceptance tests: ${JSON.stringify(automated)}`,
-            ].join("\n").slice(0, 150_000),
+              `Evidence artifact: ${evidenceArtifactId}. The compact contents required for this pass are included below; do not request successful logs that are already summarized there.`,
+              `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria.map(({ id, kind, description }) => ({ id, kind, description: description.slice(0, 800) })) })}`,
+              `Deterministic evidence bundle: ${JSON.stringify(evidenceBundle)}`,
+              `Unresolved planner-generated acceptance tests: ${JSON.stringify(compactAutomated)}`,
+            ].join("\n").slice(0, 80_000),
+            maxArkApiTurns: input.orchestration.budget.maxArkApiTurnsPerExecution,
+            maxInputTokens: input.orchestration.budget.maxInputTokensPerExecution,
           },
           acceptanceVerificationSchema,
         )
@@ -1408,6 +1618,21 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       await sink.recordVerification(record);
       records.push(record);
     }
+    const resultArtifactId = this.newId();
+    await sink.publishArtifact({
+      id: resultArtifactId,
+      orchestrationId: input.orchestration.id,
+      producerTaskId: "verifier",
+      kind: "test-result",
+      name: "Acceptance verification results",
+      version: input.contract.version,
+      payload: JSON.stringify(records.map((record) => ({
+        check: record.commandOrCheck,
+        status: record.status,
+        evidence: record.outputSummary.slice(0, 1_500),
+      }))).slice(0, 40_000),
+      createdAt: this.now().toISOString(),
+    });
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
@@ -1425,6 +1650,8 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         regressionNotApplicable: skippedRegressionIds.size,
         deferredPostRelease: postReleaseIds.size,
         recoveryRound: recovery?.round ?? 0,
+        evidenceArtifactId,
+        resultArtifactId,
       },
     });
     return records;

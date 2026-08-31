@@ -57,28 +57,20 @@ export function selectRoute(facts: RoutingFacts): RouteDecision {
     return { selectedMode: "direct", reason: "The user explicitly selected direct execution" };
   }
   if (facts.hasOverlappingWriteScopes) {
-    return {
-      selectedMode: "one-worker",
-      reason: "Planned tasks share writable paths, so one coordinated worker avoids conflicting edits",
-    };
+    throw new Error(
+      "Planned worker tasks must have exclusive writable paths; repair shared ownership before routing",
+    );
   }
-  if (facts.taskCount <= 1 || facts.coupling === "high") {
+  if (facts.taskCount <= 1) {
     return {
       selectedMode: facts.requestedMode === "orchestrated" ? "one-worker" : "direct",
-      reason:
-        facts.coupling === "high"
-          ? "The work is tightly coupled, so parallel coordination would add risk"
-          : "The work is small enough that delegation overhead is not justified",
-    };
-  }
-  if (facts.requestedMode === "orchestrated" || (facts.taskCount >= 2 && facts.changedAreaCount >= 2)) {
-    return {
-      selectedMode: "multi-worker",
-      reason: "Independent areas can be isolated and verified with bounded coordination",
+      reason: "The work is small enough that delegation overhead is not justified",
     };
   }
   return {
-    selectedMode: "one-worker",
-    reason: "One focused worker balances context isolation and coordination overhead",
+    selectedMode: "multi-worker",
+    reason: facts.coupling === "high"
+      ? "Coupled work is split into dependency-ordered workers with exclusive file ownership"
+      : "Independent areas can be isolated and verified with bounded coordination",
   };
 }

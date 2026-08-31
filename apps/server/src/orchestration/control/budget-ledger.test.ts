@@ -24,7 +24,7 @@ const orchestration = (): Orchestration => ({
   budget: {
     maxInputTokens: 1_000, maxOutputTokens: 1_000, maxEstimatedUsd: 1,
     maxModelCalls: 2, maxSteps: 10, maxWorkerAttempts: 2,
-    maxContextExpansionsPerTask: 1, maxWallClockMs: 10_000,
+    maxContextExpansionsPerTask: 1,
   },
   usage: {
     byRole: {}, totalInputTokens: 0, totalCachedInputTokens: 0,
@@ -56,17 +56,16 @@ describe("budget ledger", () => {
     ).toBeNull();
   });
 
-  it("gates token, call, cost, and wall-clock reservations", () => {
+  it("gates token, call, and cost reservations without an elapsed-time cutoff", () => {
     const item = orchestration();
-    expect(decideReservation(item, [], reservation, pricing, 5_000).decision.allowed).toBe(true);
+    expect(decideReservation(item, [], reservation, pricing).decision.allowed).toBe(true);
     item.budget.maxInputTokens = 499;
-    expect(decideReservation(item, [], reservation, pricing, 5_000).decision).toMatchObject({
+    expect(decideReservation(item, [], reservation, pricing).decision).toMatchObject({
       allowed: false, reason: "Input-token budget exhausted",
     });
     item.budget.maxInputTokens = 1_000;
-    expect(decideReservation(item, [], reservation, pricing, 10_000).decision).toMatchObject({
-      allowed: false, reason: "Wall-clock budget exhausted",
-    });
+    item.createdAt = new Date(0).toISOString();
+    expect(decideReservation(item, [], reservation, pricing).decision.allowed).toBe(true);
   });
 
   it("aggregates actual role and total usage with configured pricing", () => {
@@ -81,7 +80,7 @@ describe("budget ledger", () => {
     expect(database.orchestrations[0]!.usage).toMatchObject({
       totalInputTokens: 400, totalCachedInputTokens: 100, totalOutputTokens: 50,
       pricingStatus: "configured",
-      byRole: { worker: { modelCalls: 1, estimatedUsd: 0.00051 } },
+      byRole: { worker: { modelCalls: 1, estimatedUsd: 0.00041 } },
     });
     expect(actualUsageCost({ inputTokens: 1, cachedInputTokens: 1, outputTokens: 1 }, "worker", "unknown", pricing)).toBeNull();
   });

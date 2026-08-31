@@ -36,7 +36,6 @@ const budgetSchema = z
     maxSteps: z.number().int().nonnegative().max(100_000).optional(),
     maxWorkerAttempts: z.number().int().nonnegative().max(100).optional(),
     maxContextExpansionsPerTask: z.number().int().nonnegative().max(100).optional(),
-    maxWallClockMs: z.number().int().nonnegative().max(604_800_000).optional(),
   })
   .strict();
 const createBody = z

@@ -1,6 +1,11 @@
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { loadConfig } from "./config.js";
 import {
   buildCodexArgs,
+  CodexRunner,
   consumeCodexOutputChunk,
   parseCodexEventLine,
 } from "./codex-runner.js";
@@ -25,8 +30,9 @@ describe("Codex runner protocol", () => {
       "--skip-git-repo-check",
       "-C",
       "/tmp/workspace",
-      "build a calculator",
+      "-",
     ]);
+    expect(args).not.toContain("build a calculator");
   });
 
   it("resumes a stored Codex thread", () => {
@@ -40,7 +46,8 @@ describe("Codex runner protocol", () => {
       },
       "workspace-write",
     );
-    expect(args.slice(-3)).toEqual(["resume", "thread-123", "add tests"]);
+    expect(args.slice(-3)).toEqual(["resume", "thread-123", "-"]);
+    expect(args).not.toContain("add tests");
   });
 
   it("passes a trusted role model override as an argv element", () => {
@@ -58,7 +65,8 @@ describe("Codex runner protocol", () => {
       "read-only",
     );
     expect(args).toContain("trusted-model-id");
-    expect(args.slice(-3)).toEqual(["--model", "trusted-model-id", "plan"]);
+    expect(args.slice(-3)).toEqual(["--model", "trusted-model-id", "-"]);
+    expect(args).not.toContain("plan");
   });
 
   it("truthfully omits unsupported model overrides", () => {
@@ -76,6 +84,40 @@ describe("Codex runner protocol", () => {
       false,
     );
     expect(args).not.toContain("requested-role-model");
+  });
+
+  it("streams a large prompt through stdin instead of process arguments", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-stdin-"));
+    const executable = path.join(root, "fake-codex.sh");
+    await writeFile(executable, [
+      "#!/bin/sh",
+      "prompt=$(cat)",
+      "bytes=$(printf %s \"$prompt\" | wc -c | tr -d ' ')",
+      "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"stdin-thread\"}'",
+      "printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"stdin-bytes:%s\"}}\\n' \"$bytes\"",
+      "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'",
+    ].join("\n"));
+    await chmod(executable, 0o700);
+    try {
+      const runner = new CodexRunner(loadConfig({
+        NODE_ENV: "test",
+        CODEX_BIN: executable,
+        CODEX_TIMEOUT_MS: "10000",
+      }));
+      const prompt = "x".repeat(512_000);
+      const result = await runner.run({
+        executionId: "large-prompt",
+        agentId: "agent",
+        workspacePath: root,
+        prompt,
+        threadId: null,
+      });
+
+      expect(result.output).toBe(`stdin-bytes:${prompt.length}`);
+      expect(result.threadId).toBe("stdin-thread");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("extracts the session, final message and usage", () => {

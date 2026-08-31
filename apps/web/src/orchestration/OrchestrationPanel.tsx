@@ -453,9 +453,11 @@ export function OrchestrationPanel({
 
           {view?.orchestration.status === "drafting-intent" && (
             <AssistantMessage agentName={agentName} meta="reviewing the request">
-              <div className="thinking-row">
+              <div className="thinking-row" role="status" aria-live="polite">
                 <span className="spinner" />
-                Preparing the run details and checking for material choices…
+                <span className="orch-loading-text">
+                  Understanding your request and checking for material choices…
+                </span>
               </div>
             </AssistantMessage>
           )}
@@ -499,7 +501,9 @@ export function OrchestrationPanel({
               <AssistantMessage agentName={agentName} meta="preparing the next step">
                 <div className="thinking-row" role="status" aria-live="polite">
                   <span className="spinner" />
-                  Applying your answers and preparing the execution plan…
+                  <span className="orch-loading-text">
+                    Applying your answers and preparing the execution plan…
+                  </span>
                 </div>
               </AssistantMessage>
             )}
@@ -532,14 +536,24 @@ export function OrchestrationPanel({
               </div>
               <div
                 className="orch-progress-track"
+                data-loading={progress.loading}
                 role="progressbar"
                 aria-label="Overall orchestration progress"
+                aria-busy={progress.loading}
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={progress.percent}
               >
                 <span style={{ width: `${progress.percent}%` }} />
               </div>
+              <p
+                className="orch-current-activity"
+                data-loading={progress.loading}
+                role="status"
+                aria-live="polite"
+              >
+                {progress.activity}
+              </p>
               <p className="orch-note">{progress.detail}</p>
               {view.orchestration.status === "ready" && error && (
                 <button
