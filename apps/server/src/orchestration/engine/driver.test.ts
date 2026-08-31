@@ -104,6 +104,14 @@ function fakeRunner(
       if (request.prompt.includes("Elaborate the user's intent")) {
         output = JSON.stringify(intent);
       } else if (request.prompt.includes("Create a bounded coding plan")) {
+        output = JSON.stringify({
+          coupling: "LOW", estimatedCalls: "8", estimatedContextTokens: "1000",
+          tasks: [
+            { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: ["src/a.ts"], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
+            { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"] },
+          ],
+        });
+      } else if (request.prompt.includes("Create the protected acceptance-test plan for ONLY the tasks listed below")) {
         const acceptanceTests = [
           { id: "accept-a", title: "Module A works", criterionIds: ["c1"], category: "functional", scope: "protected", procedure: "Inspect and exercise module A", expectedOutcome: "A exports the expected value" },
           { id: "accept-b", title: "Module B works", criterionIds: ["c2"], category: "functional", scope: "protected", procedure: "Inspect and exercise module B", expectedOutcome: "B exports the expected value" },
@@ -120,14 +128,7 @@ function fakeRunner(
             expectedOutcome: "The final response tells the user what was delivered",
           });
         }
-        output = JSON.stringify({
-          coupling: "LOW", estimatedCalls: "8", estimatedContextTokens: "1000",
-          tasks: [
-            { title: "Add A", objective: "Add A", dependsOn: [], allowedPaths: ["src/a.ts"], acceptanceCriterionIds: ["c1"], requiredArtifactIds: [], explanatoryNote: "safe unknown field" },
-            { title: "Add B", objective: "Add B", dependsOn: ["0"], allowedPaths: ["src/b.ts"], acceptanceCriterionIds: ["c2"], requiredArtifactIds: ["api-contract"] },
-          ],
-          acceptanceTests,
-        });
+        output = JSON.stringify({ acceptanceTests });
       } else if (request.prompt.includes("Produce a read-only worker preflight")) {
         const isA = request.prompt.includes("Task: Add A");
         const shouldReject = badPreflightOnce && !request.prompt.includes("previous preflight was rejected") && !rejectedPreflights.has(request.taskId ?? "global");

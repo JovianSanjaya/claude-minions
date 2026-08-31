@@ -40,6 +40,15 @@ export function containerName(executionId: string, instanceId = "default"): stri
   return "launchpad-" + safeInstance + "-" + safeExecution;
 }
 
+// Docker Desktop for Mac's default "bridge" network silently kills long-lived
+// outbound connections (observed cutoff ~20s), which truncates real model
+// completions mid-stream. A user-defined bridge network is not affected and
+// keeps the same network-namespace isolation as the default bridge.
+export function runtimeNetworkName(instanceId = "default"): string {
+  const safeInstance = instanceId.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 32);
+  return "launchpad-net-" + safeInstance;
+}
+
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
@@ -66,7 +75,7 @@ export function buildContainerRunArgs(
     "io.codejam.instance-id=" + config.runtimeInstanceId,
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
     "--network",
-    "bridge",
+    runtimeNetworkName(config.runtimeInstanceId),
     "--security-opt",
     "no-new-privileges",
     "--cap-drop",
@@ -111,8 +120,27 @@ export function buildContainerRunArgs(
 
 export class ContainerCodexRunner implements AgentRunner {
   private readonly active = new Map<string, ActiveContainer>();
+  private networkReady: Promise<void> | null = null;
 
   constructor(private readonly config: AppConfig) {}
+
+  private ensureNetwork(): Promise<void> {
+    if (!this.networkReady) {
+      this.networkReady = execFileAsync(this.config.containerEngine, [
+        "network",
+        "create",
+        runtimeNetworkName(this.config.runtimeInstanceId),
+      ])
+        .then(() => undefined)
+        .catch((error: unknown) => {
+          const message = String((error as { stderr?: unknown })?.stderr ?? error);
+          if (/already exists/i.test(message)) return;
+          this.networkReady = null;
+          throw error;
+        });
+    }
+    return this.networkReady;
+  }
 
   async isAvailable(): Promise<boolean> {
     try {
@@ -166,6 +194,7 @@ export class ContainerCodexRunner implements AgentRunner {
     if (request.runtimeHomePath) {
       await writeCodexConfig(this.config, request.runtimeHomePath);
     }
+    await this.ensureNetwork();
 
     const child = spawn(
       this.config.containerEngine,

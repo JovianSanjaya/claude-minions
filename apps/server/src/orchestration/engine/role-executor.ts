@@ -9,6 +9,16 @@ import type {
 } from "../contracts.js";
 import type { AgentRunner, RunnerResult } from "../../types.js";
 import { parseStructured, repairPrompt, StructuredOutputError } from "./structured-output.js";
+import { logError } from "../../error-log.js";
+import { redactString } from "../control/redaction.js";
+
+export const TRANSIENT_ERROR_PATTERN =
+  /429|too many requests|timed? out|stream disconnected|econnreset|econnrefused|etimedout|socket hang up|network|fetch failed|dns/i;
+
+function preview(text: string, maxLength = 400): string {
+  const collapsed = redactString(text).replace(/\s+/g, " ").trim();
+  return collapsed.length > maxLength ? `${collapsed.slice(0, maxLength)}…` : collapsed;
+}
 
 export interface RoleModelConfiguration {
   planner: string;
@@ -77,6 +87,10 @@ export class RoleExecutor {
       return { ...first, value: parseStructured(schema, first.rawOutput) };
     } catch (error) {
       if (!(error instanceof StructuredOutputError)) throw error;
+      await logError(
+        "role-executor",
+        `${input.role} produced invalid structured output: ${error.issues.join("; ")}\nRaw output: "${preview(first.rawOutput, 1_000)}"`,
+      );
       const repair = await this.call(
         input,
         `${repairPrompt(error, jsonSchema)}\nInvalid output to repair:\n${first.rawOutput.slice(0, 8_000)}`,
@@ -85,6 +99,10 @@ export class RoleExecutor {
         return { ...repair, value: parseStructured(schema, repair.rawOutput) };
       } catch (repairError) {
         if (!(repairError instanceof StructuredOutputError)) throw repairError;
+        await logError(
+          "role-executor",
+          `${input.role} repair also failed: ${repairError.issues.join("; ")}\nRaw output: "${preview(repair.rawOutput, 1_000)}"`,
+        );
         throw new StructuredOutputError(
           `Model response remained invalid after one repair: ${repairError.issues.slice(0, 6).join("; ")}`,
           repairError.issues,
@@ -100,9 +118,27 @@ export class RoleExecutor {
   }
 
   private async call(input: RoleCallInput, prompt: string): Promise<Omit<RoleCallResult, "value">> {
+    try {
+      return await this.callOnce(input, prompt);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (input.signal.aborted || !TRANSIENT_ERROR_PATTERN.test(message)) throw error;
+      await logError(
+        "role-executor",
+        `${input.role} hit a transient error, retrying once: ${message}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      return await this.callOnce(input, prompt);
+    }
+  }
+
+  private async callOnce(input: RoleCallInput, prompt: string): Promise<Omit<RoleCallResult, "value">> {
     if (input.signal.aborted) throw new Error("Orchestration cancelled");
     const executionId = this.newId();
     const requestedModelId = this.models[input.role];
+    console.log(
+      `[role-executor] ${input.role} ${executionId} → ${requestedModelId} prompt: "${preview(prompt)}"`,
+    );
     const reservation = await this.sink.reserveModelCall({
       orchestrationId: input.orchestrationId,
       taskId: input.taskId,
@@ -146,7 +182,7 @@ export class RoleExecutor {
           timeoutMs: this.modelCallTimeoutMs,
         },
       }).catch(() => undefined);
-    }, 15_000);
+    }, 30_000);
     heartbeat.unref();
     const runtimeHomePath = path.join(
       this.runtimeHomeRoot,
@@ -174,6 +210,8 @@ export class RoleExecutor {
       });
       await this.sink.commitModelUsage(reservation.reservationId, usageOf(result));
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      await logError("role-executor", `${input.role} call ${executionId} failed: ${errorMessage}`);
       await this.sink.commitModelUsage(reservation.reservationId, {
         inputTokens: 0,
         cachedInputTokens: 0,
@@ -187,7 +225,7 @@ export class RoleExecutor {
         actorRole: input.role,
         modelId: requestedModelId,
         summary: `${input.role} model call stopped with an error`,
-        metadata: {},
+        metadata: { errorMessage: errorMessage.slice(0, 2_000) },
       });
       throw error;
     } finally {
@@ -213,6 +251,9 @@ export class RoleExecutor {
         sandboxMode: input.sandboxMode,
       },
     });
+    console.log(
+      `[role-executor] ${input.role} ${executionId} ← ${actualModelId} (${Date.now() - startedAt}ms) output: "${preview(result.output)}"`,
+    );
     return {
       rawOutput: result.output,
       executionId,

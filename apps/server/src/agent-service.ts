@@ -13,6 +13,7 @@ import type {
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import { logError } from "./error-log.js";
 
 const now = () => new Date().toISOString();
 
@@ -295,6 +296,9 @@ export class AgentService {
         error instanceof RunCancelledError || error instanceof RunFailedError
           ? error.threadId
           : null;
+      if (!cancelled) {
+        await logError("agent-service", `run ${run.id} (agent ${agentAtStart.id}) failed: ${message}`);
+      }
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);

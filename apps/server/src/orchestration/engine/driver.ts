@@ -13,6 +13,7 @@ import type {
   PlanInput,
   PlanResult,
   TokenUsage,
+  VerificationRecord,
 } from "../contracts.js";
 import type { AgentRunner } from "../../types.js";
 import { buildApplicationMap, type DetailedApplicationMap } from "./application-map.js";
@@ -20,16 +21,18 @@ import {
   comprehensiveAcceptanceTests,
   plannedAcceptanceTestSchema,
   requiresPostReleaseVerification,
+  type PlannedAcceptanceTest,
 } from "./acceptance-plan.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker } from "./context-broker.js";
 import { classifyFailure } from "./failure-packet.js";
-import { DeterministicIntegrator } from "./integrator.js";
+import { DeterministicIntegrator, type IntegrationCandidate } from "./integrator.js";
 import { RoleExecutor, type RoleModelConfiguration } from "./role-executor.js";
 import { selectRoute, tasksHaveOverlappingWriteScopes } from "./router.js";
 import { requiredVerificationPassed, type TrustedVerificationCheck, VerificationService } from "./verification.js";
 import { BoundedWorkerLoop, type WorkerLoopResult, WorkerLoopError } from "./worker-loop.js";
-import { scopeViolations, WorkerWorkspaceManager } from "./worker-workspaces.js";
+import { diffManifest, scopeViolations, workspaceManifest, WorkerWorkspaceManager } from "./worker-workspaces.js";
+import { logError } from "../../error-log.js";
 
 const clarificationQuestionSchema = z.object({
   prompt: z.string().min(1).max(600),
@@ -66,7 +69,7 @@ const intentSchema = z.object({
   }),
 }).strict();
 
-const planSchema = z.object({
+const taskPlanSchema = z.object({
   coupling: z.preprocess((value) => typeof value === "string" ? value.toLowerCase() : value, z.enum(["low", "medium", "high"])),
   estimatedCalls: z.coerce.number().int().positive().max(500),
   estimatedContextTokens: z.coerce.number().int().nonnegative(),
@@ -78,7 +81,18 @@ const planSchema = z.object({
     acceptanceCriterionIds: z.array(z.string().max(200)).max(100).default([]),
     requiredArtifactIds: z.array(z.string().max(200)).max(100).default([]),
   })).min(1).max(20),
-  acceptanceTests: z.array(plannedAcceptanceTestSchema).max(200).default([]),
+}).strict();
+type PlannedTask = z.infer<typeof taskPlanSchema>["tasks"][number];
+
+// Acceptance tests are requested in separate batched calls, not alongside the
+// task plan. A single call asking for tasks AND up to 200 detailed tests at
+// once scales badly: past ~15-20 tasks the response becomes large enough that
+// the model either times out mid-generation or truncates into invalid JSON.
+// Batching keeps each individual call's expected output roughly constant
+// regardless of total task count.
+const ACCEPTANCE_TEST_BATCH_SIZE = 4;
+const taskAcceptanceTestBatchSchema = z.object({
+  acceptanceTests: z.array(plannedAcceptanceTestSchema).max(40).default([]),
 }).strict();
 
 const acceptanceVerificationSchema = z.object({
@@ -88,6 +102,12 @@ const acceptanceVerificationSchema = z.object({
     evidence: z.string().min(1).max(8_000),
   }).strict()).max(200),
 }).strict();
+type VerificationResultEntry = z.infer<typeof acceptanceVerificationSchema>["results"][number];
+// Same rationale as the planner's acceptance-test batching: asking the
+// verifier to judge every test in one call scales badly (large, slow, more
+// prone to omission/truncation). Batches run concurrently since none depend
+// on another batch's outcome.
+const VERIFICATION_BATCH_SIZE = 5;
 
 const conflictSchema = z.object({ content: z.string().max(200_000) }).strict();
 const diagnosisSchema = z.object({
@@ -245,7 +265,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         verification,
       })),
     };
-    const result = await roles.structured(
+    const taskPlanResult = await roles.structured(
       {
         orchestrationId: input.orchestration.id,
         agentId: input.orchestration.agentId,
@@ -259,18 +279,55 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
           `Compact contract: ${JSON.stringify(compactContract)}`,
           `Application map: ${JSON.stringify({ summary: map.summary, entries: map.entries.map((entry) => ({ path: entry.path, imports: entry.imports, exports: entry.exports, summary: entry.summary })) })}`,
           "Keep task objectives concise and implementation-focused. Do not repeat the full contract.",
-          "Also create a comprehensive protected acceptance-test plan. Cover every confirmed criterion, important edge/failure cases, scope constraints, runtime behavior, and existing regressions. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
-          "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
-          "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
+          "Do not write acceptance tests in this response — they are requested separately afterward.",
           "When the contract restricts all edits to one explicit file, return exactly one task covering that file.",
-          "Return this exact JSON shape with no additional task fields:",
-          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}],"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
+          "Return this exact JSON shape with no additional fields:",
+          '{"coupling":"low|medium|high","estimatedCalls":8,"estimatedContextTokens":12000,"tasks":[{"title":"short title","objective":"bounded objective","dependsOn":[],"allowedPaths":["repository/relative/path"],"acceptanceCriterionIds":["exact confirmed criterion ID"],"requiredArtifactIds":[]}]}',
           "dependsOn contains zero-based indexes of earlier tasks only. allowedPaths must be repository-relative and must never begin with /workspace or contain '..'. Use exact criterion IDs from the confirmed contract.",
         ].join("\n").slice(0, 150_000),
       },
-      planSchema,
+      taskPlanSchema,
     );
-    const acceptanceTests = comprehensiveAcceptanceTests(result.value.acceptanceTests, input.contract);
+    const plannedTasks: PlannedTask[] = taskPlanResult.value.tasks;
+    const taskBatches: PlannedTask[][] = [];
+    for (let batchStart = 0; batchStart < plannedTasks.length; batchStart += ACCEPTANCE_TEST_BATCH_SIZE) {
+      taskBatches.push(plannedTasks.slice(batchStart, batchStart + ACCEPTANCE_TEST_BATCH_SIZE));
+    }
+    // Batches are independent of each other (each only needs the stable
+    // contract + full task-title list, never another batch's output), so run
+    // them concurrently instead of one-at-a-time — this is what actually
+    // shortens planning wall-clock time, not the batching alone.
+    const batchResults = await Promise.all(
+      taskBatches.map((batch) =>
+        roles.structured(
+          {
+            orchestrationId: input.orchestration.id,
+            agentId: input.orchestration.agentId,
+            taskId: null,
+            role: "planner",
+            workspacePath: input.workspacePath,
+            sandboxMode: "read-only",
+            signal,
+            prompt: [
+              "Create the protected acceptance-test plan for ONLY the tasks listed below. They are part of a larger confirmed contract already planned; do not repeat tests for other tasks.",
+              `Compact contract: ${JSON.stringify(compactContract)}`,
+              `All planned task titles, for context only (do not duplicate tests already implied for a different task): ${JSON.stringify(plannedTasks.map((task) => task.title))}`,
+              `Tasks to cover in this batch: ${JSON.stringify(batch)}`,
+              "Cover every acceptance criterion referenced by these tasks, plus important edge/failure cases, scope constraints, and runtime behavior relevant to them. Test procedures must be concrete and non-destructive. Use manual scope only when automation cannot reasonably decide the result.",
+              "Classify each acceptance test as verificationPhase release-gate or post-release. A release-gate check must be independently verifiable from the integrated candidate before publication. Anything that observes the eventual assistant reply, a user notification, deployment, publication, or another effect that can only happen after final verification is post-release. Never make a release-gate check depend on a post-release effect.",
+              "Post-release checks are recorded as deferred obligations but are never sent to the release verifier and never block publication.",
+              "Return this exact JSON shape with no additional fields:",
+              '{"acceptanceTests":[{"id":"stable-id","title":"observable behavior","criterionIds":["exact confirmed criterion ID"],"category":"functional|architectural|scope|runtime|regression|manual","scope":"protected|global|manual","verificationPhase":"release-gate|post-release","procedure":"specific independent verification steps","expectedOutcome":"precise pass condition"}]}',
+            ].join("\n").slice(0, 150_000),
+          },
+          taskAcceptanceTestBatchSchema,
+        ),
+      ),
+    );
+    const rawAcceptanceTests: z.input<typeof plannedAcceptanceTestSchema>[] = batchResults.flatMap(
+      (batchResult) => batchResult.value.acceptanceTests,
+    );
+    const acceptanceTests = comprehensiveAcceptanceTests(rawAcceptanceTests, input.contract);
     await this.verification.saveAcceptancePlan({
       orchestrationId: input.orchestration.id,
       contractVersion: input.contract.version,
@@ -296,30 +353,31 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
-      executionId: result.executionId,
+      executionId: null,
       type: "acceptance-plan-created",
       actorRole: "planner",
-      modelId: result.actualModelId,
+      modelId: taskPlanResult.actualModelId,
       summary: "Planner created the protected acceptance-test plan",
       metadata: {
         testCount: acceptanceTests.length,
         coveredCriteria: new Set(acceptanceTests.flatMap((test) => test.criterionIds)).size,
         contractVersion: input.contract.version,
+        acceptanceTestBatches: taskBatches.length,
       },
     });
     const route = selectRoute({
       requestedMode: input.orchestration.requestedMode,
-      taskCount: result.value.tasks.length,
-      changedAreaCount: new Set(result.value.tasks.flatMap((task) => task.allowedPaths.map((entry) => entry.split("/")[0]))).size,
-      hasOverlappingWriteScopes: tasksHaveOverlappingWriteScopes(result.value.tasks),
-      coupling: result.value.coupling,
-      estimatedCalls: result.value.estimatedCalls,
-      estimatedContextTokens: result.value.estimatedContextTokens,
+      taskCount: plannedTasks.length,
+      changedAreaCount: new Set(plannedTasks.flatMap((task) => task.allowedPaths.map((entry) => entry.split("/")[0]))).size,
+      hasOverlappingWriteScopes: tasksHaveOverlappingWriteScopes(plannedTasks),
+      coupling: taskPlanResult.value.coupling,
+      estimatedCalls: taskPlanResult.value.estimatedCalls,
+      estimatedContextTokens: taskPlanResult.value.estimatedContextTokens,
       budget: input.orchestration.budget,
     });
-    const ids = result.value.tasks.map(() => this.newId());
+    const ids = plannedTasks.map(() => this.newId());
     const criterionIds = new Set(input.contract.criteria.map((criterion) => criterion.id));
-    let tasks: OrchestrationTask[] = result.value.tasks.map((task, index) => {
+    let tasks: OrchestrationTask[] = plannedTasks.map((task, index) => {
       const dependsOn = task.dependsOn.map((dependency) => {
         if (dependency >= index || !ids[dependency]) throw new Error("Plan contains an invalid or cyclic dependency");
         return ids[dependency]!;
@@ -365,10 +423,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
-      executionId: result.executionId,
+      executionId: taskPlanResult.executionId,
       type: "route-decision",
       actorRole: "planner",
-      modelId: result.actualModelId,
+      modelId: taskPlanResult.actualModelId,
       summary: route.reason,
       metadata: { selectedMode: route.selectedMode, taskCount: tasks.length },
     });
@@ -486,7 +544,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         summary: "Started protected and global verification",
         metadata: {},
       });
-      const verification = await this.verification.run(
+      let verification = await this.verification.run(
         input.orchestration.id,
         null,
         candidate.path,
@@ -494,7 +552,7 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         sink,
         signal,
       );
-      const plannedVerification = await this.runPlannedAcceptanceVerification(
+      let plannedVerification = await this.runPlannedAcceptanceVerification(
         input,
         roles,
         candidate.path,
@@ -502,9 +560,44 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         signal,
       );
       if (!requiredVerificationPassed([...verification, ...plannedVerification])) {
+        const failing = [...verification, ...plannedVerification].filter(
+          (record) => record.status === "failed",
+        );
+        const repaired = await this.attemptCandidateRepair(
+          input,
+          roles,
+          candidate,
+          failing,
+          signal,
+        ).catch(() => false);
+        if (repaired) {
+          verification = await this.verification.run(
+            input.orchestration.id,
+            null,
+            candidate.path,
+            ["protected", "global", "manual"],
+            sink,
+            signal,
+          );
+          plannedVerification = await this.runPlannedAcceptanceVerification(
+            input,
+            roles,
+            candidate.path,
+            sink,
+            signal,
+          );
+        }
+      }
+      if (!requiredVerificationPassed([...verification, ...plannedVerification])) {
         const archived = await this.integrator
           .archive(candidate, this.options.archiveRoot)
-          .catch(() => null);
+          .catch(async (archiveError: unknown) => {
+            await logError(
+              "driver",
+              `orchestration ${input.orchestration.id}: failed candidate could not be archived: ${archiveError instanceof Error ? archiveError.message : String(archiveError)}`,
+            );
+            return null;
+          });
         await this.cleanup(results, "archive");
         await this.workspaces.cleanupOrchestration(input.orchestration.id, "clean");
         await sink.recordEvent({
@@ -548,6 +641,10 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         finalOutput: results.map((result) => `${result.task.title}: ${result.summary}`).join("\n"),
       };
     } catch (error) {
+      await logError(
+        "driver",
+        `orchestration ${input.orchestration.id} execution failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+      );
       await this.cleanup(results, "archive").catch(() => undefined);
       await this.workspaces.cleanupOrchestration(input.orchestration.id, "archive").catch(() => undefined);
       if (signal.aborted) return { kind: "cancelled", reason: "Orchestration cancelled" };
@@ -682,6 +779,50 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     return { task, workspace, changes, summary: call.rawOutput.slice(0, 8_000), usage: call.usage, staleTaskIds: [] };
   }
 
+  private async attemptCandidateRepair(
+    input: ExecuteInput,
+    roles: RoleExecutor,
+    candidate: IntegrationCandidate,
+    failing: VerificationRecord[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!failing.length) return false;
+    await logError(
+      "driver",
+      `orchestration ${input.orchestration.id}: candidate failed ${failing.length} verification(s), attempting one repair pass`,
+    );
+    try {
+      await roles.text({
+        orchestrationId: input.orchestration.id,
+        agentId: input.orchestration.agentId,
+        taskId: null,
+        role: "worker",
+        workspacePath: candidate.path,
+        sandboxMode: "workspace-write",
+        signal,
+        prompt: [
+          "The integrated candidate in this workspace failed the following acceptance checks.",
+          "Edit only what is necessary to fix every check below without breaking anything that currently passes.",
+          ...failing.map((record) => `- ${record.commandOrCheck}: ${record.outputSummary}`),
+        ].join("\n"),
+      });
+      // The repair pass can add or touch files beyond the original task diff
+      // (e.g. a new CSS file). Recompute changes against the original base so
+      // publish() later copies everything the repair actually did, not just
+      // the pre-repair change set.
+      const refreshedManifest = await workspaceManifest(candidate.path);
+      candidate.manifest = refreshedManifest;
+      candidate.changes = diffManifest(candidate.base, refreshedManifest);
+      return true;
+    } catch (error) {
+      await logError(
+        "driver",
+        `orchestration ${input.orchestration.id}: repair pass failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+  }
+
   private amendment(input: ExecuteInput, reason: string): ContractAmendment {
     const now = this.now().toISOString();
     return {
@@ -701,6 +842,71 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
       createdAt: now,
       decidedAt: null,
     };
+  }
+
+  private async verifyAcceptanceTestBatch(
+    input: ExecuteInput,
+    roles: RoleExecutor,
+    candidateWorkspacePath: string,
+    batch: PlannedAcceptanceTest[],
+    signal: AbortSignal,
+  ): Promise<Map<string, VerificationResultEntry>> {
+    const result = await roles.structured(
+      {
+        orchestrationId: input.orchestration.id,
+        agentId: input.orchestration.agentId,
+        taskId: null,
+        role: "verifier",
+        workspacePath: candidateWorkspacePath,
+        sandboxMode: "read-only",
+        signal,
+        prompt: [
+          "Independently verify the integrated candidate. Do not edit any files.",
+          "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
+          `You MUST return exactly ${batch.length} results, one per testId listed below. Do not summarize or group tests — every testId needs its own entry. Any testId you omit is automatically treated as a failed test, so when in doubt include it with your best evidence rather than leaving it out.`,
+          "Passing requires concrete evidence; uncertainty or an unverified claim must fail.",
+          `Required testIds (count=${batch.length}): ${JSON.stringify(batch.map((test) => test.id))}`,
+          `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
+          `Protected planner-generated acceptance tests: ${JSON.stringify(batch)}`,
+        ].join("\n").slice(0, 150_000),
+      },
+      acceptanceVerificationSchema,
+    );
+    const returned = new Map(result.value.results.map((entry) => [entry.testId, entry]));
+    const missingIds = batch.map((test) => test.id).filter((id) => !returned.has(id));
+    if (missingIds.length) {
+      await logError(
+        "driver",
+        `orchestration ${input.orchestration.id}: verifier omitted ${missingIds.length}/${batch.length} required tests in a batch; requesting the missing ones`,
+      );
+      const completion = await roles.structured(
+        {
+          orchestrationId: input.orchestration.id,
+          agentId: input.orchestration.agentId,
+          taskId: null,
+          role: "verifier",
+          workspacePath: candidateWorkspacePath,
+          sandboxMode: "read-only",
+          signal,
+          prompt: [
+            "Your previous verification response omitted required acceptance tests. Do not re-verify tests you already reported.",
+            `Return exactly one result for each of these ${missingIds.length} testIds only: ${JSON.stringify(missingIds)}`,
+            `Protected planner-generated acceptance tests (full detail, filter to the ids above): ${JSON.stringify(batch.filter((test) => missingIds.includes(test.id)))}`,
+          ].join("\n").slice(0, 150_000),
+        },
+        acceptanceVerificationSchema,
+      ).catch(async (completionError: unknown) => {
+        await logError(
+          "driver",
+          `orchestration ${input.orchestration.id}: follow-up call for ${missingIds.length} missing tests failed: ${completionError instanceof Error ? completionError.message : String(completionError)}`,
+        );
+        return null;
+      });
+      for (const entry of completion?.value.results ?? []) {
+        if (missingIds.includes(entry.testId)) returned.set(entry.testId, entry);
+      }
+    }
+    return returned;
   }
 
   private async runPlannedAcceptanceVerification(
@@ -733,28 +939,19 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
         !postReleaseIds.has(test.id),
     );
     const startedAt = this.now().toISOString();
-    const result = automated.length
-      ? await roles.structured(
-          {
-            orchestrationId: input.orchestration.id,
-            agentId: input.orchestration.agentId,
-            taskId: null,
-            role: "verifier",
-            workspacePath: candidateWorkspacePath,
-            sandboxMode: "read-only",
-            signal,
-            prompt: [
-              "Independently verify the integrated candidate. Do not edit any files.",
-              "Inspect the actual workspace and run relevant non-destructive tests, type checks, builds, or static checks where available.",
-              "Return exactly one result for every supplied acceptance test. Passing requires concrete evidence; uncertainty or an unverified claim must fail. Baseline regression tests are supplied only when the starting workspace has relevant automated-check infrastructure.",
-              `Confirmed contract: ${JSON.stringify({ version: input.contract.version, goal: input.contract.intent.goal, criteria: input.contract.criteria })}`,
-              `Protected planner-generated acceptance tests: ${JSON.stringify(automated)}`,
-            ].join("\n").slice(0, 150_000),
-          },
-          acceptanceVerificationSchema,
-        )
-      : null;
-    const returned = new Map(result?.value.results.map((entry) => [entry.testId, entry]) ?? []);
+    const verificationBatches: PlannedAcceptanceTest[][] = [];
+    for (let i = 0; i < automated.length; i += VERIFICATION_BATCH_SIZE) {
+      verificationBatches.push(automated.slice(i, i + VERIFICATION_BATCH_SIZE));
+    }
+    const batchMaps = await Promise.all(
+      verificationBatches.map((batch) =>
+        this.verifyAcceptanceTestBatch(input, roles, candidateWorkspacePath, batch, signal),
+      ),
+    );
+    const returned = new Map<string, VerificationResultEntry>();
+    for (const batchMap of batchMaps) {
+      for (const [testId, entry] of batchMap) returned.set(testId, entry);
+    }
     const records = [];
     for (const test of plan.tests) {
       const testResult = returned.get(test.id);
@@ -786,13 +983,14 @@ export class ContextAwareExecutionDriver implements OrchestrationExecutionDriver
     await sink.recordEvent({
       orchestrationId: input.orchestration.id,
       taskId: null,
-      executionId: result?.executionId ?? null,
+      executionId: null,
       type: "acceptance-verification-completed",
       actorRole: "verifier",
-      modelId: result?.actualModelId ?? this.options.models.verifier,
-      summary: "Big verifier evaluated the planner-generated acceptance tests",
+      modelId: this.options.models.verifier,
+      summary: "Verifier evaluated the planner-generated acceptance tests",
       metadata: {
         testCount: records.length,
+        verificationBatches: verificationBatches.length,
         passed: records.filter((record) => record.status === "passed").length,
         failed: records.filter((record) => record.status === "failed").length,
         skipped: records.filter((record) => record.status === "skipped").length,

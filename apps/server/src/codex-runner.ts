@@ -41,8 +41,22 @@ export function consumeCodexOutputChunk(
   parsed: ParsedEvents,
 ): boolean {
   if (target === "stderr") {
-    accumulator.stderrTail = (accumulator.stderrTail + chunk.toString("utf8"))
-      .slice(-STDERR_TAIL_CHARACTERS);
+    // Codex's own Rust runtime logs a "<EventKind> without active item" line
+    // whenever a provider's streamed response doesn't perfectly match its
+    // internal item-tracking (observed with the Ark Responses-compatible
+    // endpoint, e.g. OutputTextDelta, ReasoningSummaryDelta). It fires per
+    // streamed delta chunk — hundreds of times per call — and calls still
+    // complete successfully despite it, so it does not indicate lost
+    // content. Left unfiltered, a burst of these right before a real
+    // failure would evict genuinely useful context from the bounded tail
+    // buffer below.
+    const text = chunk
+      .toString("utf8")
+      .split(/\r?\n/)
+      .filter((line) => !/\bwithout active item\b/.test(line))
+      .join("\n");
+    if (text) process.stderr.write(text);
+    accumulator.stderrTail = (accumulator.stderrTail + text).slice(-STDERR_TAIL_CHARACTERS);
     return false;
   }
 

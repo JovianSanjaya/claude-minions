@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ContractCriterion, ModelRole, TokenUsage } from "../contracts.js";
+import { logError } from "../../error-log.js";
 
 export type BenchmarkMode = "direct" | "orchestrated";
 export type BenchmarkStatus = "running" | "completed" | "failed" | "cancelled";
@@ -185,11 +186,13 @@ export class BenchmarkService {
         current.completedAt = this.now().toISOString();
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await logError("benchmark", `record ${record.id} failed: ${message}`);
       await this.store.mutate((database) => {
         const current = database.records.find((entry) => entry.id === record.id)!;
         if (current.status === "cancelled") return;
         current.status = "failed";
-        current.error = error instanceof Error ? error.message : String(error);
+        current.error = message;
         current.completedAt = this.now().toISOString();
       });
     } finally {

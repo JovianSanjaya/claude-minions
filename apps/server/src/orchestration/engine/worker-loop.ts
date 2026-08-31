@@ -13,12 +13,13 @@ import type { DetailedApplicationMap } from "./application-map.js";
 import { ArtifactRegistry } from "./artifact-registry.js";
 import { ContextBroker, type ContextPacket } from "./context-broker.js";
 import { createFailurePacket } from "./failure-packet.js";
+import { logError } from "../../error-log.js";
 import {
   reviewPreflight,
   workerPreflightSchema,
   type PreflightDecision,
 } from "./preflight.js";
-import { RoleExecutor } from "./role-executor.js";
+import { RoleExecutor, TRANSIENT_ERROR_PATTERN } from "./role-executor.js";
 import { requiredVerificationPassed, VerificationService } from "./verification.js";
 import {
   scopeViolations,
@@ -389,6 +390,7 @@ export class BoundedWorkerLoop {
         };
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
+        await logError("worker-loop", `task ${task.id} attempt ${number} failed: ${lastError}`);
         await this.sink.recordAttempt({
           ...started,
           changedFiles: lastChanges.changedFiles,
@@ -399,9 +401,9 @@ export class BoundedWorkerLoop {
         });
         if (
           number < orchestration.budget.maxWorkerAttempts &&
-          /429|too many requests|timed out/i.test(lastError)
+          TRANSIENT_ERROR_PATTERN.test(lastError)
         ) {
-          const retryDelayMs = 15_000;
+          const retryDelayMs = 5_000;
           await this.sink.recordEvent({
             orchestrationId: orchestration.id,
             taskId: task.id,

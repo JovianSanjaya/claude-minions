@@ -12,6 +12,19 @@ import { OrchestrationControlService } from "./orchestration/control/service.js"
 import { ContextAwareExecutionDriver } from "./orchestration/engine/driver.js";
 import { BenchmarkService, BenchmarkStore, type BenchmarkSnapshot } from "./orchestration/benchmark/service.js";
 import { createLiveBenchmarkExecutor } from "./orchestration/benchmark/live-executor.js";
+import { logError } from "./error-log.js";
+
+process.on("uncaughtException", (error) => {
+  void logError("process", `uncaughtException: ${error.stack ?? error.message}`).finally(() => {
+    process.exit(1);
+  });
+});
+process.on("unhandledRejection", (reason) => {
+  void logError(
+    "process",
+    `unhandledRejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+  );
+});
 
 const config = loadConfig();
 await writeCodexConfig(config);

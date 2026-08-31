@@ -2,6 +2,7 @@ import { copyFile, mkdir, readFile, realpath, rename, rm, writeFile } from "node
 import path from "node:path";
 import type { WorkspaceChanges, WorkspaceManifest } from "./worker-workspaces.js";
 import { copyWorkspaceTree, diffManifest, workspaceManifest } from "./worker-workspaces.js";
+import { logError } from "../../error-log.js";
 
 export interface IntegrationInput {
   taskId: string;
@@ -130,10 +131,27 @@ export class DeterministicIntegrator {
         await rm(path.join(mainWorkspace, file), { force: true });
       }
     } catch (error) {
+      const rollbackFailures: string[] = [];
       for (const file of touched) {
         const destination = path.join(mainWorkspace, file);
-        if (originallyAbsent.has(file)) await rm(destination, { force: true });
-        else await copyFile(path.join(backupRoot, file), destination).catch(() => undefined);
+        if (originallyAbsent.has(file)) {
+          await rm(destination, { force: true }).catch((rollbackError) => {
+            rollbackFailures.push(`${file}: ${String(rollbackError)}`);
+          });
+        } else {
+          await copyFile(path.join(backupRoot, file), destination).catch((rollbackError) => {
+            rollbackFailures.push(`${file}: ${String(rollbackError)}`);
+          });
+        }
+      }
+      const publishErrorMessage = error instanceof Error ? error.message : String(error);
+      if (rollbackFailures.length) {
+        await logError(
+          "integrator",
+          `publish failed (${publishErrorMessage}) AND rollback left ${rollbackFailures.length} file(s) in an inconsistent state: ${rollbackFailures.join(", ")}`,
+        );
+      } else {
+        await logError("integrator", `publish failed, rollback succeeded: ${publishErrorMessage}`);
       }
       throw error;
     }

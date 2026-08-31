@@ -61,9 +61,14 @@ export async function buildApplicationMap(
   now = new Date(),
 ): Promise<DetailedApplicationMap> {
   const root = await realpath(workspacePath);
-  const entries: ApplicationMapEntry[] = [];
   const packageBoundaries: string[] = [];
+  const candidates: Array<{ absolute: string; relative: string; name: string }> = [];
 
+  // Structural traversal must stay sequential (each directory's listing
+  // depends on the previous readdir), but reading and hashing file contents
+  // is independent per file, so that part runs concurrently below —
+  // Promise.all preserves this array's order, keeping repositoryHash
+  // deterministic regardless of which read finishes first.
   const walk = async (directory: string): Promise<void> => {
     const children = await readdir(directory, { withFileTypes: true });
     children.sort((a, b) => a.name.localeCompare(b.name));
@@ -78,19 +83,27 @@ export async function buildApplicationMap(
         continue;
       }
       if (!stats.isFile() || stats.size > 1_000_000) continue;
+      candidates.push({ absolute, relative, name: child.name });
+    }
+  };
+  await walk(root);
+
+  const entries: ApplicationMapEntry[] = await Promise.all(
+    candidates.map(async ({ absolute, relative }): Promise<ApplicationMapEntry> => {
       const buffer = await readFile(absolute);
       const sha256 = createHash("sha256").update(buffer).digest("hex");
       const source = textExtensions.has(path.extname(relative).toLowerCase())
         ? buffer.toString("utf8")
         : "";
       const facts = source ? inspectSource(relative, source) : { imports: [], exports: [], summary: `Binary asset ${relative}` };
-      entries.push({ path: relative, sha256, bytes: buffer.byteLength, ...facts });
-      if (/^(?:package\.json|pyproject\.toml|Cargo\.toml|go\.mod)$/.test(child.name)) {
-        packageBoundaries.push(path.dirname(relative) === "." ? "." : path.dirname(relative));
-      }
+      return { path: relative, sha256, bytes: buffer.byteLength, ...facts };
+    }),
+  );
+  for (const { relative, name } of candidates) {
+    if (/^(?:package\.json|pyproject\.toml|Cargo\.toml|go\.mod)$/.test(name)) {
+      packageBoundaries.push(path.dirname(relative) === "." ? "." : path.dirname(relative));
     }
-  };
-  await walk(root);
+  }
   const repositoryHash = createHash("sha256")
     .update(entries.map((entry) => `${entry.path}:${entry.sha256}`).join("\n"))
     .digest("hex");

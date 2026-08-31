@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
+import { logError } from "./error-log.js";
 import type { AgentService } from "./agent-service.js";
 import type { OrchestrationControlService } from "./orchestration/control/service.js";
 import { registerOrchestrationRoutes } from "./orchestration/control/routes.js";
@@ -172,6 +173,7 @@ export async function createApp(
             : 500;
     if (statusCode >= 500) {
       request.log.error(appError);
+      void logError("http", `${request.method} ${request.url} -> 500: ${appError.stack ?? appError.message}`);
     }
     return reply.code(statusCode).send({
       error: appError.message,

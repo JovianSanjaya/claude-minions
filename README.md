@@ -37,6 +37,6 @@ See [docs/DEMO.md](docs/DEMO.md) for normal and deterministic budget-stop journe
 
 ## Recovery and limitations
 
-Restart reconciliation cancels interrupted work while retaining redacted evidence. Stop/delete cancels orchestration children; worker scratch state follows the configured archive policy. This is a single-node POC, JSON stores assume one writer process, protected checks reduce gaming but do not prove correctness, ordinary containers are not hardened multi-tenant isolation, and the live benchmark adapter uses a compact common verification check rather than a universal quality oracle.
+Restart reconciliation cancels interrupted work while retaining redacted evidence. Stop/delete cancels orchestration children; worker scratch state follows the configured archive policy. This is a single-node POC, JSON stores assume one writer process, protected checks reduce gaming but do not prove correctness, ordinary containers are not hardened multi-tenant isolation, the live benchmark adapter uses a compact common verification check rather than a universal quality oracle, concurrent worker/verification batches have no host-level concurrency cap, and a failed model call is recorded as zero usage against the budget ledger so real spend on an aborted call can be undercounted.
 
 Architecture and security details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
