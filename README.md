@@ -244,6 +244,51 @@ MinionWare focuses on three closely related middleware directions:
 
 Identity and multi-tenant authorization are not claimed. `APP_AUTH_TOKEN` is an optional shared bearer token for protecting a remote demo, not user identity, RBAC, ownership isolation, or delegated authority.
 
+## Demo
+
+The demo shows one complete Agent journey and one controlled failure. Start the platform before the three-minute presentation using the documented one-command local POC.
+
+### Normal journey
+
+1. Open <http://localhost:3000>, create or select a ready Agent, and point out its current lifecycle state.
+2. In **Execution control**, choose **Orchestrated** and submit:
+
+   ```text
+   Build a small TypeScript notes API and a separate client, with tests and a shared typed interface.
+   ```
+
+3. When the orchestration reaches **awaiting confirmation**, inspect the goal, requirements, assumptions, non-goals, architecture decisions, material questions, estimates, and hard limits. If a material question appears, answer it and select **Revise** to show that MinionWare reconciles the decision across the entire intent.
+4. Select **Confirm contract**. Inspect the selected route, route reason, bounded tasks, dependencies, allowed write paths, and acceptance criteria. Execution begins when the plan becomes ready.
+5. Follow the correlated evidence as the Run proceeds. Show a real ModelArk call, workspace file or tool action, disposable Runtime execution, worker attempt, usage event, verification result, and integration event.
+6. Open **Integration (Result)** and show that the candidate was published only after required verification passed. Confirm that the Agent is understandable and controllable after completion.
+7. Switch to **Direct** and send a small follow-up to demonstrate that the original resumable Playground path still works.
+
+### Controlled failure: deterministic budget denial
+
+Use the UUID of the Agent selected in the frontend to create a second orchestration with a one-call budget:
+
+```bash
+curl -sS -X POST http://localhost:3000/api/agents/<agent-uuid>/orchestrations -H 'Content-Type: application/json' -d '{"prompt":"Add one small, tested feature","requestedMode":"orchestrated","budget":{"maxModelCalls":1}}'
+```
+
+If `APP_AUTH_TOKEN` is configured, also provide `-H 'Authorization: Bearer <token>'`.
+
+1. Return to the Agent in the UI and open the new orchestration.
+2. Inspect the intent created by the first permitted model call, then confirm the contract.
+3. The next model-call reservation is denied when planning begins because the confirmed one-call budget is exhausted.
+4. Show the terminal **budget exhausted** state, exact stop reason, retained contract, usage ledger, and correlated budget event.
+5. Confirm that no worker candidate was published and that the Agent remains available and controllable.
+
+This failure is deterministic and does not depend on a provider outage. It demonstrates backend enforcement rather than a simulated UI error. A verification-failure variation can additionally show that a failed required check archives the isolated candidate while leaving the main Agent workspace unchanged.
+
+### Rehearsal checklist
+
+- Use a valid Ark model API key and Responses-compatible endpoint; do not use a BytePlus account AK/SK.
+- Prebuild and start the local POC before the presentation timer begins.
+- Run `npm run check` and confirm that all TypeScript checks, tests, and production builds pass.
+- Keep the Ark key, bearer token, prompts containing secrets, protected evaluator source, and unredacted payloads out of the browser, workspace, logs, screenshots, and recording.
+- Rehearse both journeys so the normal Run and failure evidence fit within three minutes.
+
 ## Configuration reference
 
 | Variable | Purpose | Default / behavior |
