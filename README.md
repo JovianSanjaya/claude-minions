@@ -289,6 +289,19 @@ This failure is deterministic and does not depend on a provider outage. It demon
 - Keep the Ark key, bearer token, prompts containing secrets, protected evaluator source, and unredacted payloads out of the browser, workspace, logs, screenshots, and recording.
 - Rehearse both journeys so the normal Run and failure evidence fit within three minutes.
 
+## Known limitations
+
+- The platform and orchestration stores are JSON-based, single-node, and assume one writer process.
+- `APP_AUTH_TOKEN` is shared demo authentication, not user identity or authorization. The POC does not provide ownership isolation, RBAC, CSRF protection, or multi-tenant isolation.
+- Ordinary Docker, Colima, and Podman containers are not hardened multi-tenant sandboxes. In the ECS profile, Codex runs inside the application container.
+- The Ark key is available to the server and active Runtime. Outbound network access is broad, and generated code, dependencies, and allowed workspace commands remain risky.
+- Protected checks reduce obvious evaluator gaming but do not prove arbitrary program correctness. Model-judged verification and bounded automatic repair remain best-effort, while manual criteria still require human review.
+- A model call that fails before returning usage is recorded with zero usage, so expenditure from an aborted call may be undercounted.
+- Concurrent planning, verification, and worker batches have no host-level concurrency cap. A large plan can launch an entire batch of containers at once.
+- Estimated dollar cost remains unavailable until operator pricing is configured. Displayed cost is an estimate, not a billing record.
+- The Direct-versus-Orchestrated benchmark describes one prompt and source snapshot. Different models, unknown pricing, or unequal verification prevent a valid cost-winner claim.
+- A compromised host or operator can access POC data. Do not mount production data, use production credentials, or expose the service publicly without HTTPS, network restrictions, and a strong bearer token.
+
 ## Configuration reference
 
 | Variable | Purpose | Default / behavior |
