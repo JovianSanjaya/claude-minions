@@ -1,0 +1,74 @@
+import { describe, expect, it } from "vitest";
+import { loadConfig } from "./config.js";
+
+describe("orchestration model configuration", () => {
+  it("does not impose cumulative token budgets unless explicitly configured", () => {
+    const defaults = loadConfig({ NODE_ENV: "test" });
+    expect(defaults.orchestrationDefaultBudget).toMatchObject({
+      maxInputTokens: null,
+      maxOutputTokens: null,
+    });
+
+    const configured = loadConfig({
+      NODE_ENV: "test",
+      ORCHESTRATION_MAX_INPUT_TOKENS: "2000000",
+      ORCHESTRATION_MAX_OUTPUT_TOKENS: "500000",
+    });
+    expect(configured.orchestrationDefaultBudget).toMatchObject({
+      maxInputTokens: 2_000_000,
+      maxOutputTokens: 500_000,
+    });
+  });
+
+  it("shares one big endpoint across trusted roles and one small endpoint across workers", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      ARK_MODEL: "ep-default",
+      ORCHESTRATION_BIG_MODEL: "ep-big",
+      ORCHESTRATION_SMALL_MODEL: "ep-small",
+    });
+
+    expect(config.orchestrationModels).toEqual({
+      planner: "ep-big",
+      worker: "ep-small",
+      verifier: "ep-big",
+      integrator: "ep-big",
+    });
+  });
+
+  it("keeps advanced per-role overrides and falls back safely", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      ARK_MODEL: "ep-default",
+      ORCHESTRATION_BIG_MODEL: "ep-big",
+      ORCHESTRATION_SMALL_MODEL: "ep-small",
+      ORCHESTRATION_VERIFIER_MODEL: "ep-verifier",
+      ORCHESTRATION_WORKER_MODEL: "ep-worker",
+    });
+
+    expect(config.orchestrationModels).toEqual({
+      planner: "ep-big",
+      worker: "ep-worker",
+      verifier: "ep-verifier",
+      integrator: "ep-big",
+    });
+  });
+
+  it("uses ARK_MODEL for every role when grouped overrides are absent", () => {
+    const config = loadConfig({ NODE_ENV: "test", ARK_MODEL: "ep-default" });
+
+    expect(config.orchestrationModels).toEqual({
+      planner: "ep-default",
+      worker: "ep-default",
+      verifier: "ep-default",
+      integrator: "ep-default",
+    });
+  });
+
+  it("defaults a single Codex turn's timeout to 30 minutes and allows overriding it", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).codexTimeoutMs).toBe(1_800_000);
+    expect(
+      loadConfig({ NODE_ENV: "test", CODEX_TIMEOUT_MS: "60000" }).codexTimeoutMs,
+    ).toBe(60_000);
+  });
+});

@@ -1,0 +1,13 @@
+import type { OrchestrationReadModel } from "../contracts";
+import { formatEstimatedCost, formatNumber, statusLabel } from "../view-model";
+
+export function EvidenceGrid({ view }: { view: OrchestrationReadModel }) {
+  const usage = view.usage;
+  return <div className="orch-evidence-grid">
+    <section className="orch-card"><h3>Route & application map</h3><strong>{view.plan?.selectedMode ?? view.orchestration.selectedMode ?? "Pending"}</strong><p>{view.plan?.routeReason ?? "The planner has not selected a route yet."}</p><small>Map v{view.plan?.applicationMapVersion ?? "—"} · {view.applicationMaps.at(-1)?.fileCount ?? 0} files</small></section>
+    <section className="orch-card"><h3>Usage & hard limits</h3><div className="orch-metrics"><span><b>{formatNumber(usage.totalInputTokens)}</b> input</span><span><b>{formatNumber(usage.totalCachedInputTokens)}</b> cached</span><span><b>{formatNumber(usage.totalOutputTokens)}</b> output</span><span><b>{Object.values(usage.byRole).reduce((sum, role) => sum + (role?.modelCalls ?? 0), 0)}</b> calls</span></div><p>{formatEstimatedCost(usage.totalEstimatedUsd)}</p><small>Call limit {view.orchestration.budget.maxModelCalls} · attempt limit {view.orchestration.budget.maxWorkerAttempts}</small></section>
+    <section className="orch-card orch-wide"><h3>Tasks</h3>{view.tasks.length ? <ol className="orch-task-list">{view.tasks.map((task) => <li key={task.id}><div><strong>{task.title}</strong><span className={`orch-state state-${task.status}`}>{statusLabel(task.status)}</span></div><p>{task.objective}</p><small>{task.dependsOn.length ? `Depends on ${task.dependsOn.length}` : "No dependencies"} · attempt {task.attemptCount} · {task.allowedPaths.join(", ") || "scope pending"}</small></li>)}</ol> : <p>No tasks have been planned.</p>}</section>
+    <section className="orch-card"><h3>Context & artifacts</h3><p>{view.contextPackets.length} compact packets · {view.contextPackets.reduce((sum, packet) => sum + packet.sourceFiles.length, 0)} file references</p><ul>{view.artifacts.slice(-6).map((artifact) => <li key={`${artifact.id}-${artifact.version}`}>{artifact.name} <b>v{artifact.version}</b></li>)}</ul></section>
+    <section className="orch-card orch-wide"><h3>Planner acceptance tests & verification</h3>{view.verifications.length ? <ul className="orch-verification-list">{view.verifications.slice(-50).map((record) => <li key={record.id}><div><strong>{record.commandOrCheck}</strong><span className={`orch-state state-${record.status}`}>{record.status}</span></div><small>{record.scope}</small><p>{record.outputSummary}</p></li>)}</ul> : <p>The planner's protected acceptance tests will appear here after the integrated candidate is verified.</p>}</section>
+  </div>;
+}
